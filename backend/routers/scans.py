@@ -561,6 +561,15 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
 
         # Convert GitHub dork findings → Finding objects
         for gh in github_findings:
+            # matched-at must be the TARGET domain URL (not GitHub URL) so the
+            # L1 scope filter passes. The GitHub evidence URL is kept in _evidence_url.
+            query = gh.get("query", "")
+            target_domain = next(
+                (d.lstrip("*.") for d in scope.in_scope_domains if d.lstrip("*.") in query),
+                scope.in_scope_domains[0].lstrip("*.") if scope.in_scope_domains else "",
+            )
+            target_url = f"https://{target_domain}" if target_domain else gh["html_url"]
+
             raw_findings.append({
                 "_source": "github_dork",
                 "info": {
@@ -568,14 +577,16 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                     "severity": gh["severity"],
                     "tags": ["token-disclosure", "exposure", "github"],
                     "description": (
-                        f"Secret found in {gh['repo']} at {gh['file_path']}. "
-                        f"Query: {gh['query']}"
+                        f"Secret '{gh['secret_type']}' for {target_domain} found publicly "
+                        f"in {gh['repo']} → {gh['file_path']}. "
+                        f"Search query: {query}"
                     ),
                 },
-                "matched-at": gh["html_url"],
+                "matched-at": target_url,   # scope-passable target URL
                 "type": "token-disclosure",
                 "_repo": gh["repo"],
                 "_file_path": gh["file_path"],
+                "_evidence_url": gh["html_url"],  # actual GitHub URL for the report
                 "_snippet": gh["snippet"],
                 "_secret_type": gh["secret_type"],
             })
