@@ -10,7 +10,10 @@ ENV GO_VERSION=1.22.3
 RUN wget -q https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz \
     && tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz \
     && rm go${GO_VERSION}.linux-amd64.tar.gz
-ENV PATH=$PATH:/usr/local/go/bin:/root/go/bin
+# IMPORTANT: Go bin MUST come before /usr/local/bin.
+# pip installs a Python httpx CLI at /usr/local/bin/httpx which would otherwise
+# shadow the ProjectDiscovery httpx scanner at /root/go/bin/httpx.
+ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH
 
 # Install Go security tools
 RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
@@ -32,6 +35,20 @@ RUN nuclei -update-templates -silent 2>/dev/null || true && \
     (test -d /root/nuclei-templates && echo "Templates OK: $(find /root/nuclei-templates -name '*.yaml' | wc -l) files") || \
     (git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git /root/nuclei-templates 2>/dev/null && \
      echo "Templates cloned: $(find /root/nuclei-templates -name '*.yaml' | wc -l) files")
+
+# Install sqlmap (git clone — not on PyPI with full feature set)
+RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap && \
+    ln -sf /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap && \
+    chmod +x /opt/sqlmap/sqlmap.py
+
+# Install gf patterns (1ndianl33t's extended collection)
+# gf binary is already at /root/go/bin/gf (installed above)
+# Patterns live at ~/.gf/ — covers: sqli, xss, ssrf, redirect, lfi, rce, idor, debug
+RUN mkdir -p /root/.gf && \
+    git clone --depth 1 https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns 2>/dev/null && \
+    cp /tmp/gf-patterns/*.json /root/.gf/ 2>/dev/null || true && \
+    rm -rf /tmp/gf-patterns && \
+    echo "gf patterns installed: $(ls /root/.gf/*.json 2>/dev/null | wc -l) files"
 
 # Python dependencies
 WORKDIR /app

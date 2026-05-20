@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # GitHub token for dorking (https://github.com/settings/tokens — read:public_repo)
     github_token: Optional[str] = None
 
+    # HackerOne researcher username — added as X-HackerOne-Researcher header to
+    # all active-recon requests, as required by many H1 programs (e.g. Coupang).
+    h1_username: Optional[str] = None
+
     class Config:
         env_file = ".env"
 

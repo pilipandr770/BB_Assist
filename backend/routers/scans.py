@@ -1,8 +1,33 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
+
+# Matches credentials embedded in URL paths like:
+#   /:user@domain.com:Password123   (path-style, from GAU history)
+#   /user:password@host/path       (RFC-3986 userinfo in path — malformed but common)
+_CRED_IN_PATH_RE = re.compile(
+    r'(?:^|/)'                          # start of path segment
+    r':?'                               # optional leading colon
+    r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+'  # email-like username
+    r':'                                # separator
+    r'[^/\s@]{6,}',                    # password (≥6 chars, no space/slash)
+    re.IGNORECASE,
+)
+
+# Matches interesting API path SEGMENTS (not substrings of longer words).
+# Keyword must be a complete path segment: followed by / or end of string only.
+# Dot is intentionally excluded — /user.gender, /user.email are doc pages, not endpoints.
+# Examples:  /api/v1 ✓   /auth/login ✓   /login ✓
+#            /authors/ ✗   /users/ ✗   /user.gender ✗   /user.email ✗
+_ARJUN_PATH_RE = re.compile(
+    r'/(?:api|v[123456]|graphql|search|user|account|admin|auth|query|login|register|oauth|token|payment)'
+    r'(?=/|$)',   # followed by / or end of string — NOT dot, NOT alphanumeric
+    re.IGNORECASE,
+)
 
 import aiofiles
 import redis.asyncio as aioredis
@@ -176,9 +201,20 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
     scan_dir = _scan_dir(program_id, scan_id)
     finding_dir = _finding_dir(program_id)
 
-    os.makedirs(scan_dir, exist_ok=True)
-    os.makedirs(os.path.join(finding_dir, "filtered"), exist_ok=True)
-    os.makedirs(os.path.join(finding_dir, "rejected"), exist_ok=True)
+    try:
+        os.makedirs(scan_dir, exist_ok=True)
+        os.makedirs(os.path.join(finding_dir, "filtered"), exist_ok=True)
+        os.makedirs(os.path.join(finding_dir, "rejected"), exist_ok=True)
+    except OSError as _io_err:
+        # Docker Desktop / WSL2 volume IO error — surface a clear message
+        await _push_event(
+            await _get_redis(), scan_id, "scan_error",
+            {"error": (
+                f"Workspace volume IO error (errno {_io_err.errno}). "
+                "Restart Docker Desktop and try again."
+            )},
+        )
+        return
 
     redis = await _get_redis()
 
@@ -191,15 +227,77 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         program = await _load_scope_and_program(program_id)
         scope = program.scope
 
+        # ── Pipeline adaptation: tailor phases to program type ────────────────
+        # mobile / blockchain / source_code programs have no live web surface to crawl —
+        # skip heavy web-crawl phases and focus on passive recon + nuclei + dorking.
+        # API-only programs skip deep HTML crawling but benefit from arjun + CORS checks.
+        notes_lower = (scope.notes or "").lower()
+        prog_type = (scope.program_type or "web").lower()
+
+        do_katana  = prog_type in ("web", "api")      # JS crawling useless for mobile/blockchain
+        do_ffuf    = prog_type == "web"                # dir-fuzzing irrelevant for pure APIs
+        do_arjun   = prog_type in ("web", "api")
+        arjun_max  = 10 if prog_type == "api" else 5   # more param targets for API programs
+
+        # Skip nuclei if the program explicitly bans automated scanners
+        _no_scan_keywords = [
+            "no automated scanner", "no automated scanning", "no scanners",
+            "manual testing only", "no automated tools", "do not use automated",
+            "do not run automated", "automated tools are not allowed",
+        ]
+        do_nuclei = not any(kw in notes_lower for kw in _no_scan_keywords)
+
+        await _push_event(redis, scan_id, "pipeline_config", {
+            "program_type": prog_type,
+            "do_katana": do_katana,
+            "do_ffuf": do_ffuf,
+            "do_arjun": do_arjun,
+            "do_nuclei": do_nuclei,
+        })
+
         await _push_event(redis, scan_id, "phase_start", {"phase": "passive_recon"})
 
         # ── Phase 1: Passive recon ────────────────────────────────────────────
         all_subdomains: set[str] = set()
         all_urls: set[str] = set()
 
-        for domain in scope.in_scope_domains:
-            base_domain = domain.lstrip("*.")
-            passive = await passive_recon.run_all_passive(base_domain)
+        # Deduplicate to unique apex domains before running passive recon.
+        # Programs like Coupang Taiwan list 45 explicit subdomains — running
+        # run_all_passive() on all of them sequentially would take 22+ minutes
+        # (45 domains × 5 API sources × 30s timeout).
+        # Strategy: extract unique apex domains (last two labels) and cap at 5.
+        # e.g. payment.tw.coupang.com → tw.coupang.com
+        #      shop.tw.coupang.com    → tw.coupang.com  (same apex, skip)
+        #      tw.coupangcorp.com     → tw.coupangcorp.com (different apex, keep)
+        def _apex(domain: str) -> str:
+            parts = domain.lstrip("*.").split(".")
+            return ".".join(parts[-2:]) if len(parts) >= 2 else domain.lstrip("*.")
+
+        seen_apexes: set[str] = set()
+        passive_domains: list[str] = []
+        for _d in scope.in_scope_domains:
+            _base = _d.lstrip("*.")
+            _apex_d = _apex(_base)
+            if _apex_d not in seen_apexes:
+                seen_apexes.add(_apex_d)
+                passive_domains.append(_base)
+            if len(passive_domains) >= 5:  # hard cap — passive recon has no scanner value beyond 5
+                break
+
+        await _push_event(redis, scan_id, "phase_start", {
+            "phase": "passive_recon_detail",
+            "domains": passive_domains,
+            "total_scope_domains": len(scope.in_scope_domains),
+        })
+
+        # Run all passive recon domains in PARALLEL — no reason to wait for each
+        passive_results = await asyncio.gather(
+            *[passive_recon.run_all_passive(d) for d in passive_domains],
+            return_exceptions=True,
+        )
+        for passive in passive_results:
+            if isinstance(passive, Exception):
+                continue
             all_subdomains.update(passive.get("subdomains", []))
             all_urls.update(passive.get("urls", []))
 
@@ -234,48 +332,157 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         live_hosts = await tool_runner.run_dnsx(scoped_subs, dnsx_out)
         await _push_event(redis, scan_id, "tool_done", {"tool": "dnsx", "count": len(live_hosts)})
 
-        # httpx — probe live hosts
-        await _push_event(redis, scan_id, "tool_start", {"tool": "httpx", "detail": f"{len(live_hosts)} live hosts"})
+        # Phase 2.1: nmap — find web services on non-standard ports
+        # Runs on up to 100 dnsx-confirmed live hosts; adds "hostname:port" pairs to httpx targets.
+        # Services on ports 8080/8443/3000/5000 are often less hardened than the
+        # primary 443 endpoint and are easy to miss without port scanning.
+        # CDN-aware: run_nmap pre-resolves hostnames so CDN IPs (Cloudflare, Fastly)
+        # are expanded back to all hostnames sharing that IP → correct SNI/Host routing.
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "nmap",
+            "detail": f"non-standard web ports on {min(len(live_hosts), 100)} hosts",
+        })
+        nmap_out = os.path.join(recon_dir, "nmap.gnmap")
+        nmap_endpoints = await tool_runner.run_nmap(live_hosts, nmap_out)
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "nmap", "count": len(nmap_endpoints),
+        })
+
+        # httpx — probe live hosts + always include explicit scope URLs so we get
+        # at least metadata for known-good targets even if all subfinder hosts fail.
+        # (Most subfinder subdomains resolve in DNS but have no web service → 0 httpx results)
+        explicit_scope_urls = [u for u in (scope.in_scope_urls or []) if u.startswith("http")]
+        httpx_targets = list(live_hosts)
+        # Add nmap-discovered non-standard ports
+        for ep in nmap_endpoints:
+            if ep not in httpx_targets:
+                httpx_targets.append(ep)
+        for _eu in explicit_scope_urls:
+            if _eu not in httpx_targets:
+                httpx_targets.append(_eu)
+
+        await _push_event(redis, scan_id, "tool_start", {"tool": "httpx", "detail": f"{len(httpx_targets)} hosts"})
         httpx_out = os.path.join(recon_dir, "httpx.jsonl")
-        http_results = await tool_runner.run_httpx(live_hosts, httpx_out)
+        http_results = await tool_runner.run_httpx(httpx_targets, httpx_out)
         live_urls = [r.get("url", "") for r in http_results if r.get("url")]
         await _push_event(redis, scan_id, "tool_done", {"tool": "httpx", "count": len(live_urls)})
 
-        # Fallback: if httpx found nothing, seed from explicit scope URLs
-        if not live_urls and scope.in_scope_urls:
-            fallback = [u for u in scope.in_scope_urls if u.startswith("http")]
-            if fallback:
-                live_urls = fallback
-                await _push_event(redis, scan_id, "tool_start", {
-                    "tool": "httpx-fallback",
-                    "detail": f"using {len(fallback)} explicit scope URLs",
-                })
-                await _push_event(redis, scan_id, "tool_done", {"tool": "httpx-fallback", "count": len(fallback)})
+        # Fallback 1: httpx found nothing → seed from explicit scope URLs
+        if not live_urls and explicit_scope_urls:
+            live_urls = explicit_scope_urls
+            await _push_event(redis, scan_id, "tool_start", {
+                "tool": "httpx-fallback",
+                "detail": f"using {len(explicit_scope_urls)} explicit scope URLs",
+            })
+            await _push_event(redis, scan_id, "tool_done", {
+                "tool": "httpx-fallback", "count": len(explicit_scope_urls),
+            })
 
-        # gau — deduplicate base domains to avoid running twice for *.example.com + example.com
+        # Fallback 2: still nothing → generate URLs from in_scope_domains directly.
+        # Covers programs that only specify *.example.com (no explicit URLs) and
+        # where all subfinder-discovered subdomains have no HTTP service.
+        if not live_urls:
+            generated: list[str] = []
+            for _d in scope.in_scope_domains[:3]:
+                _base = _d.lstrip("*.")
+                for _prefix in ("", "www.", "api.", "app.", "dashboard.", "portal."):
+                    generated.append(f"https://{_prefix}{_base}")
+            # Probe these candidates so we get real status codes, not guesses
+            _gen_httpx_out = os.path.join(recon_dir, "httpx_gen.jsonl")
+            await _push_event(redis, scan_id, "tool_start", {
+                "tool": "httpx-gen-fallback",
+                "detail": f"probing {len(generated)} generated domain URLs",
+            })
+            _gen_results = await tool_runner.run_httpx(generated, _gen_httpx_out)
+            _gen_live = [r.get("url", "") for r in _gen_results if r.get("url")]
+            if _gen_live:
+                live_urls = _gen_live
+            else:
+                # Nothing responded — use generated list as plain seeds (gau/katana still benefit)
+                live_urls = generated
+            await _push_event(redis, scan_id, "tool_done", {
+                "tool": "httpx-gen-fallback", "count": len(live_urls),
+            })
+
+        # gau — run on unique apex domains only (same dedup logic as passive recon).
+        # Programs with 45 explicit subdomains should not trigger 45 gau runs —
+        # gau queries by apex anyway, so tw.coupang.com covers all its subdomains.
         gau_urls: set[str] = set()
-        seen_gau_bases: set[str] = set()
+        seen_gau_apexes: set[str] = set()
+        gau_domains_run: list[str] = []
         for domain in scope.in_scope_domains:
             base = domain.lstrip("*.")
-            if base in seen_gau_bases:
+            apex_d = _apex(base)
+            if apex_d in seen_gau_apexes:
                 continue
-            seen_gau_bases.add(base)
-            await _push_event(redis, scan_id, "tool_start", {"tool": "gau", "detail": base})
-            gau_out = os.path.join(recon_dir, f"gau_{base}.txt")
-            gau_results = await tool_runner.run_gau(base, gau_out)
+            seen_gau_apexes.add(apex_d)
+            gau_domains_run.append(base)
+            if len(gau_domains_run) >= 5:  # cap — beyond 5 apex domains gau adds noise
+                break
+
+        for gau_domain in gau_domains_run:
+            await _push_event(redis, scan_id, "tool_start", {"tool": "gau", "detail": gau_domain})
+            gau_out = os.path.join(recon_dir, f"gau_{gau_domain.replace('.', '_')}.txt")
+            gau_results = await tool_runner.run_gau(gau_domain, gau_out)
             gau_urls.update(gau_results)
             await _push_event(redis, scan_id, "tool_done", {"tool": "gau", "count": len(gau_results)})
 
-        # katana — crawl live URLs
-        katana_urls = live_urls[:50] if live_urls else []
-        await _push_event(redis, scan_id, "tool_start", {"tool": "katana", "detail": f"{len(katana_urls)} URLs"})
-        katana_out = os.path.join(recon_dir, "katana.txt")
-        crawled_urls = await tool_runner.run_katana(katana_urls, katana_out)
-        await _push_event(redis, scan_id, "tool_done", {"tool": "katana", "count": len(crawled_urls)})
+        # katana — crawl live URLs (skip for mobile/blockchain/source_code programs)
+        if do_katana:
+            katana_urls = live_urls[:50] if live_urls else []
+            await _push_event(redis, scan_id, "tool_start", {"tool": "katana", "detail": f"{len(katana_urls)} URLs"})
+            katana_out = os.path.join(recon_dir, "katana.txt")
+            crawled_urls = await tool_runner.run_katana(katana_urls, katana_out)
+            await _push_event(redis, scan_id, "tool_done", {"tool": "katana", "count": len(crawled_urls)})
+        else:
+            crawled_urls = []
+            await _push_event(redis, scan_id, "tool_skip", {
+                "tool": "katana", "reason": f"program_type={prog_type} — JS crawling not applicable",
+            })
 
-        # Merge all URLs, filter to scope
+        # Merge all URLs, filter to scope, cap at 15k to keep later phases manageable
         all_target_urls = list(set(live_urls) | gau_urls | set(crawled_urls))
         all_target_urls = [u for u in all_target_urls if is_in_scope(u, scope)]
+        if len(all_target_urls) > 15_000:
+            # Prioritise shorter URLs (more likely to be API endpoints) before truncating
+            all_target_urls.sort(key=lambda u: len(u))
+            all_target_urls = all_target_urls[:15_000]
+
+        # ── Credential-in-URL detection (from GAU) ───────────────────────────
+        # Two patterns:
+        #   1. RFC-3986 userinfo: https://user:password@host/  → urlparse catches this
+        #   2. Path-embedded:    https://host/:email@dom:Pass  → regex catches this
+        cred_urls: list[dict] = []
+        _seen_cred_hosts: set[str] = set()
+        for _raw_url in gau_urls:
+            try:
+                _p = urlparse(_raw_url)
+                _host = _p.hostname or ""
+                if not _host or _host in _seen_cred_hosts:
+                    continue
+
+                if _p.password:
+                    # Standard RFC-3986 userinfo format
+                    _seen_cred_hosts.add(_host)
+                    cred_urls.append({
+                        "url": _raw_url,
+                        "username": _p.username or "",
+                        "password": _p.password,
+                        "host": _host,
+                        "source": "userinfo",
+                    })
+                elif _CRED_IN_PATH_RE.search(_p.path):
+                    # Credentials embedded in path (e.g. /:user@domain.com:Passw0rd)
+                    _seen_cred_hosts.add(_host)
+                    cred_urls.append({
+                        "url": _raw_url,
+                        "username": "",  # can't reliably extract without full parse
+                        "password": "",
+                        "host": _host,
+                        "source": "path_embedded",
+                    })
+            except Exception:
+                pass
 
         async with aiofiles.open(os.path.join(recon_dir, "all_urls.txt"), "w") as f:
             await f.write("\n".join(sorted(all_target_urls)))
@@ -284,6 +491,7 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             "phase": "active_recon",
             "live_hosts": len(live_hosts),
             "target_urls": len(all_target_urls),
+            **({"cred_urls": len(cred_urls)} if cred_urls else {}),
         })
 
         # ── Phase 1.5: GitHub Dorking (passive, no target contact) ──────────
@@ -305,39 +513,47 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
 
         # ── Phase 2.5: Content Discovery (ffuf) ──────────────────────────────
         # Run on top 5 live hosts — finds hidden admin panels, backup files, .env etc.
+        # Skipped for API/mobile/blockchain programs where directory fuzzing adds no value.
         await _push_event(redis, scan_id, "phase_start", {"phase": "content_discovery"})
 
         ffuf_found_urls: list[str] = []
         ffuf_403_urls: list[str] = []
 
-        ffuf_hosts = live_urls[:5] if live_urls else []
-        if not ffuf_hosts and scope.in_scope_urls:
-            ffuf_hosts = [u for u in scope.in_scope_urls if u.startswith("http")][:3]
+        if do_ffuf:
+            ffuf_hosts = live_urls[:5] if live_urls else []
+            if not ffuf_hosts and scope.in_scope_urls:
+                ffuf_hosts = [u for u in scope.in_scope_urls if u.startswith("http")][:3]
 
-        for host_url in ffuf_hosts:
-            await _push_event(redis, scan_id, "tool_start", {
-                "tool": "ffuf", "detail": host_url,
+            for host_url in ffuf_hosts:
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "ffuf", "detail": host_url,
+                })
+                ffuf_out = os.path.join(scan_dir, f"ffuf_{len(ffuf_found_urls)}.json")
+                results = await tool_runner.run_ffuf(host_url, "", ffuf_out)
+                found = [f"{host_url.rstrip('/')}/{r['input']['FUZZ']}" for r in results if r.get("status") != 403]
+                fbd_403 = [f"{host_url.rstrip('/')}/{r['input']['FUZZ']}" for r in results if r.get("status") == 403]
+                ffuf_found_urls.extend(found)
+                ffuf_403_urls.extend(fbd_403)
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "ffuf", "count": len(results),
+                    "found": len(found), "forbidden": len(fbd_403),
+                })
+
+            # Add discovered URLs to the target pool (in-scope only)
+            new_urls = [u for u in ffuf_found_urls if is_in_scope(u, scope)]
+            all_target_urls = list(set(all_target_urls) | set(new_urls))
+
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "content_discovery",
+                "new_paths": len(new_urls),
+                "forbidden": len(ffuf_403_urls),
             })
-            ffuf_out = os.path.join(scan_dir, f"ffuf_{len(ffuf_found_urls)}.json")
-            results = await tool_runner.run_ffuf(host_url, "", ffuf_out)
-            found = [f"{host_url.rstrip('/')}/{r['input']['FUZZ']}" for r in results if r.get("status") != 403]
-            fbd_403 = [f"{host_url.rstrip('/')}/{r['input']['FUZZ']}" for r in results if r.get("status") == 403]
-            ffuf_found_urls.extend(found)
-            ffuf_403_urls.extend(fbd_403)
-            await _push_event(redis, scan_id, "tool_done", {
-                "tool": "ffuf", "count": len(results),
-                "found": len(found), "forbidden": len(fbd_403),
+        else:
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "content_discovery",
+                "skipped": True,
+                "reason": f"program_type={prog_type}",
             })
-
-        # Add discovered URLs to the target pool (in-scope only)
-        new_urls = [u for u in ffuf_found_urls if is_in_scope(u, scope)]
-        all_target_urls = list(set(all_target_urls) | set(new_urls))
-
-        await _push_event(redis, scan_id, "phase_done", {
-            "phase": "content_discovery",
-            "new_paths": len(new_urls),
-            "forbidden": len(ffuf_403_urls),
-        })
 
         # ── Phase 2.6: JS Secret Scanning ────────────────────────────────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "js_scan"})
@@ -385,40 +601,65 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             })
 
         # ── Phase 2.8: Parameter Discovery (arjun) ───────────────────────────
-        # Run on top 5 parameterless interesting endpoints
+        # Run on top N parameterless interesting endpoints (N is larger for API programs).
         await _push_event(redis, scan_id, "phase_start", {"phase": "param_discovery"})
 
-        PARAM_PATTERNS = ["/api/", "/v1/", "/v2/", "/graphql", "/search",
-                          "/user", "/account", "/admin", "/auth", "/query"]
-        param_targets = [
-            u for u in all_target_urls
-            if not "?" in u
-            and is_in_scope(u, scope)
-            and any(p in u for p in PARAM_PATTERNS)
-        ][:5]
+        STATIC_EXTS = {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                       ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
+                       ".txt", ".xml", ".yaml", ".yml", ".json", ".lock",
+                       ".pdf", ".zip", ".gz", ".tar", ".md", ".csv"}
 
         arjun_params: dict[str, list[str]] = {}
-        for pt_url in param_targets:
-            await _push_event(redis, scan_id, "tool_start", {
-                "tool": "arjun", "detail": pt_url,
-            })
-            arjun_out = os.path.join(scan_dir, f"arjun_{len(arjun_params)}.json")
-            params = await tool_runner.run_arjun(pt_url, arjun_out)
-            if params:
-                arjun_params[pt_url] = params
-                # Build URLs with discovered params → add to nuclei targets
-                param_url = pt_url + "?" + "&".join(f"{p}=FUZZ" for p in params[:5])
-                if is_in_scope(param_url, scope):
-                    all_target_urls.append(param_url)
-            await _push_event(redis, scan_id, "tool_done", {
-                "tool": "arjun", "count": len(params),
-            })
 
-        await _push_event(redis, scan_id, "phase_done", {
-            "phase": "param_discovery",
-            "endpoints_tested": len(param_targets),
-            "params_found": sum(len(v) for v in arjun_params.values()),
-        })
+        if do_arjun:
+            param_targets: list[str] = []
+            for _u in all_target_urls:
+                if "?" in _u or not is_in_scope(_u, scope):
+                    continue
+                try:
+                    _path = urlparse(_u).path.lower()
+                except Exception:
+                    continue
+                # Skip static / asset files — arjun has no business scanning them
+                if any(_path.endswith(_ext) for _ext in STATIC_EXTS):
+                    continue
+                # Only match within the FIRST TWO path segments.
+                # Real API endpoints live at /api/..., /auth/..., /oauth/...
+                # Deep content pages like /legal/modernslaverystatement/api/ are not APIs.
+                _parts = [p for p in _path.split("/") if p]
+                _path_prefix = "/" + "/".join(_parts[:2])
+                if _ARJUN_PATH_RE.search(_path_prefix):
+                    param_targets.append(_u)
+                if len(param_targets) >= arjun_max:
+                    break
+
+            for pt_url in param_targets:
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "arjun", "detail": pt_url,
+                })
+                arjun_out = os.path.join(scan_dir, f"arjun_{len(arjun_params)}.json")
+                params = await tool_runner.run_arjun(pt_url, arjun_out)
+                if params:
+                    arjun_params[pt_url] = params
+                    # Build URLs with discovered params → add to nuclei targets
+                    param_url = pt_url + "?" + "&".join(f"{p}=FUZZ" for p in params[:5])
+                    if is_in_scope(param_url, scope):
+                        all_target_urls.append(param_url)
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "arjun", "count": len(params),
+                })
+
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "param_discovery",
+                "endpoints_tested": len(param_targets),
+                "params_found": sum(len(v) for v in arjun_params.values()),
+            })
+        else:
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "param_discovery",
+                "skipped": True,
+                "reason": f"program_type={prog_type}",
+            })
 
         # ── Phase 2.9: CORS Checker ──────────────────────────────────────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "cors_check"})
@@ -455,38 +696,47 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         # ── Phase 3: Nuclei scan ──────────────────────────────────────────────
         # Smart URL selection: nuclei works best on a focused set of high-value targets.
         # Too many URLs (3000+) makes scans take hours; cap at 500 prioritised URLs.
-        nuclei_urls = _select_nuclei_targets(all_target_urls, live_urls, max_urls=500)
-
+        # Skipped if program notes say "no automated scanners" / "manual testing only".
+        raw_findings: list[dict] = []
         await _push_event(redis, scan_id, "phase_start", {"phase": "nuclei_scan"})
-        await _push_event(redis, scan_id, "tool_start", {
-            "tool": "nuclei",
-            "detail": f"{len(nuclei_urls)} targets (of {len(all_target_urls)} total)",
-        })
 
-        nuclei_out = os.path.join(scan_dir, "nuclei.jsonl")
+        if do_nuclei:
+            nuclei_urls = _select_nuclei_targets(all_target_urls, live_urls, max_urls=500)
+            await _push_event(redis, scan_id, "tool_start", {
+                "tool": "nuclei",
+                "detail": f"{len(nuclei_urls)} targets (of {len(all_target_urls)} total)",
+            })
 
-        # Run nuclei with a concurrent progress ticker so the SSE stream stays alive.
-        # Without this, the 10-minute idle timeout disconnects the browser mid-scan.
-        async def _nuclei_progress_ticker():
-            elapsed = 0
-            while True:
-                await asyncio.sleep(30)
-                elapsed += 30
-                await _push_event(redis, scan_id, "nuclei_progress", {
-                    "elapsed_s": elapsed,
-                    "targets": len(nuclei_urls),
-                })
+            nuclei_out = os.path.join(scan_dir, "nuclei.jsonl")
 
-        ticker = asyncio.create_task(_nuclei_progress_ticker())
-        try:
-            raw_findings = await tool_runner.run_nuclei(nuclei_urls, nuclei_out, scope)
-        finally:
-            ticker.cancel()
+            # Run nuclei with a concurrent progress ticker so the SSE stream stays alive.
+            # Without this, the 10-minute idle timeout disconnects the browser mid-scan.
+            async def _nuclei_progress_ticker():
+                elapsed = 0
+                while True:
+                    await asyncio.sleep(30)
+                    elapsed += 30
+                    await _push_event(redis, scan_id, "nuclei_progress", {
+                        "elapsed_s": elapsed,
+                        "targets": len(nuclei_urls),
+                    })
 
-        await _push_event(redis, scan_id, "phase_done", {
-            "phase": "nuclei_scan",
-            "raw_findings": len(raw_findings),
-        })
+            ticker = asyncio.create_task(_nuclei_progress_ticker())
+            try:
+                raw_findings = await tool_runner.run_nuclei(nuclei_urls, nuclei_out, scope)
+            finally:
+                ticker.cancel()
+
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "nuclei_scan",
+                "raw_findings": len(raw_findings),
+            })
+        else:
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "nuclei_scan",
+                "skipped": True,
+                "reason": "program prohibits automated scanners",
+            })
 
         # ── Phase 4: Filter & validate ────────────────────────────────────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "filtering"})
@@ -559,26 +809,65 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 "_evidence_url": takeover.get("evidence_url", ""),
             })
 
+        # Convert credential-in-URL findings → Finding objects
+        for cred in cred_urls:
+            if is_in_scope(cred["url"], scope):
+                _source_label = (
+                    "URL userinfo (RFC-3986 user:password@host format)"
+                    if cred["source"] == "userinfo"
+                    else "URL path (credentials embedded in path segment)"
+                )
+                _user_info = f"user: {cred['username']}" if cred["username"] else "pattern matched in URL path"
+                raw_findings.append({
+                    "_source": "gau_credentials",
+                    "info": {
+                        "name": f"Credentials Exposed in URL — {cred['host']}",
+                        "severity": "high",
+                        "tags": ["exposure", "credentials", "sensitive-data"],
+                        "description": (
+                            f"GAU found a URL with plaintext credentials ({_user_info}) "
+                            f"via {_source_label} for {cred['host']}. "
+                            f"Credentials in URLs are logged by proxies, browsers, CDNs, "
+                            f"and web server access logs, leading to credential exposure. "
+                            f"Evidence URL: {cred['url']}"
+                        ),
+                    },
+                    "matched-at": f"https://{cred['host']}",
+                    "type": "exposure",
+                    "_credential_url": cred["url"],
+                    "_username": cred["username"] or "[extracted from path]",
+                    "_password": "[REDACTED]",
+                })
+
         # Convert GitHub dork findings → Finding objects
         for gh in github_findings:
             # matched-at must be the TARGET domain URL (not GitHub URL) so the
             # L1 scope filter passes. The GitHub evidence URL is kept in _evidence_url.
             query = gh.get("query", "")
+            is_org_repo = gh.get("_is_org_repo", False)
             target_domain = next(
                 (d.lstrip("*.") for d in scope.in_scope_domains if d.lstrip("*.") in query),
                 scope.in_scope_domains[0].lstrip("*.") if scope.in_scope_domains else "",
             )
             target_url = f"https://{target_domain}" if target_domain else gh["html_url"]
 
+            # Org-repo findings get higher severity — company's own committed secrets
+            severity = gh["severity"]
+            if is_org_repo and gh["severity"] in ("medium", "low"):
+                severity = "high"
+
             raw_findings.append({
                 "_source": "github_dork",
                 "info": {
-                    "name": f"Exposed {gh['secret_type']} in GitHub Repository",
-                    "severity": gh["severity"],
-                    "tags": ["token-disclosure", "exposure", "github"],
+                    "name": f"Exposed {gh['secret_type']} in {'Official' if is_org_repo else 'Third-Party'} GitHub Repository",
+                    "severity": severity,
+                    "tags": ["token-disclosure", "exposure", "github"]
+                          + (["official-repo"] if is_org_repo else ["third-party"]),
                     "description": (
                         f"Secret '{gh['secret_type']}' for {target_domain} found publicly "
-                        f"in {gh['repo']} → {gh['file_path']}. "
+                        f"in {'OFFICIAL org repo' if is_org_repo else 'third-party repo'} "
+                        f"{gh['repo']} → {gh['file_path']}. "
+                        f"{'This is a COMPANY-OWNED repository — much higher impact.' if is_org_repo else ''}"
                         f"Search query: {query}"
                     ),
                 },
@@ -591,57 +880,123 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 "_secret_type": gh["secret_type"],
             })
 
-        for raw in raw_findings:
-            finding = _nuclei_to_finding(raw, job)
+        # ── Phase 4.5: SQLi validation with sqlmap ───────────────────────────
+        # Find any SQLi candidates from nuclei and run sqlmap in safe time-based mode.
+        # Max 3 candidates — each sqlmap run can take up to 5 min.
+        sqli_candidates: list[str] = []
+        for _raw in raw_findings:
+            _tags = str(_raw.get("info", {}).get("tags", [])).lower()
+            _name = _raw.get("info", {}).get("name", "").lower()
+            if "sqli" in _tags or "sql" in _name:
+                _url = _raw.get("matched-at", "")
+                if _url and is_in_scope(_url, scope) and _url not in sqli_candidates:
+                    sqli_candidates.append(_url)
 
-            await _push_event(redis, scan_id, "finding_evaluating", {
-                "title": finding.title,
-                "url": finding.url,
-                "vuln_type": finding.vuln_type,
-            })
+        if sqli_candidates:
+            await _push_event(redis, scan_id, "phase_start", {"phase": "sqli_validation"})
+            sqlmap_confirmed: list[dict] = []
 
-            passed, reason = await finding_filter.run_all_layers(
-                finding, scope, program.raw_text
-            )
+            for _sql_url in sqli_candidates[:3]:
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "sqlmap",
+                    "detail": _sql_url[:120],
+                })
+                try:
+                    _sql_results = await tool_runner.run_sqlmap(_sql_url, scan_dir)
+                    sqlmap_confirmed.extend(_sql_results)
+                    await _push_event(redis, scan_id, "tool_done", {
+                        "tool": "sqlmap", "count": len(_sql_results),
+                    })
+                except Exception as _sm_err:
+                    # sqlmap not installed yet (requires rebuild) — skip silently
+                    await _push_event(redis, scan_id, "tool_done", {
+                        "tool": "sqlmap", "count": 0,
+                        "note": f"sqlmap unavailable: {str(_sm_err)[:80]}",
+                    })
 
-            if passed:
-                approved_count += 1
-                finding_path = os.path.join(finding_dir, "filtered", f"{finding.id}.json")
-                async with aiofiles.open(finding_path, "w") as f:
-                    await f.write(finding.model_dump_json(indent=2))
-
-                await _push_event(redis, scan_id, "finding_approved", {
-                    "id": finding.id,
-                    "title": finding.title,
-                    "severity": finding.severity,
-                    "reason": reason,
+            # Promote sqlmap-confirmed SQLi as high-priority raw findings
+            for _sf in sqlmap_confirmed:
+                raw_findings.append({
+                    "_source": "sqlmap",
+                    "info": {
+                        "name": "SQL Injection (Time-Based Blind) — Confirmed by sqlmap",
+                        "severity": "high",
+                        "tags": ["sqli", "injection"],
+                        "description": _sf["evidence"][:500],
+                    },
+                    "matched-at": _sf["url"],
+                    "type": "sqli",
                 })
 
-                # Phase 5: Generate report for this finding
-                try:
-                    report = await report_generator.generate(finding, scope)
-                    job.reports_count += 1
-                    await _push_event(redis, scan_id, "report_generated", {
-                        "finding_id": finding.id,
-                        "report_id": report.id,
-                        "title": report.title,
-                    })
-                except Exception as e:
-                    await _push_event(redis, scan_id, "report_error", {
-                        "finding_id": finding.id,
-                        "error": str(e),
-                    })
-            else:
-                rejected_count += 1
-                # Save rejected finding with reason for review
-                rejected_data = {**json.loads(finding.model_dump_json()), "rejection_reason": reason}
-                rej_path = os.path.join(finding_dir, "rejected", f"{finding.id}.json")
-                async with aiofiles.open(rej_path, "w") as f:
-                    await f.write(json.dumps(rejected_data, indent=2))
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "sqli_validation",
+                "candidates": len(sqli_candidates),
+                "confirmed": len(sqlmap_confirmed),
+            })
 
-                await _push_event(redis, scan_id, "finding_rejected", {
+        for raw in raw_findings:
+            # Wrap each finding individually so one Claude failure / network blip
+            # doesn't abort the remaining findings and crash the entire scan.
+            try:
+                finding = _nuclei_to_finding(raw, job)
+
+                await _push_event(redis, scan_id, "finding_evaluating", {
                     "title": finding.title,
-                    "reason": reason,
+                    "url": finding.url,
+                    "vuln_type": finding.vuln_type,
+                })
+
+                passed, reason = await finding_filter.run_all_layers(
+                    finding, scope, program.raw_text
+                )
+
+                if passed:
+                    approved_count += 1
+                    finding_path = os.path.join(finding_dir, "filtered", f"{finding.id}.json")
+                    async with aiofiles.open(finding_path, "w") as f:
+                        await f.write(finding.model_dump_json(indent=2))
+
+                    await _push_event(redis, scan_id, "finding_approved", {
+                        "id": finding.id,
+                        "title": finding.title,
+                        "severity": finding.severity,
+                        "reason": reason,
+                    })
+
+                    # Phase 5: Generate report for this finding
+                    try:
+                        report = await report_generator.generate(finding, scope)
+                        job.reports_count += 1
+                        await _push_event(redis, scan_id, "report_generated", {
+                            "finding_id": finding.id,
+                            "report_id": report.id,
+                            "title": report.title,
+                        })
+                    except Exception as _rep_err:
+                        await _push_event(redis, scan_id, "report_error", {
+                            "finding_id": finding.id,
+                            "error": str(_rep_err),
+                        })
+                else:
+                    rejected_count += 1
+                    # Save rejected finding with reason for review
+                    rejected_data = {**json.loads(finding.model_dump_json()), "rejection_reason": reason}
+                    rej_path = os.path.join(finding_dir, "rejected", f"{finding.id}.json")
+                    async with aiofiles.open(rej_path, "w") as f:
+                        await f.write(json.dumps(rejected_data, indent=2))
+
+                    await _push_event(redis, scan_id, "finding_rejected", {
+                        "title": finding.title,
+                        "reason": reason,
+                    })
+
+            except Exception as _finding_err:
+                # Single finding failed (Claude timeout, network error, bad JSON) —
+                # log and continue with the rest.
+                rejected_count += 1
+                await _push_event(redis, scan_id, "finding_error", {
+                    "error": str(_finding_err),
+                    "raw_title": str(raw.get("info", {}).get("name", ""))[:120],
                 })
 
         job.findings_count = approved_count
@@ -655,12 +1010,22 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             "reports": job.reports_count,
         })
 
+        # Expire scan event list after 24 h so Redis doesn't accumulate indefinitely
+        if redis:
+            await redis.expire(f"scan:{scan_id}:events", 86400)
+
     except Exception as e:
+        import logging
+        logging.getLogger("scans").exception("Scan %s crashed: %s", scan_id, e)
         job.status = ScanStatus.failed
         job.finished_at = datetime.utcnow()
         await _save_job(job, program_id)
         await _push_event(redis, scan_id, "scan_error", {"error": str(e)})
-        raise
+        # Expire failed scan events after 24 h
+        if redis:
+            await redis.expire(f"scan:{scan_id}:events", 86400)
+        # Do NOT re-raise — re-raising a fire-and-forget asyncio.create_task produces
+        # noisy "Task exception was never retrieved" logs with no benefit.
     finally:
         if redis:
             await redis.aclose()

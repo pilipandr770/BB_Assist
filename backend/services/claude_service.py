@@ -19,13 +19,36 @@ MODEL = "claude-sonnet-4-6"
 
 
 def _strip_json(text: str) -> str:
-    """Strip markdown code fences from Claude's JSON output."""
+    """
+    Extract a JSON object from Claude's response.
+
+    Handles:
+    1. Clean JSON — returned as-is
+    2. Markdown code fences  — ```json ... ``` stripped
+    3. JSON embedded in prose — find first { and matching closing } and extract
+    """
     text = text.strip()
+    if not text:
+        return text
+
+    # Strip markdown code fences
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
-        text = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-    return text.strip()
+        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        text = "\n".join(inner).strip()
+
+    # If it already looks like valid JSON, return it
+    if text.startswith("{"):
+        return text
+
+    # Last resort: find the first { and the last } and extract the substring.
+    # Handles cases where Claude prepends an explanation before the JSON object.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+
+    return text
 
 
 async def parse_scope(raw_program_text: str) -> Scope:
@@ -205,7 +228,19 @@ Decision:"""
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    data = json.loads(_strip_json(message.content[0].text))
+    raw_text = ""
+    try:
+        raw_text = message.content[0].text if message.content else ""
+        data = json.loads(_strip_json(raw_text))
+    except (json.JSONDecodeError, IndexError, Exception):
+        # Claude returned empty/invalid JSON — conservatively reject the finding
+        # rather than crashing the entire scan pipeline.
+        return FilterResult(
+            approved=False,
+            reason=f"Claude filter returned unparseable response (len={len(raw_text)}) — conservative rejection",
+            severity=Severity.informative,
+            attack_chain=None,
+        )
 
     severity = None
     if data.get("severity"):
@@ -215,8 +250,8 @@ Decision:"""
             severity = Severity.informative
 
     return FilterResult(
-        approved=data["approved"],
-        reason=data["reason"],
+        approved=data.get("approved", False),
+        reason=data.get("reason", "No reason provided"),
         severity=severity,
         attack_chain=data.get("attack_chain"),
     )
@@ -273,7 +308,19 @@ Is this confirmed?"""
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    data = json.loads(_strip_json(message.content[0].text))
+    raw_text = ""
+    try:
+        raw_text = message.content[0].text if message.content else ""
+        data = json.loads(_strip_json(raw_text))
+    except (json.JSONDecodeError, IndexError, Exception):
+        return PocResult(
+            confirmed=False,
+            evidence=f"Claude PoC validator returned unparseable response (len={len(raw_text)}) — manual review required",
+            safe_output="",
+            request=None,
+            response_snippet=None,
+        )
+
     return PocResult(
         confirmed=data["confirmed"],
         evidence=data["evidence"],

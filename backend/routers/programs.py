@@ -48,13 +48,34 @@ async def _load_program(program_id: str) -> Program:
 
 async def _save_program(program: Program) -> None:
     """Persist program to workspace using atomic write (write-then-rename)."""
-    os.makedirs(_program_dir(program.slug), exist_ok=True)
+    try:
+        os.makedirs(_program_dir(program.slug), exist_ok=True)
+    except OSError as e:
+        # errno 5 = Input/output error — Docker Desktop WSL2 volume IO issue.
+        # Tell the user to restart Docker rather than showing a cryptic 500.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Workspace volume IO error (errno {e.errno}). "
+                "This is a Docker Desktop / WSL2 issue — restart Docker Desktop and try again."
+            ),
+        ) from e
+
     final = _program_file(program.slug)
     # Unique tmp per call — prevents collisions from concurrent saves
     tmp = final + f".{uuid.uuid4().hex}.tmp"
-    async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-        await f.write(program.model_dump_json(indent=2))
-    os.replace(tmp, final)  # atomic on Linux — no partial reads possible
+    try:
+        async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+            await f.write(program.model_dump_json(indent=2))
+        os.replace(tmp, final)  # atomic on Linux — no partial reads possible
+    except OSError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Workspace write error (errno {e.errno}). "
+                "Restart Docker Desktop and try again."
+            ),
+        ) from e
 
 
 @router.post("", response_model=ApiResponse)

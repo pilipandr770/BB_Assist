@@ -48,6 +48,23 @@ NUCLEI_TAGS_RUN = (
 NUCLEI_SEVERITY = "low,medium,high,critical"
 
 
+def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:
+    """
+    Return command-line header arguments for the X-HackerOne-Researcher header.
+
+    Many H1 programs (e.g. Coupang, Shopify) require all testing traffic to carry
+    this header so their security team can identify researcher activity in logs.
+    Without it, findings may be disqualified or traffic flagged as malicious.
+
+    Returns e.g. ["-H", "X-HackerOne-Researcher: myusername"] if username is set,
+    or [] if not configured.
+    """
+    username = h1_username or settings.h1_username
+    if not username:
+        return []
+    return ["-H", f"X-HackerOne-Researcher: {username}"]
+
+
 async def _get_redis() -> Optional[aioredis.Redis]:
     """Return async Redis client, or None if Redis is unavailable."""
     try:
@@ -125,6 +142,7 @@ async def run_subfinder(domains: list[str], output_file: str) -> list[str]:
     """
     Discover subdomains with subfinder.
     Command: subfinder -dL {domains_file} -silent -o {output_file}
+    Timeout: 600s — 14 domains at 50 threads / 30s per-domain = well under 10 min.
     """
     domains_file = _write_temp_list(domains)
     try:
@@ -136,7 +154,9 @@ async def run_subfinder(domains: list[str], output_file: str) -> list[str]:
             "-t", "50",         # threads
             "-timeout", "30",   # per-domain timeout
         ]
-        rc, stdout, _ = await _run_command(cmd, stream_key=f"tool:subfinder:{output_file}")
+        # No stream_key — subfinder output (thousands of subdomains) is read from the
+        # output file; streaming every line to Redis wastes memory with no benefit.
+        rc, stdout, _ = await _run_command(cmd, timeout_s=600)
 
         # Read output file if it exists
         if os.path.exists(output_file):
@@ -153,6 +173,7 @@ async def run_dnsx(subdomains: list[str], output_file: str) -> list[str]:
     """
     Validate which subdomains have DNS records.
     Command: dnsx -silent -l {input_file} -o {output_file}
+    Timeout: 120s — 600 subdomains at 100 threads resolves in seconds normally.
     """
     input_file = _write_temp_list(subdomains)
     try:
@@ -163,7 +184,7 @@ async def run_dnsx(subdomains: list[str], output_file: str) -> list[str]:
             "-o", output_file,
             "-t", "100",
         ]
-        await _run_command(cmd, stream_key=f"tool:dnsx:{output_file}")
+        await _run_command(cmd, timeout_s=120)  # no stream_key — output read from file
 
         if os.path.exists(output_file):
             with open(output_file) as f:
@@ -173,31 +194,178 @@ async def run_dnsx(subdomains: list[str], output_file: str) -> list[str]:
         os.unlink(input_file)
 
 
+async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
+    """
+    Scan dnsx-validated hosts for non-standard web service ports.
+    Finds web apps running on 8080, 8443, 3000, 5000, etc. — often less hardened
+    than the standard 80/443 services and frequently forgotten in scope reviews.
+
+    CDN awareness: many targets share a CDN IP (e.g. Cloudflare 172.64.x.x).
+    nmap deduplicates by IP, so if 50 hosts resolve to the same IP, only one
+    hostname appears in the greppable output. We fix this by:
+      1. Pre-resolving all input hostnames → build ip→[hostnames] map
+      2. For each open port found, emit hostname:port for ALL hostnames on that IP
+         (capped at 20 hostnames per IP to avoid probe explosion)
+
+    Returns list of "hostname:port" strings ready for httpx to probe.
+    Always uses hostnames (never raw IPs) so CDN/SNI routing works correctly.
+    Caps at 100 hosts input; 30 s per-host timeout keeps the scan under 5 min.
+    """
+    import logging
+    import socket
+    log = logging.getLogger("tool_runner")
+
+    if not hosts:
+        return []
+
+    # Ports that commonly host web services but are NOT 80/443
+    WEB_PORTS = "8080,8443,8000,8888,8008,3000,3001,4000,4443,5000,5443,9000,9090,9443,7080,7443"
+
+    targets = hosts[:100]
+    targets_file = _write_temp_list(targets)
+
+    # Pre-resolve input hostnames → ip→[hostnames] map so we can expand CDN IPs
+    # back to all hostnames that share that IP (critical for Cloudflare/Fastly targets).
+    ip_to_hosts: dict[str, list[str]] = {}
+    for h in targets:
+        try:
+            ip = socket.gethostbyname(h)
+            ip_to_hosts.setdefault(ip, []).append(h)
+        except Exception:
+            pass
+
+    try:
+        cmd = [
+            "nmap",
+            "-iL", targets_file,
+            "-p", WEB_PORTS,
+            "--open",               # show only open ports
+            "-T4",                  # aggressive timing (fast)
+            "--max-retries", "1",
+            "--host-timeout", "30s",
+            "-oG", output_file,     # greppable output — easy to parse
+        ]
+        await _run_command(cmd, timeout_s=300)
+
+        # Parse greppable nmap output.
+        # Line format: Host: IP (hostname)\tPorts: PORT/open/tcp//service///[,...]
+        # ip_to_open_ports: {ip: set of open port strings}
+        ip_to_open_ports: dict[str, set] = {}
+        if os.path.exists(output_file):
+            with open(output_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line.startswith("Host:") or "Ports:" not in line:
+                        continue
+                    parts = line.split("\t")
+                    host_tokens = parts[0].split()
+                    ip = host_tokens[1] if len(host_tokens) > 1 else ""
+                    if not ip:
+                        continue
+
+                    # Extract open port numbers from "Ports:" section
+                    ports_section = ""
+                    for part in parts:
+                        stripped = part.strip()
+                        if stripped.startswith("Ports:"):
+                            ports_section = stripped[len("Ports:"):].strip()
+                            break
+
+                    for entry in ports_section.split(","):
+                        entry = entry.strip()
+                        if "/open/" in entry:
+                            port = entry.split("/")[0].strip()
+                            if port.isdigit():
+                                ip_to_open_ports.setdefault(ip, set()).add(port)
+
+        # Build final endpoint list: for each open port on each IP, emit hostname:port
+        # for ALL hostnames that resolved to that IP. This ensures CDN-fronted hosts
+        # are probed with the correct Host header (httpx uses the hostname, not the IP).
+        seen: set[str] = set()
+        endpoints: list[str] = []
+        for ip, open_ports in ip_to_open_ports.items():
+            # Find hostnames that resolve to this IP (from our pre-resolution map)
+            matched_hosts = ip_to_hosts.get(ip, [])
+            # If no match (nmap resolved to a different IP than we did), use nmap's hostname
+            if not matched_hosts:
+                # Try to find the hostname nmap put in parens — stored in parsing loop above
+                # Fall back to the IP itself (less ideal but functional for non-CDN hosts)
+                matched_hosts = [ip]
+            # Cap per-IP to 20 hostnames to avoid probe explosion (e.g. 86 hosts on one Cloudflare IP)
+            for hostname in matched_hosts[:20]:
+                for port in sorted(open_ports):
+                    ep = f"{hostname}:{port}"
+                    if ep not in seen:
+                        seen.add(ep)
+                        endpoints.append(ep)
+
+        log.info(
+            "nmap: %d open web ports on %d unique IPs → %d hostname:port probes",
+            sum(len(v) for v in ip_to_open_ports.values()),
+            len(ip_to_open_ports),
+            len(endpoints),
+        )
+        return endpoints
+    finally:
+        if os.path.exists(targets_file):
+            os.unlink(targets_file)
+
+
 async def run_httpx(hosts: list[str], output_file: str) -> list[dict]:
     """
     Probe live HTTP hosts and gather info.
-    Note: -silent is intentionally omitted — it suppresses JSON output in newer httpx versions.
-    We parse both the output file and stdout to be safe.
+
+    Design notes:
+    - dnsx outputs bare hostnames (no scheme). We prepend https:// so httpx
+      probes HTTPS by default instead of trying both HTTP+HTTPS.
+    - We try TWO flag sets: modern short flags first, then legacy long flags.
+      This handles all httpx versions installed via @latest.
+    - Always log stderr + result count to help diagnose zero-result issues.
     """
-    input_file = _write_temp_list(hosts)
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    # Normalise entries: strip any extra tokens from dnsx output
+    # (dnsx may add ' [A 1.2.3.4]' suffix on some versions).
+    # IMPORTANT: do NOT prepend a scheme to bare hostnames.
+    # When httpx receives a bare hostname (no http:// / https://) it probes
+    # BOTH http and https automatically, which doubles discovery coverage.
+    # Only keep an explicit scheme if the caller already provided one
+    # (e.g. entries from scope.in_scope_urls like https://app.example.com).
+    normed: list[str] = []
+    for h in hosts:
+        h = h.strip().split()[0]   # take first token only
+        if not h:
+            continue
+        normed.append(h)  # no scheme → httpx probes both HTTP + HTTPS
+
+    if not normed:
+        return []
+
+    input_file = _write_temp_list(normed)
     try:
-        cmd = [
-            "httpx",
-            "-l", input_file,
-            "-json",
-            "-o", output_file,
-            "-title",
-            "-tech-detect",
-            "-status-code",
-            "-content-length",
-            "-follow-redirects",
-            "-threads", "20",
-            "-timeout", "15",
-            "-rate-limit", "30",   # 150 was getting CDN-blocked (Cloudflare 429)
-            "-no-color",
-            "-retries", "1",
+        # IMPORTANT: use the full path to ProjectDiscovery httpx.
+        # pip installs a Python httpx CLI at /usr/local/bin/httpx which shadows
+        # the Go binary at /root/go/bin/httpx because /usr/local/bin is first in PATH.
+        # Using the full path guarantees we always call the right tool.
+        _HTTPX_BIN = "/root/go/bin/httpx"
+
+        # Two flag sets to try in order — handles @latest version differences.
+        # Set A: modern short aliases (httpx ≥ 1.3)
+        # Set B: legacy long flags (httpx ≤ 1.2) — fallback if A gives 0 results
+        _hdr = _h1_header_args()
+        cmd_sets = [
+            [  # Set A — modern short flags (v1.3+)
+                _HTTPX_BIN, "-l", input_file, "-json", "-o", output_file,
+                "-sc", "-cl", "-fr",
+                "-threads", "20", "-timeout", "10", "-rl", "30", "-retries", "1",
+            ] + _hdr,
+            [  # Set B — legacy long flags (v1.2 and below)
+                _HTTPX_BIN, "-l", input_file, "-json", "-o", output_file,
+                "-status-code", "-content-length", "-follow-redirects", "-no-color",
+                "-threads", "20", "-timeout", "10", "-rate-limit", "30", "-retries", "1",
+            ] + _hdr,
         ]
-        rc, stdout, stderr = await _run_command(cmd, stream_key=f"tool:httpx:{output_file}")
 
         results = []
         seen_urls: set[str] = set()
@@ -216,22 +384,49 @@ async def run_httpx(hosts: list[str], output_file: str) -> list[dict]:
                 except json.JSONDecodeError:
                     continue
 
-        # Try output file first, then fall back to stdout
-        if os.path.exists(output_file):
-            with open(output_file) as f:
-                _parse_jsonl(f.read())
-        if not results and stdout:
-            _parse_jsonl(stdout)
+        for i, cmd in enumerate(cmd_sets):
+            # Clear output file before each attempt
+            if os.path.exists(output_file):
+                os.remove(output_file)
 
+            rc, stdout, stderr = await _run_command(
+                cmd,
+                stream_key=f"tool:httpx:{output_file}",
+                timeout_s=300,
+            )
+
+            # Always log so Docker logs show what happened
+            log.info(
+                "httpx attempt %d/%d: rc=%d hosts=%d stderr_head=%s",
+                i + 1, len(cmd_sets), rc, len(normed), stderr[:200] if stderr else "",
+            )
+
+            results.clear()
+            seen_urls.clear()
+
+            if os.path.exists(output_file):
+                with open(output_file) as f:
+                    _parse_jsonl(f.read())
+            if not results and stdout:
+                _parse_jsonl(stdout)
+
+            log.info("httpx attempt %d: parsed %d results", i + 1, len(results))
+
+            if results:
+                break   # first flag set that works wins; skip the other
+
+        log.info("httpx: %d live hosts from %d probed", len(results), len(normed))
         return results
     finally:
-        os.unlink(input_file)
+        if os.path.exists(input_file):
+            os.unlink(input_file)
 
 
 async def run_gau(domain: str, output_file: str) -> list[str]:
     """
     Fetch known URLs from various sources (Wayback, Common Crawl, etc).
     Command: gau {domain} --blacklist png,jpg,gif,css,woff --o {output_file}
+    Timeout: 120s per domain — some domains return 50k+ URLs and we cap them anyway.
     """
     cmd = [
         "gau",
@@ -241,18 +436,26 @@ async def run_gau(domain: str, output_file: str) -> list[str]:
         "--threads", "5",
         "--timeout", "30",
     ]
-    await _run_command(cmd, stream_key=f"tool:gau:{output_file}")
+    # No stream_key: gau returns 10k-50k URLs per domain; pushing every line to
+    # Redis causes multi-hundred-MB RDB snapshots with zero benefit (output is
+    # read from the file, not the Redis stream).
+    await _run_command(cmd, timeout_s=120)
 
     if os.path.exists(output_file):
         with open(output_file) as f:
-            return [line.strip() for line in f if line.strip()]
+            urls = [line.strip() for line in f if line.strip()]
+        # Cap per-domain to avoid www.example.com → 50k URLs overwhelming the pool.
+        # The global all_target_urls cap (15k) is a backstop, but capping early
+        # reduces memory and Redis write pressure during the scan.
+        return urls[:10_000]
     return []
 
 
 async def run_katana(urls: list[str], output_file: str) -> list[str]:
     """
     Web crawl target URLs for endpoint discovery.
-    Command: katana -list {input_file} -silent -jc -o {output_file} -depth 3
+    Hard caps: 10 min wall time (-crawl-duration), 50k results (post-filter).
+    Depth 2 keeps JS-heavy SPAs from exploding to millions of routes.
     """
     input_file = _write_temp_list(urls)
     try:
@@ -260,18 +463,20 @@ async def run_katana(urls: list[str], output_file: str) -> list[str]:
             "katana",
             "-list", input_file,
             "-silent",
-            "-jc",              # JS crawling
+            "-jc",                   # JS crawling
             "-o", output_file,
-            "-depth", "3",
+            "-depth", "2",           # was 3 — depth 3 on SPAs = millions of URLs
             "-concurrency", "10",
             "-rate-limit", "50",
             "-timeout", "10",
-        ]
-        await _run_command(cmd, stream_key=f"tool:katana:{output_file}")
+            "-crawl-duration", "8m", # hard stop at 8 min regardless of depth
+        ] + _h1_header_args()
+        await _run_command(cmd, timeout_s=510)  # no stream_key — output read from file
 
         if os.path.exists(output_file):
-            with open(output_file) as f:
-                return [line.strip() for line in f if line.strip()]
+            urls_out = [line.strip() for line in open(output_file) if line.strip()]
+            # Cap at 50k — beyond that the signal/noise ratio collapses
+            return urls_out[:50_000]
         return []
     finally:
         os.unlink(input_file)
@@ -365,7 +570,7 @@ async def run_nuclei(
             "-retries", "1",
             "-nc",                           # no color codes in output
             # Note: interactsh ENABLED intentionally — needed for blind SSRF/XSS/XXE detection
-        ] + template_args
+        ] + template_args + _h1_header_args()
 
         MAX_NUCLEI_RUNTIME = 900  # 15 minutes hard cap — use partial results after
         rc, stdout, stderr = await _run_command(
@@ -432,7 +637,7 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
         "-rate", "30",     # CDN-friendly
         "-timeout", "10",
         "-silent",
-    ]
+    ] + _h1_header_args()
     await _run_command(cmd, stream_key=f"tool:ffuf:{output_file}", timeout_s=180)
 
     if os.path.exists(output_file):
@@ -450,6 +655,11 @@ async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict
     XSS scanner — only call if nuclei or manual review flagged XSS candidate.
     Command: dalfox url {url} --silence --format json -o {output_file}
     """
+    # dalfox uses --header instead of -H
+    _dalfox_hdrs = []
+    if settings.h1_username:
+        _dalfox_hdrs = ["--header", f"X-HackerOne-Researcher: {settings.h1_username}"]
+
     cmd = [
         "dalfox",
         "url", url,
@@ -458,7 +668,7 @@ async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict
         "-o", output_file,
         "--timeout", "10",
         "--delay", "100",
-    ]
+    ] + _dalfox_hdrs
 
     # Add specific params if provided
     if params:
@@ -485,10 +695,68 @@ async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict
     return []
 
 
+async def run_sqlmap(url: str, scan_dir: str) -> list[dict]:
+    """
+    Test URL for SQL injection using time-based blind technique only.
+
+    Safe mode constraints (won't upset program rules):
+    - --technique=T  → time-based blind only (no UNION, no error-based, no data dump)
+    - --level=1      → minimal parameter coverage
+    - --risk=1       → no heavy/destructive payloads
+    - --batch        → never interactive
+    - --threads=1    → single-threaded, CDN-friendly
+
+    Returns list of finding dicts if SQLi is confirmed, empty list otherwise.
+    A full rebuild is required before sqlmap is available (it's not in the base image).
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    output_dir = os.path.join(scan_dir, "sqlmap_output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    cmd = [
+        "sqlmap",
+        "-u", url,
+        "--technique=T",        # time-based blind only
+        "--level=1",
+        "--risk=1",
+        "--batch",              # no user prompts
+        "--output-dir", output_dir,
+        "--forms",              # also test HTML form fields
+        "--timeout", "10",
+        "--retries", "1",
+        "--threads", "1",
+        "-q",                   # quiet (less noise in logs)
+    ]
+
+    rc, stdout, stderr = await _run_command(cmd, timeout_s=300)
+
+    combined = (stdout + "\n" + stderr).lower()
+    findings = []
+
+    # sqlmap prints "parameter X appears to be 'TIME-BASED BLIND' injectable"
+    if "appears to be" in combined and ("injectable" in combined or "blind" in combined):
+        findings.append({
+            "url": url,
+            "tool": "sqlmap",
+            "technique": "time-based blind",
+            "evidence": (stdout or stderr)[:1500],
+        })
+        log.info("sqlmap: CONFIRMED SQLi at %s", url)
+    else:
+        log.info("sqlmap: no SQLi confirmed at %s", url)
+
+    return findings
+
+
 async def run_arjun(url: str, output_file: str) -> list[str]:
     """
     Discover hidden HTTP parameters.
     Command: arjun -u {url} -oJ {output_file} --stable -q
+    Timeout: 120s per URL — if arjun hasn't found params in 2 min, the endpoint
+    likely doesn't have discoverable params. Prevents 30-min arjun blocks on
+    large scopes (5 URLs × 360s = 30 min → now 5 × 120s = 10 min max).
     """
     cmd = [
         "arjun",
@@ -498,7 +766,7 @@ async def run_arjun(url: str, output_file: str) -> list[str]:
         "-q",
         "-t", "10",
     ]
-    await _run_command(cmd, stream_key=f"tool:arjun:{output_file}")
+    await _run_command(cmd, stream_key=f"tool:arjun:{output_file}", timeout_s=120)
 
     if os.path.exists(output_file):
         try:
@@ -570,7 +838,8 @@ async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
     """
     Download JS files and scan for secrets using regex.
     Returns list of findings: {url, secret_type, match, context, severity}.
-    Caps at 80 URLs, runs 10 downloads concurrently in a thread pool.
+    Caps at 200 URLs, prioritising first-party JS (not CDN/analytics/third-party).
+    Runs 10 downloads concurrently in a thread pool.
     """
     import logging
     log = logging.getLogger("tool_runner")
@@ -578,7 +847,20 @@ async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
     if not js_urls:
         return []
 
-    urls_to_scan = js_urls[:80]
+    # De-prioritise known CDN / analytics / third-party domains — they're never
+    # going to contain the target's secrets but make up the bulk of JS URLs.
+    CDN_NOISE = (
+        "cdn.", "static.", "assets.", "googletagmanager", "google-analytics",
+        "googleapis", "gstatic", "cloudflare", "jsdelivr", "unpkg", "cdnjs",
+        "jquery", "bootstrap", "fontawesome", "intercom", "segment",
+        "analytics", "hotjar", "mixpanel", "amplitude", "sentry-cdn",
+        "facebook", "twitter", "linkedin",
+    )
+    first_party = [u for u in js_urls if not any(n in u.lower() for n in CDN_NOISE)]
+    third_party  = [u for u in js_urls if     any(n in u.lower() for n in CDN_NOISE)]
+    ordered = first_party + third_party
+
+    urls_to_scan = ordered[:200]
     findings: list[dict] = []
     compiled = [(re.compile(pat), stype, sev) for pat, stype, sev in _JS_SECRET_PATTERNS]
     loop = asyncio.get_event_loop()
@@ -956,17 +1238,59 @@ async def run_subdomain_takeover(subdomains: list[str], output_file: str) -> lis
 
 # ── GitHub Dorking ────────────────────────────────────────────────────────────
 
-# Search queries — prioritised by signal quality
+# Search queries — prioritised by signal quality.
+# Queries require *assignment syntax* (=, :) near the domain to avoid
+# false positives from library docs / exchange lists that merely mention the domain.
+#
+# IMPORTANT: GitHub Code Search API does NOT support wildcard filename qualifiers
+# like NOT filename:*.md — those trigger a 422 (invalid query) that is silently
+# swallowed, causing the entire query to return 0 results.
+# Only use exact filename matches (NOT filename:README) or path exclusions
+# (NOT path:docs NOT path:test) which are fully supported.
 _GITHUB_DORK_QUERIES = [
-    '"{domain}" password',
-    '"{domain}" api_key OR apikey',
-    '"{domain}" secret',
-    '"{domain}" token',
-    '"{domain}" authorization',
-    '"{domain}" access_key OR accesskey',
-    '"{domain}" credentials',
-    '"{domain}" private_key',
+    # Config file patterns — exclude README/docs pages that just mention the domain
+    '"{domain}" password= NOT filename:README NOT path:docs NOT path:test',
+    '"{domain}" api_key= NOT filename:README NOT path:docs NOT path:test',
+    '"{domain}" secret= NOT filename:README NOT path:docs NOT path:test',
+    '"{domain}" access_token= NOT filename:README',
+    # YAML/JSON config patterns (common in CI config and docker-compose)
+    '"{domain}" password: NOT filename:README NOT path:docs',
+    '"{domain}" secret_key: NOT filename:README',
+    # .env files — exact filename exclusions work; wildcards do not
+    'filename:.env "{domain}" NOT filename:.env.example NOT filename:.env.sample',
+    'filename:.pem "{domain}"',
 ]
+
+# Org-specific high-value queries — run against the APEX domain's GitHub org.
+# These find secrets in the company's OWN repositories (much higher signal).
+# The {org} placeholder is replaced with the apex domain's subdomain-stripped name.
+_GITHUB_ORG_QUERIES = [
+    'org:{org} filename:.env password',
+    'org:{org} filename:.env secret',
+    'org:{org} filename:.env api_key',
+    'org:{org} password= NOT filename:README NOT filename:*.md',
+    'org:{org} secret= NOT filename:README NOT filename:*.md',
+]
+
+# Values that look like placeholder / template / example credentials — not real secrets.
+# Applied to the captured secret value (group 1) of generic patterns like password=/api_key=.
+_PLACEHOLDER_VALUE_RE = re.compile(
+    r'(?i)(?:'
+    r'your[-_]'                     # your_key, your-password, your_secret_id_here
+    r'|[-_]here$'                   # _here suffix: secret_key_here
+    r'|example'                     # example_key, example_secret
+    r'|placeholder'                 # placeholder_value
+    r'|dummy'                       # dummy_password
+    r'|fake'                        # fake_token
+    r'|making_validator'            # making_validator_happy (literal from findings)
+    r'|<[^>]+>'                     # <your_key_here>
+    r'|\{[^}]+\}'                   # {your_key}
+    r'|#+[A-Z_]+#+'                 # ###DB_PASSWORD###
+    r'|x{4,}'                       # xxxx, xxxxx (masked)
+    r'|\*{3,}'                      # ***, ***** (redacted)
+    r'|^(?:postgres|password|passwd|changeme|secret|admin|root|test|demo|sample|none|null|undefined|todo)$'
+    r')'
+)
 
 # Regex patterns to detect actual secrets in the code snippets GitHub returns
 _GH_SECRET_PATTERNS = [
@@ -1006,17 +1330,27 @@ def _github_search_sync(query: str, token: str) -> list[dict]:
 
                 # Only keep results that actually contain a detectable secret pattern
                 for regex, secret_type, severity in _GH_SECRET_PATTERNS:
-                    if regex.search(combined):
-                        results.append({
-                            "repo": item.get("repository", {}).get("full_name", ""),
-                            "file_path": item.get("path", ""),
-                            "html_url": item.get("html_url", ""),
-                            "secret_type": secret_type,
-                            "severity": severity,
-                            "query": query,
-                            "snippet": combined[:300],
-                        })
-                        break  # one finding per search result
+                    m = regex.search(combined)
+                    if not m:
+                        continue
+                    # For generic patterns (password=, api_key=) that capture the value,
+                    # reject if the captured value looks like a placeholder/template.
+                    # High-specificity patterns (AKIA*, sk_live_*, ghp_*, PEM headers)
+                    # have no capture group and are inherently non-placeholder.
+                    if m.lastindex:
+                        secret_value = m.group(1) or ""
+                        if _PLACEHOLDER_VALUE_RE.search(secret_value):
+                            continue  # skip — it's a template/example value
+                    results.append({
+                        "repo": item.get("repository", {}).get("full_name", ""),
+                        "file_path": item.get("path", ""),
+                        "html_url": item.get("html_url", ""),
+                        "secret_type": secret_type,
+                        "severity": severity,
+                        "query": query,
+                        "snippet": combined[:300],
+                    })
+                    break  # one finding per search result
     except urllib.error.HTTPError as e:
         if e.code == 403:
             pass  # Rate limited — skip silently
@@ -1044,7 +1378,7 @@ async def run_github_dork(domains: list[str], output_file: str,
     if not domains:
         return []
 
-    # Deduplicate domains and pick the base apex domains
+    # Deduplicate domains and extract apex + org names
     apex_domains: list[str] = []
     seen: set[str] = set()
     for d in domains:
@@ -1053,17 +1387,36 @@ async def run_github_dork(domains: list[str], output_file: str,
             seen.add(apex)
             apex_domains.append(apex)
 
+    # Derive GitHub org name from apex domain: "gocardless.com" → "gocardless"
+    # Companies almost always use their domain name as their GitHub org.
+    orgs = list({d.split(".")[0] for d in apex_domains})
+
     all_findings: list[dict] = []
     loop = asyncio.get_event_loop()
 
-    for domain in apex_domains[:3]:  # Max 3 domains to avoid rate limit
-        for query_template in _GITHUB_DORK_QUERIES[:5]:  # 5 queries per domain
+    # Phase A: broad domain queries (third-party repos, lower signal)
+    for domain in apex_domains[:2]:  # Max 2 domains to avoid rate limit
+        for query_template in _GITHUB_DORK_QUERIES:  # all 8 queries
             query = query_template.replace("{domain}", domain)
             results = await loop.run_in_executor(
                 None, _github_search_sync, query, github_token
             )
             all_findings.extend(results)
-            await asyncio.sleep(2.5)  # 30 req/min auth limit = 2s min; add buffer
+            await asyncio.sleep(2.5)  # 30 req/min auth limit
+
+    # Phase B: org-scoped queries (company's OWN repos — highest signal)
+    # These find secrets the company accidentally committed — always in scope.
+    for org in orgs[:2]:
+        for query_template in _GITHUB_ORG_QUERIES:
+            query = query_template.replace("{org}", org)
+            results = await loop.run_in_executor(
+                None, _github_search_sync, query, github_token
+            )
+            # Mark org findings so the LLM filter can apply appropriate context
+            for r in results:
+                r["_is_org_repo"] = True
+            all_findings.extend(results)
+            await asyncio.sleep(2.5)
 
     # Deduplicate by html_url
     seen_urls: set[str] = set()
@@ -1078,6 +1431,6 @@ async def run_github_dork(domains: list[str], output_file: str,
             for item in unique_findings:
                 f_out.write(json.dumps(item) + "\n")
 
-    log.info("github_dork: %d secrets found across %d domains",
-             len(unique_findings), len(apex_domains))
+    log.info("github_dork: %d secrets found across %d domains (%d org queries)",
+             len(unique_findings), len(apex_domains), len(orgs))
     return unique_findings
