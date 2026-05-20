@@ -348,6 +348,8 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             "tool": "nmap", "count": len(nmap_endpoints),
         })
 
+        detected_techs: set[str] = set()  # populated after httpx completes
+
         # httpx — probe live hosts + always include explicit scope URLs so we get
         # at least metadata for known-good targets even if all subfinder hosts fail.
         # (Most subfinder subdomains resolve in DNS but have no web service → 0 httpx results)
@@ -366,6 +368,13 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         http_results = await tool_runner.run_httpx(httpx_targets, httpx_out)
         live_urls = [r.get("url", "") for r in http_results if r.get("url")]
         await _push_event(redis, scan_id, "tool_done", {"tool": "httpx", "count": len(live_urls)})
+
+        # Extract tech stack from httpx results for smarter nuclei CVE targeting
+        detected_techs: set[str] = tool_runner.extract_tech_stack(http_results)
+        if detected_techs:
+            await _push_event(redis, scan_id, "tech_detected", {
+                "techs": sorted(detected_techs),
+            })
 
         # Fallback 1: httpx found nothing → seed from explicit scope URLs
         if not live_urls and explicit_scope_urls:
@@ -723,7 +732,9 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
 
             ticker = asyncio.create_task(_nuclei_progress_ticker())
             try:
-                raw_findings = await tool_runner.run_nuclei(nuclei_urls, nuclei_out, scope)
+                raw_findings = await tool_runner.run_nuclei(
+                    nuclei_urls, nuclei_out, scope, detected_techs=detected_techs
+                )
             finally:
                 ticker.cancel()
 

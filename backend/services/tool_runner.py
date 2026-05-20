@@ -47,6 +47,51 @@ NUCLEI_TAGS_RUN = (
 
 NUCLEI_SEVERITY = "low,medium,high,critical"
 
+# Maps normalized tech names (from httpx output) to nuclei CVE tags.
+# Used for a targeted second nuclei pass on http/cves when tech is detected.
+_TECH_NUCLEI_TAGS: dict[str, str] = {
+    "wordpress": "wordpress", "wp": "wordpress",
+    "drupal": "drupal", "joomla": "joomla",
+    "laravel": "laravel", "codeigniter": "codeigniter",
+    "spring": "spring", "springboot": "springboot",
+    "jenkins": "jenkins", "jira": "jira",
+    "confluence": "confluence", "gitlab": "gitlab",
+    "grafana": "grafana", "kibana": "kibana",
+    "elasticsearch": "elasticsearch", "solr": "solr",
+    "apache": "apache", "nginx": "nginx", "iis": "iis",
+    "php": "php", "rails": "rails", "django": "django",
+    "struts": "struts", "tomcat": "tomcat",
+    "weblogic": "weblogic", "websphere": "websphere",
+    "sharepoint": "sharepoint", "exchange": "exchange",
+    "citrix": "citrix", "vmware": "vmware",
+    "magento": "magento", "opencart": "opencart",
+    "prestashop": "prestashop", "woocommerce": "woocommerce",
+    "phpmyadmin": "phpmyadmin", "adminer": "adminer",
+    "nextjs": "nextjs", "react": "react",
+    "litespeed": "litespeed", "caddy": "caddy",
+    "cloudflare": "cloudflare",
+}
+
+
+def extract_tech_stack(http_results: list[dict]) -> set[str]:
+    """
+    Parse httpx JSONL results to extract a normalized set of detected technologies.
+    httpx reports tech via 'tech', 'technologies', or 'technology' depending on version.
+    Also checks the 'webserver' field for server banners.
+    """
+    techs: set[str] = set()
+    for r in http_results:
+        for field in ("tech", "technologies", "technology"):
+            for t in (r.get(field) or []):
+                name = str(t).split(":")[0].split("/")[0].lower().strip()
+                if name and len(name) > 1:
+                    techs.add(name)
+        ws = (r.get("webserver") or "").lower()
+        for tech in ("apache", "nginx", "iis", "caddy", "gunicorn", "litespeed", "tomcat", "cloudflare"):
+            if tech in ws:
+                techs.add(tech)
+    return techs
+
 
 def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:
     """
@@ -487,6 +532,7 @@ async def run_nuclei(
     output_file: str,
     scope: Scope,
     tags: str = NUCLEI_TAGS_RUN,
+    detected_techs: set[str] | None = None,
 ) -> list[dict]:
     """
     Run nuclei vulnerability scanner with curated templates.
@@ -602,6 +648,56 @@ async def run_nuclei(
                     except json.JSONDecodeError:
                         continue
         log.info("nuclei: %d findings from %d scoped URLs", len(findings), len(scoped_urls))
+
+        # ── Tech-stack targeted CVE second pass ───────────────────────────────
+        # If httpx detected specific technologies, run a targeted nuclei pass
+        # against http/cves with tech-specific tags (90s hard cap).
+        # This is a SEPARATE invocation so -tags doesn't filter the main scan subdirs.
+        if detected_techs and templates_dir:
+            cve_dir = os.path.join(templates_dir, "http", "cves")
+            if os.path.isdir(cve_dir):
+                cve_tags = list(dict.fromkeys(
+                    _TECH_NUCLEI_TAGS[t] for t in detected_techs if t in _TECH_NUCLEI_TAGS
+                ))[:6]  # cap at 6 tags to keep template count manageable
+                if cve_tags:
+                    cve_out = output_file.replace(".jsonl", "_cve.jsonl")
+                    cve_cmd = [
+                        "nuclei",
+                        "-l", input_file,
+                        "-t", cve_dir,
+                        "-tags", ",".join(cve_tags),
+                        "-severity", NUCLEI_SEVERITY,
+                        "-jsonl-export", cve_out,
+                        "-j",
+                        "-silent",
+                        "-rate-limit", "100",
+                        "-bulk-size", "30",
+                        "-concurrency", "15",
+                        "-timeout", "10",
+                        "-retries", "1",
+                        "-nc",
+                    ] + _h1_header_args()
+                    log.info("nuclei-cve: running with tags=%s", ",".join(cve_tags))
+                    await _run_command(cve_cmd, timeout_s=90)
+
+                    cve_count_before = len(findings)
+                    if os.path.exists(cve_out):
+                        with open(cve_out) as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        obj = json.loads(line)
+                                        obj["_cve_pass"] = True
+                                        findings.append(obj)
+                                    except json.JSONDecodeError:
+                                        continue
+                    log.info(
+                        "nuclei-cve: %d additional findings (tags=%s)",
+                        len(findings) - cve_count_before,
+                        ",".join(cve_tags),
+                    )
+
         return findings
     finally:
         os.unlink(input_file)

@@ -6,31 +6,37 @@ const EVENT_COLORS = {
   phase_done: '#3fb950',
   tool_start: '#8b949e',
   tool_done: '#58a6ff',
+  tool_skip: '#6e7681',
   nuclei_progress: '#8b949e',
+  pipeline_config: '#8b949e',
+  tech_detected: '#a371f7',
   finding_approved: '#f0883e',
   finding_rejected: '#6e7681',
   finding_evaluating: '#d29922',
+  finding_error: '#f85149',
   report_generated: '#3fb950',
   report_error: '#f85149',
   scan_done: '#3fb950',
   scan_error: '#f85149',
-  heartbeat: null, // hidden
+  heartbeat: null,
 }
 
 const PHASE_LABELS = {
-  passive_recon:       '🔍 Passive Recon',
-  github_dork:         '🐙 GitHub Dorking',
-  active_recon:        '📡 Active Recon',
-  content_discovery:   '📂 Content Discovery',
-  js_scan:             '🔑 JS Secret Scan',
-  bypass_403:          '🔓 403 Bypass Test',
-  param_discovery:     '🎯 Parameter Discovery',
-  cors_check:          '🌐 CORS Check',
-  subdomain_takeover:  '💀 Subdomain Takeover',
-  nuclei_scan:         '⚡ Nuclei Scan',
-  filtering:           '🤖 AI Filtering',
-  complete:            '✅ Complete',
-  failed:              '❌ Failed',
+  passive_recon:         '🔍 Passive Recon',
+  passive_recon_detail:  '🔍 Passive Recon',
+  github_dork:           '🐙 GitHub Dorking',
+  active_recon:          '📡 Active Recon',
+  content_discovery:     '📂 Content Discovery',
+  js_scan:               '🔑 JS Secret Scan',
+  bypass_403:            '🔓 403 Bypass Test',
+  param_discovery:       '🎯 Parameter Discovery',
+  cors_check:            '🌐 CORS Check',
+  subdomain_takeover:    '💀 Subdomain Takeover',
+  nuclei_scan:           '⚡ Nuclei Scan',
+  sqli_validation:       '💉 SQLi Validation',
+  filtering:             '🤖 AI Filtering',
+  complete:              '✅ Complete',
+  failed:                '❌ Failed',
 }
 
 const SEVERITY_COLOR = {
@@ -70,7 +76,7 @@ export default function ScanProgress() {
     const EVENTS = Object.keys(EVENT_COLORS)
     EVENTS.forEach(evType => {
       es.addEventListener(evType, (e) => {
-        if (evType === 'heartbeat') return // skip silently
+        if (evType === 'heartbeat' || evType === 'pipeline_config') return
         try {
           const data = JSON.parse(e.data)
           if (evType === 'scan_done' || evType === 'scan_error') {
@@ -123,6 +129,16 @@ export default function ScanProgress() {
         addLine(`    ⟳ ${data.tool}  ${data.detail ? `(${data.detail})` : ''}`, color)
         break
 
+      case 'tool_skip':
+        addLine(`    ⊘ ${data.tool} skipped${data.reason ? ` — ${data.reason}` : ''}`, color)
+        break
+
+      case 'tech_detected': {
+        const techList = (data.techs || []).join(', ')
+        addLine(`  🔬 Tech detected: ${techList || 'none'}`, color)
+        break
+      }
+
       case 'tool_done': {
         const extras = []
         if (data.count != null) extras.push(`${data.count} results`)
@@ -160,6 +176,10 @@ export default function ScanProgress() {
         setStats(s => ({ ...s, reports: s.reports + 1 }))
         if (data.report_id) setReportIds(ids => [...ids, data.report_id])
         addLine(`  📄 Report ready: ${data.title}`, color)
+        break
+
+      case 'finding_error':
+        addLine(`  ✗ Finding error: ${data.raw_title || ''} — ${data.error}`, color)
         break
 
       case 'report_error':

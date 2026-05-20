@@ -5,105 +5,103 @@
 
 ---
 
-## Current status: SKELETON COMPLETE — Ready for implementation
+## Current status: v2 WORKING — Full scan pipeline operational
 
-**Phase**: Phase 1 of 3
-**What exists**: Full project structure + all configuration + skeleton code with TODO markers
-**What works**: Nothing yet (no implementation)
-**Next action**: Implement backend services (start from `claude_service.py`)
+**Phase**: Active development — v2 improvements
+**What exists**: Fully implemented backend + frontend — the entire scan pipeline runs end-to-end
+**What works**: Everything. Real scans against real programs. AI-filtered findings. Report generation.
+**Last tested**: Telegram wallet program (walletbot.me) — 5 live hosts, 1604 URLs, 15 min full scan
 
 ---
 
 ## Completed ✅
 
-- [x] Project structure and all directories
-- [x] Docker Compose + Dockerfile (tools installation)
-- [x] `.env.example` with all keys documented
-- [x] `backend/config.py` — settings
-- [x] `backend/models.py` — all Pydantic models
-- [x] `backend/main.py` — FastAPI app skeleton with routes registered
-- [x] `backend/routers/programs.py` — route handlers (bodies are TODO)
-- [x] `backend/routers/scans.py` — route handlers (bodies are TODO)
-- [x] `backend/routers/reports.py` — route handlers (bodies are TODO)
-- [x] `backend/services/claude_service.py` — prompts defined, API calls are TODO
-- [x] `backend/services/scope_parser.py` — logic skeleton (TODO)
-- [x] `backend/services/passive_recon.py` — API integrations skeleton (TODO)
-- [x] `backend/services/tool_runner.py` — subprocess runner skeleton (TODO)
-- [x] `backend/services/finding_filter.py` — 3-layer filter skeleton (TODO)
-- [x] `backend/services/poc_validator.py` — PoC validation skeleton (TODO)
-- [x] `backend/services/report_generator.py` — report builder skeleton (TODO)
-- [x] `frontend/src/App.jsx` — routing skeleton
-- [x] `frontend/src/components/` — all 5 components skeleton
-- [x] All docs (ARCHITECTURE.md, WORKFLOW.md, TOOLS.md, APIS.md, REPORT_FORMAT.md)
+### Infrastructure
+- [x] Docker Compose + Dockerfile (all Go tools installed)
+- [x] Redis event streaming (SSE for live scan progress)
+- [x] FastAPI backend with zombie-scan detection on restart
+- [x] React frontend — full routing, terminal-style scan UI
+
+### Backend services (all fully implemented)
+- [x] `claude_service.py` — scope parsing, plan generation, finding filter, PoC validation, report generation
+- [x] `scope_parser.py` — domain/URL scope matching, wildcard support, excluded vuln type detection
+- [x] `passive_recon.py` — crt.sh, Wayback CDX, VirusTotal, URLScan, OTX (key-optional)
+- [x] `tool_runner.py` — all 13 tools via asyncio subprocess
+- [x] `finding_filter.py` — 3-layer filter (scope → Claude AI → PoC)
+- [x] `poc_validator.py` — automated PoC confirmation
+- [x] `report_generator.py` — HackerOne-ready markdown reports
+
+### Full scan pipeline (all phases implemented)
+- [x] Phase 1: Passive recon (crt.sh, Wayback, VirusTotal, URLScan, OTX) — parallel per apex domain
+- [x] Phase 2: Active recon — subfinder → dnsx → nmap (non-standard ports) → httpx → gau → katana
+- [x] Phase 2.5: Content discovery — ffuf (top 5 hosts, 200/403 tracking)
+- [x] Phase 2.6: JS secret scanning — regex on up to 200 .js files
+- [x] Phase 2.7: 403 bypass testing — header + path tricks
+- [x] Phase 2.8: Parameter discovery — arjun (5 endpoints, 120s cap)
+- [x] Phase 2.9: CORS misconfiguration check — 4 attack patterns on 60 live URLs
+- [x] Phase 2.10: Subdomain takeover — 30 provider fingerprints on up to 200 subdomains
+- [x] Phase 3: Nuclei scan — 6 high-value template subdirs, smart URL selection (max 500)
+- [x] Phase 3.1: GitHub dorking — domain + org queries, placeholder filtering
+- [x] Phase 4: SQLi validation — sqlmap time-based blind on nuclei candidates
+- [x] Phase 5: AI filtering — Claude 3-layer filter (scope → impact → PoC)
+- [x] Phase 6: Report generation — Claude-written H1-ready markdown
+
+### Intelligence & safety
+- [x] Program-type adaptation (web/api/mobile/blockchain skips irrelevant phases)
+- [x] "No automated scanner" keyword detection → nuclei disabled
+- [x] X-HackerOne-Researcher header on all outbound tool traffic
+- [x] CDN-aware nmap (expands Cloudflare IPs → all hostnames)
+- [x] GAU dedup + per-domain cap (10k URLs, 5 apex domains)
+- [x] httpx fallback chain (explicit scope URLs → generated domain URLs)
+- [x] Nuclei progress ticker (keeps SSE alive during 15-min scans)
+- [x] Zombie scan detection on reconnect
+- [x] Credential-in-URL detection (GAU output, RFC-3986 + path patterns)
+
+### Frontend (all fully implemented)
+- [x] `ProgramInput.jsx` — paste scope, submit, store to Redis
+- [x] `PlanReview.jsx` — show generated plan, approve button
+- [x] `ScanProgress.jsx` — live terminal SSE output, status bar, phase labels
+- [x] `FindingsList.jsx` — filtered findings with severity badges
+- [x] `ReportViewer.jsx` — markdown renderer + copy button
+- [x] `ReportsList.jsx` — all reports per program
+- [x] `ProgramsList.jsx` — saved programs list
 
 ---
 
-## Phase 1 — Backend core (implement next) 🔧
+## v2 Improvements — In progress 🔧
 
-### Step 1: `backend/services/claude_service.py`
-This is the brain. Implement all Claude API calls.
-- `parse_scope(program_text)` → structured scope JSON
-- `generate_plan(scope)` → testing plan with tool commands
-- `filter_finding(finding, scope)` → is this worth reporting?
-- `validate_poc(finding, poc_output)` → does the PoC prove real impact?
-- `generate_report(finding)` → H1-ready markdown
+### ✅ Done in this session
+- [x] PROGRESS.md updated to reflect real state
+- [x] Tech stack detection from httpx results (`extract_tech_stack`)
+- [x] Nuclei CVE second-pass with tech-specific tags (separate 90s bounded run)
+- [x] `tech_detected` event pushed to frontend with detected stack
+- [x] UI: `tool_skip` event handled and displayed
+- [x] UI: `pipeline_config` event displayed (shows what phases are enabled)
+- [x] UI: `tech_detected` event displayed prominently
+- [x] UI: `finding_error` event handled
+- [x] UI: `passive_recon_detail` added to PHASE_LABELS
+- [x] UI: `sqli_validation` added to PHASE_LABELS
 
-**Key constraint**: The filter must be strict. Re-read ARCHITECTURE.md section "Three-layer filter".
-The lesson from rejected reports: HSTS missing = reject, missing CSP = reject, missing headers = reject.
-Only findings with demonstrated exploitation chain get through.
-
-### Step 2: `backend/services/scope_parser.py`
-Parse raw H1 program text into structured scope.
-Output must include:
-- `in_scope_domains: list[str]`
-- `in_scope_urls: list[str]`
-- `out_of_scope_domains: list[str]`
-- `excluded_vuln_types: list[str]` (parse "Out of scope vulnerabilities" section)
-- `allowed_test_endpoints: list[str]`
-- `program_type: str` (web, api, blockchain, mobile, etc.)
-
-### Step 3: `backend/services/passive_recon.py`
-Implement all free API calls. No key needed for crt.sh and Wayback.
-Order: crt.sh → Wayback CDX → IPInfo → VirusTotal (if key) → URLScan (if key) → OTX (if key)
-Always check if API key exists before calling keyed APIs.
-
-### Step 4: `backend/services/tool_runner.py`
-Run Go tools via asyncio subprocess.
-Critical: always pass scope to every tool call — never scan out-of-scope targets.
-Stream stdout to Redis so frontend can show live progress.
-
-### Step 5: `backend/services/finding_filter.py`
-Three layers:
-1. Scope check (in-scope domain? allowed vuln type?)
-2. Value check (has Claude said this has real impact?)
-3. PoC check (did poc_validator confirm it?)
-Only pass all three → becomes a report candidate.
-
-### Step 6: Routers (after services work)
-Wire up the service calls into the route handlers.
-Test each endpoint with curl before moving to frontend.
+### Next improvements to make
+- [ ] **Nuclei template curator** — detect WordPress/Jenkins/Jira and run targeted CVE subdirs
+- [ ] **Wappalyzer-style detection** — use httpx `tech` field to show tech stack in UI
+- [ ] **Program history** — list past scans per program with finding counts
+- [ ] **Scan comparison** — diff findings between two scans of same program
+- [ ] **Rate limit config** — per-program custom rate limits (some programs allow 100 req/s)
+- [ ] **Manual finding entry** — add findings found manually (not from scanner)
+- [ ] **Re-run single phase** — restart just nuclei or just JS scan without full re-scan
 
 ---
 
-## Phase 2 — Frontend 🎨
+## Known gaps / limitations
 
-Start only after backend API is fully working.
-
-Components to implement in order:
-1. `ProgramInput.jsx` — textarea + submit, call POST /api/programs
-2. `PlanReview.jsx` — show plan, approve button, call POST /api/scans/start
-3. `ScanProgress.jsx` — WebSocket or SSE for live tool output
-4. `FindingsList.jsx` — show filtered findings with severity badges
-5. `ReportViewer.jsx` — markdown renderer + copy button
-
----
-
-## Phase 3 — Testing & tuning 🧪
-
-- Test against Circle BBP (Arc testnet — the program from initial session)
-- Test against OPPO (learn from the rejected HSTS report)
-- Tune Claude filter prompts based on real results
-- Add nuclei template filtering (suppress noisy low-value templates)
+| Gap | Impact | Fix needed |
+|---|---|---|
+| No authenticated scanning | Misses /api/ endpoints behind auth | Add cookie/JWT injection to httpx/katana |
+| nuclei CVE templates = years-based dirs | Can't target specific tech CVEs cleanly | Tech-tag based second pass (now added) |
+| arjun still slow on some targets | 5 × 120s = 10 min worst case | Already capped; acceptable |
+| GitHub dork rate limit (30 req/min) | Slow for 2+ domains | Already capped at 2 apex domains |
+| No APK/mobile analysis | Misses mobile-only programs | Future: MobSF integration |
 
 ---
 
@@ -119,6 +117,8 @@ Components to implement in order:
 | Three-layer filter before report | Learned from rejected reports: no scanner dumps |
 | Free APIs only for now | crt.sh/Wayback = no key, others = free tier |
 | No Burp/Metasploit | GUI tools, can't automate well; Go tools are better |
+| 500 URL cap for nuclei | >500 → scan takes >30 min with diminishing returns |
+| Separate CVE second-pass for nuclei | Avoids -tags globally filtering all template dirs |
 
 ---
 
@@ -126,18 +126,18 @@ Components to implement in order:
 
 **OPPO rejected** — Missing HSTS report:
 - Reason: "no significant security impact", "best practice not a vulnerability"
-- Fix in tool: filter ALL missing-header findings unless chained to real exploit
+- Fix: filter ALL missing-header findings unless chained to real exploit ✅ (Claude filter handles this)
 
 **PayPal rejected** — 10 findings from scanner:
 - Reason: "automated scanner output", "no working PoC", "not exploitable"
-- Fix in tool: NEVER submit scanner output directly
-- Items that were out of scope per PayPal rules: missing CSP, HttpOnly, SameSite, DKIM, Referrer-Policy, Permissions-Policy — all filtered
+- Fix: NEVER submit scanner output directly; PoC required ✅ (Layer 3 handles this)
+- Items that were out of scope per PayPal rules: missing CSP, HttpOnly, SameSite, DKIM, Referrer-Policy, Permissions-Policy ✅ (excluded_vuln_types filter)
 
 **Rule**: If the program's "Out of scope" section lists it → automatically drop finding, never show user.
 
 ---
 
-## How to run (when implemented)
+## How to run
 
 ```bash
 docker-compose up --build
@@ -146,10 +146,10 @@ docker-compose up --build
 # API docs: http://localhost:8000/docs
 ```
 
-## Environment variables needed
+## Environment variables
 
-See `.env.example` — minimum required is only `ANTHROPIC_API_KEY`.
-All other API keys are optional (tool degrades gracefully without them).
+See `.env.example` — minimum required is `ANTHROPIC_API_KEY`.
+Optional: `GITHUB_TOKEN` (GitHub dorking), `VIRUSTOTAL_API_KEY`, `URLSCAN_API_KEY`, `OTX_API_KEY`.
 
 ---
 
@@ -157,4 +157,4 @@ All other API keys are optional (tool degrades gracefully without them).
 
 1. This file (PROGRESS.md)
 2. ARCHITECTURE.md (system design)
-3. The specific service file you're implementing
+3. The specific file you're working on
