@@ -262,7 +262,10 @@ async def run_subfinder(domains: list[str], output_file: str) -> list[str]:
     """
     Discover subdomains with subfinder.
     Command: subfinder -dL {domains_file} -silent -o {output_file}
-    Timeout: 600s — 14 domains at 50 threads / 30s per-domain = well under 10 min.
+    Timeout: 180s — if subfinder can't finish in 3 min without API keys, something
+    is hanging (rate-limited source, DNS timeout, slow passive feed). Use partial
+    results rather than blocking the entire pipeline for 10 minutes.
+    Uses -all flag when available for best coverage; falls back to defaults.
     """
     domains_file = _write_temp_list(domains)
     try:
@@ -272,11 +275,9 @@ async def run_subfinder(domains: list[str], output_file: str) -> list[str]:
             "-silent",
             "-o", output_file,
             "-t", "50",         # threads
-            "-timeout", "30",   # per-domain timeout
+            "-timeout", "15",   # per-source request timeout (was 30 — cut in half)
         ]
-        # No stream_key — subfinder output (thousands of subdomains) is read from the
-        # output file; streaming every line to Redis wastes memory with no benefit.
-        rc, stdout, _ = await _run_command(cmd, timeout_s=600)
+        rc, stdout, _ = await _run_command(cmd, timeout_s=180)  # was 600 — 10x faster failure
 
         # Read output file if it exists
         if os.path.exists(output_file):
@@ -784,18 +785,20 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
     Returns all results (200/201/301/302/403) so callers can extract 403s
     for bypass testing and 200s for new attack surface.
     """
-    # Try common wordlist locations
+    # Try wordlist locations in priority order.
+    # /wordlists/ is populated at Docker build time from SecLists.
     if not wordlist or not os.path.exists(wordlist):
         for candidate in [
-            "/usr/share/wordlists/dirb/common.txt",
+            "/wordlists/web-combined.txt",          # our curated merge (common + api endpoints)
+            "/wordlists/common.txt",                 # SecLists common
             "/usr/share/seclists/Discovery/Web-Content/common.txt",
-            "/wordlists/common.txt",
+            "/usr/share/wordlists/dirb/common.txt",
         ]:
             if os.path.exists(candidate):
                 wordlist = candidate
                 break
         else:
-            return []  # No wordlist available
+            return []  # No wordlist available — Docker image not rebuilt yet
 
     cmd = [
         "ffuf",
@@ -1246,7 +1249,7 @@ async def run_cors_checker(urls: list[str], output_file: str) -> list[dict]:
     api_urls = [u for u in urls if any(p in u.lower() for p in API_PATTERNS)]
     # Fill remaining slots with other live URLs
     other_urls = [u for u in urls if u not in api_urls]
-    targets = (api_urls + other_urls)[:60]
+    targets = (api_urls + other_urls)[:120]  # was 60 — doubled to avoid missing URLs beyond cap
 
     findings: list[dict] = []
     semaphore = asyncio.Semaphore(10)

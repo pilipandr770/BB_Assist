@@ -626,16 +626,23 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 if "?" in _u or not is_in_scope(_u, scope):
                     continue
                 try:
-                    _path = urlparse(_u).path.lower()
+                    _parsed_u = urlparse(_u)
+                    _path = _parsed_u.path.lower()
                 except Exception:
                     continue
                 # Skip static / asset files — arjun has no business scanning them
                 if any(_path.endswith(_ext) for _ext in STATIC_EXTS):
                     continue
+                # Skip URLs with duplicate path segments — these are crawler artifacts
+                # e.g. /customer_support/API/register/API/register/API/logging/ from katana
+                # following relative hrefs recursively on SPAs.
+                _raw_parts = [p for p in _path.split("/") if p]
+                if len(_raw_parts) != len(set(_raw_parts)):
+                    continue
                 # Only match within the FIRST TWO path segments.
                 # Real API endpoints live at /api/..., /auth/..., /oauth/...
                 # Deep content pages like /legal/modernslaverystatement/api/ are not APIs.
-                _parts = [p for p in _path.split("/") if p]
+                _parts = _raw_parts
                 _path_prefix = "/" + "/".join(_parts[:2])
                 if _ARJUN_PATH_RE.search(_path_prefix):
                     param_targets.append(_u)
@@ -674,7 +681,7 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         await _push_event(redis, scan_id, "phase_start", {"phase": "cors_check"})
         await _push_event(redis, scan_id, "tool_start", {
             "tool": "cors_checker",
-            "detail": f"{min(len(live_urls), 60)} live URLs",
+            "detail": f"{min(len(live_urls), 120)} live URLs",
         })
         cors_out = os.path.join(scan_dir, "cors.jsonl")
         cors_findings = await tool_runner.run_cors_checker(live_urls, cors_out)

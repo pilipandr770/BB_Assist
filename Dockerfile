@@ -15,6 +15,19 @@ RUN wget -q https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz \
 # shadow the ProjectDiscovery httpx scanner at /root/go/bin/httpx.
 ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH
 
+# Download wordlists for ffuf/directory fuzzing.
+# Using curated lists from SecLists — small enough to keep image lean,
+# large enough to catch real findings (admin panels, .env files, backups).
+RUN mkdir -p /wordlists && \
+    wget -q -O /wordlists/common.txt \
+      "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt" && \
+    wget -q -O /wordlists/raft-dirs.txt \
+      "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt" && \
+    wget -q -O /wordlists/api-endpoints.txt \
+      "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt" && \
+    cat /wordlists/common.txt /wordlists/api-endpoints.txt | sort -u > /wordlists/web-combined.txt && \
+    wc -l /wordlists/*.txt | tail -1
+
 # Install Go security tools
 RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
     go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
