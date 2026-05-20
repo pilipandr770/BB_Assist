@@ -187,7 +187,75 @@ def _select_nuclei_targets(all_urls: list[str], live_urls: list[str], max_urls: 
     return [url for _, url in scored[:max_urls]]
 
 
-async def _run_scan(job: ScanJob, approved_plan: str) -> None:
+def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
+    """
+    Pick the best base hosts for directory fuzzing.
+    Prefer API/admin subdomains on standard ports; skip CDN/media/CS hosts.
+    """
+    from urllib.parse import urlparse
+
+    # Subdomain name patterns that are interesting for directory fuzzing
+    INTERESTING_SUB = (
+        "api", "admin", "portal", "dashboard", "dev", "staging", "internal",
+        "test", "beta", "app", "manage", "console", "panel", "monitor",
+        "login", "auth", "upload", "backend", "service", "services",
+    )
+    # Subdomain/path patterns that indicate CDN, media, or delivery hosts
+    CDN_SKIP = (
+        "edge", "cdn", "rtm", "streaming", "delivery", "media", "img",
+        "static", "live", "video", "cam", "thumb", "photo", "image",
+        "archive", "mirror", "relay",
+    )
+
+    def _host_score(url: str) -> int:
+        try:
+            p = urlparse(url)
+        except Exception:
+            return -999
+        host = p.hostname or ""
+        subdomain = host.split(".")[0].lower() if "." in host else host.lower()
+
+        # Skip clear CDN/media delivery nodes
+        if any(c in host.lower() for c in CDN_SKIP):
+            return -999
+
+        score = 0
+
+        # Prefer HTTPS
+        if p.scheme == "https":
+            score += 20
+        # Prefer standard ports (no explicit port = 443/80)
+        if not p.port:
+            score += 15
+        elif p.port in (80, 443):
+            score += 10
+        else:
+            score -= 20  # non-standard port (8443, 8080, etc.)
+
+        # Boost interesting subdomains
+        if any(kw == subdomain or subdomain.startswith(kw) for kw in INTERESTING_SUB):
+            score += 40
+
+        return score
+
+    # Deduplicate by base host (scheme+netloc) — one entry per host
+    seen_hosts: dict[str, tuple[int, str]] = {}
+    for url in live_urls:
+        try:
+            p = urlparse(url)
+            base = f"{p.scheme}://{p.netloc}"
+        except Exception:
+            continue
+        s = _host_score(url)
+        if s <= -999:
+            continue
+        if base not in seen_hosts or s > seen_hosts[base][0]:
+            seen_hosts[base] = (s, base)
+
+    scored = sorted(seen_hosts.values(), key=lambda x: x[0], reverse=True)
+    return [url for _, url in scored[:max_hosts]]
+
+
     """
     Full scan pipeline executed as a background task.
     Phase 1: Passive recon
@@ -528,7 +596,7 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         ffuf_403_urls: list[str] = []
 
         if do_ffuf:
-            ffuf_hosts = live_urls[:5] if live_urls else []
+            ffuf_hosts = _select_ffuf_targets(live_urls, max_hosts=5)
             if not ffuf_hosts and scope.in_scope_urls:
                 ffuf_hosts = [u for u in scope.in_scope_urls if u.startswith("http")][:3]
 
