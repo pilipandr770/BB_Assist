@@ -284,9 +284,8 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             if len(passive_domains) >= 5:  # hard cap — passive recon has no scanner value beyond 5
                 break
 
-        await _push_event(redis, scan_id, "phase_start", {
-            "phase": "passive_recon_detail",
-            "domains": passive_domains,
+        await _push_event(redis, scan_id, "pipeline_config", {
+            "passive_domains": passive_domains,
             "total_scope_domains": len(scope.in_scope_domains),
         })
 

@@ -124,6 +124,18 @@ _HEADER_TECH_MAP = {
 }
 
 
+_TECH_NOISE: frozenset[str] = frozenset({
+    # HTTP protocol / feature labels — not technologies
+    "http", "https", "http/1.1", "http/2", "http/3", "h2", "h3",
+    # Security policy names
+    "hsts", "basic", "digest", "bearer", "ntlm",
+    # Generic CDN/infra that aren't useful for CVE targeting
+    "cdn", "waf",
+    # Single-letter leftovers from bad parsing
+    "", "-", "_",
+})
+
+
 def extract_tech_stack(http_results: list[dict]) -> set[str]:
     """
     Parse httpx JSONL results to extract a normalized set of detected technologies.
@@ -140,7 +152,7 @@ def extract_tech_stack(http_results: list[dict]) -> set[str]:
         for field in ("tech", "technologies", "technology"):
             for t in (r.get(field) or []):
                 name = str(t).split(":")[0].split("/")[0].lower().strip()
-                if name and len(name) > 1:
+                if name and len(name) > 1 and name not in _TECH_NOISE:
                     techs.add(name)
 
         # Layer 2: webserver banner
