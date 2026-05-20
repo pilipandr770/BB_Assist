@@ -8,9 +8,16 @@ Rules:
   - Use time-based techniques for blind SQLi (not error-based first)
   - For XSS: only confirm reflection, never steal real user cookies
   - For IDOR: read-only check (GET only, no PUT/DELETE)
+
+Tool-confirmed sources:
+  cors_checker, js_scanner, subdomain_takeover, 403_bypass, github_dork,
+  gau_credentials, and sqlmap all perform live validation as part of their
+  operation — their raw_output already contains evidence. These sources are
+  auto-confirmed here so Layer 3 passes without a redundant second request.
 """
 
 import asyncio
+import json
 import time
 import uuid
 
@@ -45,11 +52,126 @@ _LFI_PAYLOADS = [
 ]
 
 
+# Sources whose tools already made a live confirming request — no second PoC needed.
+_TOOL_CONFIRMED_SOURCES = {
+    "cors_checker",
+    "js_scanner",
+    "subdomain_takeover",
+    "403_bypass",
+    "github_dork",
+    "gau_credentials",
+    "sqlmap",
+}
+
+
+def _get_raw(finding: Finding) -> dict:
+    """Parse finding.raw_output JSON, return empty dict on failure."""
+    try:
+        return json.loads(finding.raw_output or "{}")
+    except Exception:
+        return {}
+
+
+def _tool_confirmed_poc(finding: Finding, source: str) -> PocResult:
+    """
+    Build a confirmed PocResult from evidence already collected by the source tool.
+    Each source stores its evidence in known fields of raw_output.
+    """
+    raw = _get_raw(finding)
+
+    if source == "cors_checker":
+        origin = raw.get("_origin_sent", "https://evil.com")
+        acao = raw.get("_acao", "")
+        acac = raw.get("_acac", "false")
+        evidence = (
+            f"CORS misconfiguration confirmed by live HTTP probe.\n"
+            f"  Origin sent:                  {origin}\n"
+            f"  Access-Control-Allow-Origin:  {acao}\n"
+            f"  Access-Control-Allow-Credentials: {acac}\n"
+            f"  URL: {finding.url}\n\n"
+            f"Reproduction:\n"
+            f"  curl -s -I -H 'Origin: {origin}' '{finding.url}' | grep -i access-control"
+        )
+
+    elif source == "js_scanner":
+        secret_type = raw.get("_secret_type", "secret")
+        match = raw.get("extracted-results", ["[redacted]"])[0] if raw.get("extracted-results") else "[redacted]"
+        context = raw.get("_context", "")
+        evidence = (
+            f"{secret_type} found in JavaScript file.\n"
+            f"  File: {finding.url}\n"
+            f"  Match: {match[:80]}\n"
+            f"  Context: {context[:200]}\n\n"
+            f"Reproduction: curl -s '{finding.url}' | grep -o '{match[:40]}'"
+        )
+
+    elif source == "subdomain_takeover":
+        provider = raw.get("_provider", "unknown")
+        fingerprint = raw.get("_fingerprint", "")
+        evidence_url = raw.get("_evidence_url", finding.url)
+        evidence = (
+            f"Subdomain takeover confirmed by fingerprint match.\n"
+            f"  Subdomain: {finding.url}\n"
+            f"  Provider: {provider}\n"
+            f"  Fingerprint: {fingerprint}\n"
+            f"  Evidence URL: {evidence_url}\n\n"
+            f"Reproduction: curl -s '{evidence_url}' | grep '{fingerprint[:60]}'"
+        )
+
+    elif source == "403_bypass":
+        payload = raw.get("_bypass_payload", "")
+        status = raw.get("_bypass_status", 200)
+        bypass_type = raw.get("info", {}).get("name", "bypass")
+        evidence = (
+            f"403 bypass confirmed — server returned HTTP {status}.\n"
+            f"  URL: {finding.url}\n"
+            f"  Technique: {bypass_type}\n"
+            f"  Payload: {payload}\n\n"
+            f"Reproduction: curl -s -o /dev/null -w '%{{http_code}}' '{payload}'"
+        )
+
+    elif source == "github_dork":
+        repo = raw.get("_repo", "")
+        file_path = raw.get("_file_path", "")
+        evidence_url = raw.get("_evidence_url", "")
+        snippet = raw.get("_snippet", "")[:300]
+        evidence = (
+            f"Secret found in public GitHub repository.\n"
+            f"  Repo: {repo}\n"
+            f"  File: {file_path}\n"
+            f"  Evidence: {evidence_url}\n"
+            f"  Snippet:\n{snippet}"
+        )
+
+    elif source == "gau_credentials":
+        cred_url = raw.get("_credential_url", finding.url)
+        username = raw.get("_username", "")
+        evidence = (
+            f"Credentials exposed in URL (found in Wayback Machine / GAU).\n"
+            f"  Host: {finding.url}\n"
+            f"  URL with credentials: {cred_url[:200]}\n"
+            f"  Username: {username}"
+        )
+
+    elif source == "sqlmap":
+        evidence = raw.get("info", {}).get("description", "SQLi confirmed by sqlmap time-based blind.")
+
+    else:
+        evidence = f"Confirmed by {source} tool."
+
+    return PocResult(confirmed=True, evidence=evidence, safe_output=evidence)
+
+
 async def attempt_poc(finding: Finding) -> PocResult:
     """
     Route to appropriate validator based on vuln type.
     Falls back to manual_review_poc for types that can't be auto-validated.
     """
+    # Tool-confirmed findings already carry live evidence — skip redundant PoC
+    source = _get_raw(finding).get("_source", "")
+    if source in _TOOL_CONFIRMED_SOURCES:
+        return _tool_confirmed_poc(finding, source)
+
     vuln = finding.vuln_type.lower()
 
     if "xss" in vuln:

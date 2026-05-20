@@ -73,23 +73,98 @@ _TECH_NUCLEI_TAGS: dict[str, str] = {
 }
 
 
+# Cookie name prefixes that reveal specific frameworks
+_COOKIE_TECH_MAP = {
+    "phpsessid":        "php",
+    "jsessionid":       "java",
+    "aspsessionid":     "asp",
+    "asp.net_sessionid": "aspnet",
+    "laravel_session":  "laravel",
+    "ci_session":       "codeigniter",
+    "symfony":          "symfony",
+    "yii_csrf_token":   "yii",
+    "rails_session":    "rails",
+    "_rails":           "rails",
+    "django_session":   "django",
+    "csrftoken":        "django",
+    "wp-settings":      "wordpress",
+    "wordpress_":       "wordpress",
+    "joomla":           "joomla",
+    "drupal":           "drupal",
+    "magento":          "magento",
+    "prestashop":       "prestashop",
+    "opencart":         "opencart",
+}
+
+# Response header values → technology
+_HEADER_TECH_MAP = {
+    "x-powered-by": {
+        "php":          "php",
+        "asp.net":      "aspnet",
+        "express":      "nodejs",
+        "next.js":      "nextjs",
+        "ruby on rails": "rails",
+        "django":       "django",
+        "laravel":      "laravel",
+        "wordpress":    "wordpress",
+        "drupal":       "drupal",
+    },
+    "server": {
+        "apache":       "apache",
+        "nginx":        "nginx",
+        "iis":          "iis",
+        "caddy":        "caddy",
+        "litespeed":    "litespeed",
+        "gunicorn":     "gunicorn",
+        "tomcat":       "tomcat",
+        "cloudflare":   "cloudflare",
+        "openresty":    "nginx",
+        "pepyaka":      "wordpress",  # Wix
+    },
+}
+
+
 def extract_tech_stack(http_results: list[dict]) -> set[str]:
     """
     Parse httpx JSONL results to extract a normalized set of detected technologies.
-    httpx reports tech via 'tech', 'technologies', or 'technology' depending on version.
-    Also checks the 'webserver' field for server banners.
+
+    Detection layers (in priority order):
+    1. httpx 'tech'/'technologies' field (populated in newer httpx builds)
+    2. 'webserver' field from httpx
+    3. Response headers: Server, X-Powered-By (always present)
+    4. Cookie names (framework session cookies are highly reliable fingerprints)
     """
     techs: set[str] = set()
     for r in http_results:
+        # Layer 1: httpx native tech detection
         for field in ("tech", "technologies", "technology"):
             for t in (r.get(field) or []):
                 name = str(t).split(":")[0].split("/")[0].lower().strip()
                 if name and len(name) > 1:
                     techs.add(name)
+
+        # Layer 2: webserver banner
         ws = (r.get("webserver") or "").lower()
-        for tech in ("apache", "nginx", "iis", "caddy", "gunicorn", "litespeed", "tomcat", "cloudflare"):
-            if tech in ws:
+        for keyword, tech in _HEADER_TECH_MAP["server"].items():
+            if keyword in ws:
                 techs.add(tech)
+
+        # Layer 3: response headers dict (httpx stores as {"header-name": "value"})
+        headers: dict = r.get("headers") or {}
+        for header_name, keyword_map in _HEADER_TECH_MAP.items():
+            header_val = headers.get(header_name, headers.get(header_name.lower(), "")).lower()
+            if header_val:
+                for keyword, tech in keyword_map.items():
+                    if keyword in header_val:
+                        techs.add(tech)
+                        break
+
+        # Layer 4: Set-Cookie header — framework session cookie names are reliable
+        set_cookie = headers.get("set-cookie", headers.get("Set-Cookie", "")).lower()
+        for cookie_prefix, tech in _COOKIE_TECH_MAP.items():
+            if cookie_prefix in set_cookie:
+                techs.add(tech)
+
     return techs
 
 
