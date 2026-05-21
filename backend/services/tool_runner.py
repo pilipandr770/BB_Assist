@@ -1092,6 +1092,22 @@ async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
 
     await asyncio.gather(*[_scan_one(u) for u in urls_to_scan])
 
+    # Deduplicate by (secret_type, match prefix) — the same key embedded in 100s of
+    # JS bundle files should be one finding, not 100 separate AI evaluations.
+    seen_key_values: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for fnd in findings:
+        key = (fnd["secret_type"], fnd["match"][:50])
+        if key not in seen_key_values:
+            seen_key_values.add(key)
+            deduped.append(fnd)
+    if len(deduped) < len(findings):
+        log.info(
+            "js_scanner: collapsed %d → %d unique findings after dedup",
+            len(findings), len(deduped),
+        )
+    findings = deduped
+
     if findings:
         with open(output_file, "w") as f:
             for finding in findings:

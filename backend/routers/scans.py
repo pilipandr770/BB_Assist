@@ -654,10 +654,30 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
             "tool": "js_scanner", "count": len(js_secrets),
         })
 
+        # Pre-filter: skip known-public client-side key patterns that are intentionally
+        # embedded in JS. Algolia search-only keys, Next.js NEXT_PUBLIC_ vars, and
+        # similar patterns are by design public-facing and not security vulnerabilities.
+        # Filtering here avoids wasting L2 AI calls on guaranteed-reject findings.
+        _JS_PUBLIC_CTX = (
+            "algolia", "search-api-key", "searchapikey",
+            "next_public_", "react_app_", "vite_public_",
+            "gtm-", "googletagmanager", "ga-measurement",
+        )
+        _js_pre_filtered = 0
+        _js_kept = []
+        for _s in js_secrets:
+            _ctx_lower = (_s.get("context", "") + " " + _s.get("match", "")).lower()
+            if any(_p in _ctx_lower for _p in _JS_PUBLIC_CTX):
+                _js_pre_filtered += 1
+            else:
+                _js_kept.append(_s)
+        js_secrets = _js_kept
+
         await _push_event(redis, scan_id, "phase_done", {
             "phase": "js_scan",
             "js_files": len(js_urls),
             "secrets_found": len(js_secrets),
+            **({"pre_filtered_public_keys": _js_pre_filtered} if _js_pre_filtered else {}),
         })
 
         # ── Phase 2.7: 403 Bypass Testing ────────────────────────────────────
