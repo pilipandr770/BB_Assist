@@ -690,6 +690,18 @@ async def run_nuclei(
         log.info("nuclei: using %d templates across %d subdirs",
                  template_count, len([a for a in template_args if a != "-t"]))
 
+        # Cloudflare targets block nuclei's default "Go-http-client" UA and throttle
+        # high-rate scans. Use browser UA always; lower rate when CF is detected.
+        behind_cloudflare = detected_techs and "cloudflare" in detected_techs
+        nuclei_rate = "20" if behind_cloudflare else "100"
+        nuclei_bulk = "20" if behind_cloudflare else "50"
+        nuclei_conc = "10" if behind_cloudflare else "25"
+        nuclei_ua   = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+
         cmd = [
             "nuclei",
             "-l", input_file,
@@ -697,12 +709,13 @@ async def run_nuclei(
             "-jsonl-export", output_file,   # nuclei v3: JSONL file export
             "-j",                            # nuclei v3: JSONL to stdout too
             "-silent",
-            "-rate-limit", "150",
-            "-bulk-size", "50",
-            "-concurrency", "25",
+            "-rate-limit", nuclei_rate,
+            "-bulk-size", nuclei_bulk,
+            "-concurrency", nuclei_conc,
             "-timeout", "10",
             "-retries", "1",
             "-nc",                           # no color codes in output
+            "-H", f"User-Agent: {nuclei_ua}",
             # Note: interactsh ENABLED intentionally — needed for blind SSRF/XSS/XXE detection
         ] + template_args + _h1_header_args()
 
@@ -758,12 +771,13 @@ async def run_nuclei(
                         "-jsonl-export", cve_out,
                         "-j",
                         "-silent",
-                        "-rate-limit", "100",
-                        "-bulk-size", "30",
-                        "-concurrency", "15",
+                        "-rate-limit", "15" if behind_cloudflare else "80",
+                        "-bulk-size", "20" if behind_cloudflare else "30",
+                        "-concurrency", "8"  if behind_cloudflare else "15",
                         "-timeout", "10",
                         "-retries", "1",
                         "-nc",
+                        "-H", f"User-Agent: {nuclei_ua}",
                     ] + _h1_header_args()
                     log.info("nuclei-cve: running with tags=%s", ",".join(cve_tags))
                     await _run_command(cve_cmd, timeout_s=90)
