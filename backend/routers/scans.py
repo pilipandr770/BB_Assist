@@ -31,7 +31,7 @@ _ARJUN_PATH_RE = re.compile(
 
 import aiofiles
 import redis.asyncio as aioredis
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from backend.config import settings
@@ -1175,16 +1175,20 @@ async def start_scan(body: ScanCreate):
 
 
 @router.get("/{program_id}/{scan_id}/stream")
-async def stream_scan(program_id: str, scan_id: str):
+async def stream_scan(program_id: str, scan_id: str, request: Request):
     """
     SSE stream of live scan output.
     Reads events from Redis list for this scan_id.
+    Uses SSE event IDs so browser reconnects resume from the last received event
+    instead of replaying everything from position 0.
     Detects zombie scans (interrupted mid-run) and emits scan_error rather than
     waiting 2 hours for events that will never arrive.
     """
     async def event_generator():
         redis = await _get_redis()
-        cursor = 0
+        # Resume from Last-Event-ID if the browser is reconnecting
+        _last_id = request.headers.get("last-event-id", "")
+        cursor = (int(_last_id) + 1) if _last_id.isdigit() else 0
         idle_ticks = 0
         last_event_type: str = ""
 
@@ -1194,10 +1198,11 @@ async def stream_scan(program_id: str, scan_id: str):
                 if events:
                     idle_ticks = 0
                     for raw_event in events:
+                        event_id = cursor   # capture before increment
                         cursor += 1
                         parsed = json.loads(raw_event)
                         last_event_type = parsed["type"]
-                        yield {"event": last_event_type, "data": json.dumps(parsed["data"])}
+                        yield {"event": last_event_type, "data": json.dumps(parsed["data"]), "id": str(event_id)}
 
                     # Check if scan is done
                     if last_event_type in ("scan_done", "scan_error"):

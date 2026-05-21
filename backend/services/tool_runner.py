@@ -177,7 +177,8 @@ def extract_tech_stack(http_results: list[dict]) -> set[str]:
             if cookie_prefix in set_cookie:
                 techs.add(tech)
 
-    return techs
+    # Final pass: strip protocol/policy noise regardless of which layer added it
+    return techs - _TECH_NOISE
 
 
 def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:
