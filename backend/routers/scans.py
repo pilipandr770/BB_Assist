@@ -292,6 +292,29 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
         job.started_at = datetime.utcnow()
         await _save_job(job, program_id)
 
+        # ── Delta scanning: load baseline from previous scan ─────────────────
+        # Comparing current scan against the previous one lets us highlight NEW
+        # subdomains / endpoints that appeared since last run — first-mover advantage.
+        _delta_file = os.path.join(WORKSPACE, program_id, "scan_history.json")
+        _prev_subdomains: set[str] = set()
+        _prev_live_urls: set[str] = set()
+        _prev_scan_date: str = ""
+        if os.path.exists(_delta_file):
+            try:
+                import aiofiles as _af
+                async with _af.open(_delta_file, encoding="utf-8") as _df:
+                    _prev_data = json.loads(await _df.read())
+                _prev_subdomains = set(_prev_data.get("subdomains", []))
+                _prev_live_urls = set(_prev_data.get("live_urls", []))
+                _prev_scan_date = _prev_data.get("scan_date", "")
+                await _push_event(redis, scan_id, "delta_baseline", {
+                    "prev_scan_date": _prev_scan_date,
+                    "prev_subdomains": len(_prev_subdomains),
+                    "prev_live_urls": len(_prev_live_urls),
+                })
+            except Exception:
+                pass  # No valid history — first scan for this program
+
         program = await _load_scope_and_program(program_id)
         scope = program.scope
 
@@ -570,6 +593,18 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
             **({"cred_urls": len(cred_urls)} if cred_urls else {}),
         })
 
+        # ── Delta: compare with previous scan ────────────────────────────────
+        if _prev_subdomains or _prev_live_urls:
+            _new_subs = sorted(all_subdomains - _prev_subdomains)
+            _new_urls = sorted(set(live_urls) - _prev_live_urls)
+            if _new_subs or _new_urls:
+                await _push_event(redis, scan_id, "delta_new_surface", {
+                    "new_subdomains_count": len(_new_subs),
+                    "new_subdomains": _new_subs[:20],
+                    "new_live_urls_count": len(_new_urls),
+                    "new_live_urls": _new_urls[:10],
+                })
+
         # ── Phase 1.5: GitHub Dorking (passive, no target contact) ──────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "github_dork"})
         await _push_event(redis, scan_id, "tool_start", {
@@ -783,6 +818,28 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                 "reason": f"program_type={prog_type}",
             })
 
+        # ── Phase 2.8.5: XSS Scan (dalfox on arjun-discovered params) ──────────
+        # Only runs when arjun found actual injectable parameters — no arjun params
+        # means no URLs to fuzz, so dalfox is skipped entirely.
+        dalfox_findings: list[dict] = []
+        if arjun_params:
+            await _push_event(redis, scan_id, "phase_start", {"phase": "xss_scan"})
+            for _xss_base, _xss_params in list(arjun_params.items())[:3]:  # cap at 3 endpoints
+                _xss_url = _xss_base + "?" + "&".join(f"{p}=test" for p in _xss_params[:5])
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "dalfox",
+                    "detail": f"{_xss_base} ({len(_xss_params)} params)",
+                })
+                _dalfox_out = os.path.join(scan_dir, f"dalfox_{len(dalfox_findings)}.json")
+                _dalfox_results = await tool_runner.run_dalfox(_xss_url, _xss_params, _dalfox_out)
+                dalfox_findings.extend(_dalfox_results)
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "dalfox", "count": len(_dalfox_results),
+                })
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "xss_scan", "findings": len(dalfox_findings),
+            })
+
         # ── Phase 2.9: CORS Checker ──────────────────────────────────────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "cors_check"})
         await _push_event(redis, scan_id, "tool_start", {
@@ -832,6 +889,48 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
         })
         await _push_event(redis, scan_id, "phase_done", {
             "phase": "email_security", "issues": len(email_findings),
+        })
+
+        # ── Phase 2.12: Swagger / OpenAPI Discovery ───────────────────────────
+        # Exposed API specs are Medium findings AND map the full API surface
+        # so subsequent nuclei/arjun passes have more precise targets.
+        await _push_event(redis, scan_id, "phase_start", {"phase": "swagger_discovery"})
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "swagger_discovery",
+            "detail": f"{len(live_urls)} live hosts",
+        })
+        swagger_out = os.path.join(scan_dir, "swagger.jsonl")
+        swagger_findings = await tool_runner.run_swagger_discovery(live_urls, swagger_out)
+        # If specs found, extract their API paths → add to nuclei target pool
+        for _sw in swagger_findings:
+            for _api_path in _sw.get("sample_paths", []):
+                _full = _sw["base_url"].rstrip("/") + _api_path
+                if is_in_scope(_full, scope) and _full not in all_target_urls:
+                    all_target_urls.append(_full)
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "swagger_discovery", "count": len(swagger_findings),
+        })
+        await _push_event(redis, scan_id, "phase_done", {
+            "phase": "swagger_discovery",
+            "specs_found": len(swagger_findings),
+            "new_endpoints": sum(s.get("endpoints_count", 0) for s in swagger_findings),
+        })
+
+        # ── Phase 2.13: S3 Bucket Enumeration ────────────────────────────────
+        # Checks public S3 buckets using company name variants derived from
+        # the target domains. Public buckets = Critical/High on H1.
+        await _push_event(redis, scan_id, "phase_start", {"phase": "s3_enum"})
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "s3_enum",
+            "detail": f"{len(scope.in_scope_domains)} domains → bucket variants",
+        })
+        s3_out = os.path.join(scan_dir, "s3_buckets.jsonl")
+        s3_findings = await tool_runner.run_s3_enum(scope.in_scope_domains, s3_out)
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "s3_enum", "count": len(s3_findings),
+        })
+        await _push_event(redis, scan_id, "phase_done", {
+            "phase": "s3_enum", "public_buckets": len(s3_findings),
         })
 
         # ── Phase 3: Nuclei scan ──────────────────────────────────────────────
@@ -977,6 +1076,54 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                 "_domain": domain,
                 "_checks_failed": checks,
                 "_issues": email_issue.get("issues", []),
+            })
+
+        # Convert Swagger/OpenAPI spec findings → Finding objects
+        for _sw in swagger_findings:
+            raw_findings.append({
+                "_source": "swagger_discovery",
+                "info": {
+                    "name": f"Exposed API Specification — {_sw['spec_url']}",
+                    "severity": _sw["severity"],
+                    "tags": ["exposure", "api-docs", "information-disclosure"],
+                    "description": _sw["impact"],
+                },
+                "matched-at": _sw["spec_url"],
+                "type": "exposure",
+                "_endpoints_count": _sw["endpoints_count"],
+                "_sample_paths": _sw.get("sample_paths", []),
+            })
+
+        # Convert S3 bucket enum findings → Finding objects
+        for _s3 in s3_findings:
+            raw_findings.append({
+                "_source": "s3_enum",
+                "info": {
+                    "name": f"Public S3 Bucket — {_s3['bucket']}",
+                    "severity": _s3["severity"],
+                    "tags": ["exposure", "s3", "misconfig", "cloud"],
+                    "description": _s3["impact"],
+                },
+                "matched-at": _s3["url"],
+                "type": "exposure",
+                "_bucket": _s3["bucket"],
+                "_publicly_listed": _s3["publicly_listed"],
+            })
+
+        # Convert dalfox XSS findings → Finding objects
+        for _xss in dalfox_findings:
+            raw_findings.append({
+                "_source": "dalfox",
+                "info": {
+                    "name": f"Cross-Site Scripting (XSS) — {_xss.get('param', 'unknown param')}",
+                    "severity": "high",
+                    "tags": ["xss", "injection"],
+                    "description": str(_xss.get("evidence", _xss)),
+                },
+                "matched-at": _xss.get("url", ""),
+                "type": "xss",
+                "_param": _xss.get("param", ""),
+                "_evidence": str(_xss.get("evidence", ""))[:500],
             })
 
         # Convert credential-in-URL findings → Finding objects
@@ -1168,6 +1315,19 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                     "error": str(_finding_err),
                     "raw_title": str(raw.get("info", {}).get("name", ""))[:120],
                 })
+
+        # Save scan state for delta comparison on next scan
+        try:
+            _delta_data = {
+                "scan_id": scan_id,
+                "scan_date": datetime.utcnow().isoformat(),
+                "subdomains": sorted(all_subdomains),
+                "live_urls": sorted(live_urls),
+            }
+            async with aiofiles.open(_delta_file, "w", encoding="utf-8") as _df:
+                await _df.write(json.dumps(_delta_data, indent=2))
+        except Exception:
+            pass
 
         job.findings_count = approved_count
         job.status = ScanStatus.done

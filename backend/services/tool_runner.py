@@ -1453,6 +1453,206 @@ async def run_subdomain_takeover(subdomains: list[str], output_file: str) -> lis
     return findings
 
 
+# ── Swagger / OpenAPI Discovery ──────────────────────────────────────────────
+
+_SWAGGER_PATHS = [
+    "/swagger.json", "/swagger-ui.html",
+    "/openapi.json", "/openapi.yaml",
+    "/api-docs", "/api-docs.json",
+    "/v2/api-docs", "/v3/api-docs",
+    "/api/swagger.json", "/api/openapi.json",
+    "/docs", "/redoc",
+    "/_api/swagger.json",
+    "/api/v1/swagger.json", "/api/v2/swagger.json",
+    "/api/v1/openapi.json", "/api/v2/openapi.json",
+]
+
+
+def _probe_swagger_sync(base_url: str) -> Optional[dict]:
+    """Probe a single base URL for an exposed Swagger/OpenAPI spec."""
+    for path in _SWAGGER_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/yaml, */*"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status != 200:
+                    continue
+                raw = resp.read(524288).decode("utf-8", errors="replace")
+                # Must contain swagger/openapi markers
+                if not any(kw in raw[:1000] for kw in (
+                    '"swagger"', '"openapi"', 'swagger:', 'openapi:', '"paths"',
+                )):
+                    continue
+                # Parse paths from JSON spec
+                api_paths: list[str] = []
+                try:
+                    spec = json.loads(raw)
+                    api_paths = list(spec.get("paths", {}).keys())
+                except json.JSONDecodeError:
+                    pass  # YAML spec — paths not extracted but finding still reported
+                return {
+                    "base_url": base_url,
+                    "spec_url": url,
+                    "endpoints_count": len(api_paths),
+                    "sample_paths": api_paths[:30],
+                    "severity": "medium",
+                    "impact": (
+                        f"API specification exposed at {url} reveals {len(api_paths)} endpoint(s). "
+                        "Attackers can enumerate all API routes, parameters, and authentication "
+                        "requirements without any prior knowledge of the API surface."
+                    ),
+                }
+        except Exception:
+            continue
+    return None
+
+
+async def run_swagger_discovery(live_urls: list[str], output_file: str) -> list[dict]:
+    """
+    Probe live hosts for exposed Swagger/OpenAPI specifications.
+    API-like subdomains (api.*, backend.*) are checked first.
+    Caps at 30 unique base hosts.
+    """
+    import logging
+    from urllib.parse import urlparse as _up
+    log = logging.getLogger("tool_runner")
+
+    if not live_urls:
+        return []
+
+    # Unique base URLs scored by API likelihood
+    seen: dict[str, int] = {}
+    for u in live_urls:
+        try:
+            p = _up(u)
+            base = f"{p.scheme}://{p.netloc}"
+        except Exception:
+            continue
+        if base not in seen:
+            score = 10 if any(kw in (p.hostname or "") for kw in ("api", "backend", "service", "gateway")) else 0
+            seen[base] = score
+
+    base_urls = sorted(seen, key=lambda b: seen[b], reverse=True)[:30]
+
+    findings: list[dict] = []
+    semaphore = asyncio.Semaphore(10)
+    loop = asyncio.get_event_loop()
+
+    async def _check_one(base_url: str):
+        async with semaphore:
+            result = await loop.run_in_executor(None, _probe_swagger_sync, base_url)
+        if result:
+            findings.append(result)
+
+    await asyncio.gather(*[_check_one(b) for b in base_urls])
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("swagger_discovery: %d specs found from %d hosts", len(findings), len(base_urls))
+    return findings
+
+
+# ── S3 Bucket Enumeration ─────────────────────────────────────────────────────
+
+_S3_BUCKET_SUFFIXES = [
+    "", "-backup", "-backups", "-dev", "-development",
+    "-staging", "-stage", "-prod", "-production",
+    "-assets", "-asset", "-static", "-media", "-uploads",
+    "-files", "-data", "-logs", "-log", "-archive",
+    "-internal", "-private", "-public", "-storage",
+    "-cdn", "-email", "-export", "-tmp", "-temp",
+    "-test", "-images", "-img", "-docs", "-reports",
+    "backup", "assets", "static", "media", "data", "logs",
+]
+
+
+def _check_s3_bucket_sync(bucket: str) -> Optional[dict]:
+    """Check a single S3 bucket for public access."""
+    for url in (
+        f"https://{bucket}.s3.amazonaws.com/",
+        f"https://s3.amazonaws.com/{bucket}/",
+    ):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    raw = resp.read(4096).decode("utf-8", errors="replace")
+                    is_listing = "<ListBucketResult" in raw
+                    return {
+                        "bucket": bucket,
+                        "url": url,
+                        "publicly_listed": is_listing,
+                        "severity": "critical" if is_listing else "high",
+                        "impact": (
+                            f"S3 bucket '{bucket}' is publicly accessible. "
+                            + ("Directory listing enabled — all objects are enumerable."
+                               if is_listing else "Bucket contents may be readable.")
+                        ),
+                    }
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                pass  # Bucket exists but private — not a finding
+        except Exception:
+            pass
+    return None
+
+
+async def run_s3_enum(domains: list[str], output_file: str) -> list[dict]:
+    """
+    Enumerate S3 buckets by generating company name variants from target domains.
+    Only reports actually public buckets (HTTP 200). Private (403) buckets are skipped.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not domains:
+        return []
+
+    # Extract company identifiers from apex domains
+    company_names: set[str] = set()
+    for d in domains:
+        base = d.lstrip("*.")
+        name = base.split(".")[0].lower()
+        company_names.add(name)
+        company_names.add(name.replace("-", ""))
+        company_names.add(name.replace("_", ""))
+
+    bucket_names: list[str] = []
+    for name in sorted(company_names):
+        for suffix in _S3_BUCKET_SUFFIXES:
+            candidate = f"{name}{suffix}"
+            if 3 <= len(candidate) <= 63:  # S3 bucket name length constraints
+                bucket_names.append(candidate)
+
+    bucket_names = list(dict.fromkeys(bucket_names))  # deduplicate
+
+    findings: list[dict] = []
+    semaphore = asyncio.Semaphore(20)
+    loop = asyncio.get_event_loop()
+
+    async def _check_one(bucket: str):
+        async with semaphore:
+            result = await loop.run_in_executor(None, _check_s3_bucket_sync, bucket)
+        if result:
+            findings.append(result)
+
+    await asyncio.gather(*[_check_one(b) for b in bucket_names])
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("s3_enum: %d public buckets found from %d candidates", len(findings), len(bucket_names))
+    return findings
+
+
 # ── Email Security Scanner ────────────────────────────────────────────────────
 
 def _check_email_security_sync(domain: str) -> dict:
