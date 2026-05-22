@@ -703,7 +703,14 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
         STATIC_EXTS = {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
                        ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
                        ".txt", ".xml", ".yaml", ".yml", ".json", ".lock",
-                       ".pdf", ".zip", ".gz", ".tar", ".md", ".csv"}
+                       ".pdf", ".zip", ".gz", ".tar", ".md", ".csv",
+                       ".html", ".htm", ".min.html", ".min.htm"}  # HTML pages have no query params
+
+        # Static directory path segments — arjun has no value testing assets/static dirs
+        _STATIC_PATH_SEGS = frozenset({
+            "static", "assets", "vendor", "dist", "build", "public",
+            "images", "img", "fonts", "media", "css", "views",
+        })
 
         arjun_params: dict[str, list[str]] = {}
 
@@ -717,13 +724,20 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                     _path = _parsed_u.path.lower()
                 except Exception:
                     continue
+                # Skip directory listings (path ends with /)
+                if _path.endswith("/") and _path != "/":
+                    continue
                 # Skip static / asset files — arjun has no business scanning them
                 if any(_path.endswith(_ext) for _ext in STATIC_EXTS):
+                    continue
+                # Skip paths that pass through known static asset directories
+                # e.g. /login/static/views/mfa.html, /login/static/css/images/
+                _raw_parts = [p for p in _path.split("/") if p]
+                if any(seg in _STATIC_PATH_SEGS for seg in _raw_parts[:-1]):
                     continue
                 # Skip URLs with duplicate path segments — these are crawler artifacts
                 # e.g. /customer_support/API/register/API/register/API/logging/ from katana
                 # following relative hrefs recursively on SPAs.
-                _raw_parts = [p for p in _path.split("/") if p]
                 if len(_raw_parts) != len(set(_raw_parts)):
                     continue
                 # Skip URLs where a path segment contains '=' — these are gau artifacts
@@ -799,6 +813,25 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
         })
         await _push_event(redis, scan_id, "phase_done", {
             "phase": "subdomain_takeover", "vulnerable": len(takeover_findings),
+        })
+
+        # ── Phase 2.11: Email Security (SPF / DMARC) ─────────────────────────
+        # Pure DNS — no active scanning, no rate limits, no WAF concerns.
+        # Missing/weak DMARC is a frequent Medium finding on H1.
+        await _push_event(redis, scan_id, "phase_start", {"phase": "email_security"})
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "email_security",
+            "detail": f"{len(scope.in_scope_domains)} domains",
+        })
+        email_out = os.path.join(scan_dir, "email_security.jsonl")
+        email_findings = await tool_runner.run_email_security(
+            scope.in_scope_domains, email_out
+        )
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "email_security", "count": len(email_findings),
+        })
+        await _push_event(redis, scan_id, "phase_done", {
+            "phase": "email_security", "issues": len(email_findings),
         })
 
         # ── Phase 3: Nuclei scan ──────────────────────────────────────────────
@@ -917,6 +950,33 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                 "_provider": takeover["provider"],
                 "_fingerprint": takeover["fingerprint"],
                 "_evidence_url": takeover.get("evidence_url", ""),
+            })
+
+        # Convert email security findings → Finding objects
+        for email_issue in email_findings:
+            domain = email_issue["domain"]
+            checks = email_issue["checks_failed"]
+            # matched-at = target domain URL so L1 scope filter passes
+            target_url = f"https://{domain}"
+            issues_text = "; ".join(
+                f"{i['check']}: {i['detail']}" for i in email_issue.get("issues", [])
+            )
+            raw_findings.append({
+                "_source": "email_security",
+                "info": {
+                    "name": f"Email Security Misconfiguration — {checks} ({domain})",
+                    "severity": email_issue["severity"],
+                    "tags": ["misconfig", "email-security", "spf", "dmarc"],
+                    "description": (
+                        f"Email security issues detected for {domain}: {issues_text}. "
+                        f"Impact: {email_issue['impact']}"
+                    ),
+                },
+                "matched-at": target_url,
+                "type": "email-misconfig",
+                "_domain": domain,
+                "_checks_failed": checks,
+                "_issues": email_issue.get("issues", []),
             })
 
         # Convert credential-in-URL findings → Finding objects

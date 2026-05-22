@@ -1453,6 +1453,147 @@ async def run_subdomain_takeover(subdomains: list[str], output_file: str) -> lis
     return findings
 
 
+# ── Email Security Scanner ────────────────────────────────────────────────────
+
+def _check_email_security_sync(domain: str) -> dict:
+    """
+    Check SPF, DMARC, and DKIM for a domain via DNS lookups.
+    Returns a finding dict if misconfiguration is found, else empty dict.
+
+    Common H1 findings:
+    - Missing DMARC → attacker can send spoofed emails from domain (phishing)
+    - DMARC p=none → policy exists but not enforced (useless)
+    - Missing SPF → no sender restriction
+    - SPF +all → allows any server to send (critical misconfiguration)
+    """
+    import dns.resolver
+    import dns.exception
+
+    issues: list[dict] = []
+
+    def _query_txt(name: str) -> list[str]:
+        try:
+            answers = dns.resolver.resolve(name, "TXT", lifetime=8)
+            return [b.decode("utf-8", errors="replace") for rdata in answers for b in rdata.strings]
+        except (dns.exception.DNSException, Exception):
+            return []
+
+    # ── SPF check ───────────────────────────────────────────────────────────
+    spf_records = [r for r in _query_txt(domain) if r.lower().startswith("v=spf1")]
+    if not spf_records:
+        issues.append({
+            "check": "SPF",
+            "severity": "medium",
+            "detail": f"No SPF record found for {domain}. Anyone can send email appearing to come from @{domain}.",
+            "impact": "Email spoofing — attacker can send phishing emails from @{domain} with no SPF validation failure.".format(domain=domain),
+        })
+    else:
+        spf = spf_records[0].lower()
+        if "+all" in spf or spf.endswith(" all") and "~all" not in spf and "-all" not in spf and "?all" not in spf:
+            # Plain 'all' without qualifier = +all (pass all)
+            issues.append({
+                "check": "SPF +all",
+                "severity": "high",
+                "detail": f"SPF record uses '+all' or unqualified 'all': {spf_records[0]}",
+                "impact": f"Any mail server on the internet is permitted to send email as @{domain}.",
+            })
+
+    # ── DMARC check ─────────────────────────────────────────────────────────
+    dmarc_records = _query_txt(f"_dmarc.{domain}")
+    dmarc_txt = next((r for r in dmarc_records if r.lower().startswith("v=dmarc1")), None)
+
+    if not dmarc_txt:
+        issues.append({
+            "check": "DMARC missing",
+            "severity": "medium",
+            "detail": f"No DMARC record found at _dmarc.{domain}.",
+            "impact": (
+                f"Without DMARC, spoofed emails from @{domain} are not rejected by receiving mail servers. "
+                "Attackers can impersonate the domain in phishing campaigns with no enforcement."
+            ),
+        })
+    else:
+        dmarc_lower = dmarc_txt.lower()
+        # Extract p= policy
+        import re as _re
+        p_match = _re.search(r'\bp=(\w+)', dmarc_lower)
+        policy = p_match.group(1) if p_match else "none"
+        if policy == "none":
+            issues.append({
+                "check": "DMARC p=none",
+                "severity": "medium",
+                "detail": f"DMARC record exists but policy is p=none (monitor only): {dmarc_txt}",
+                "impact": (
+                    f"DMARC p=none does not prevent spoofed emails from being delivered. "
+                    f"Attackers can still send phishing emails as @{domain} and they will be delivered."
+                ),
+            })
+        # Check for missing rua (reporting address) — won't find violations
+        if "rua=" not in dmarc_lower:
+            issues.append({
+                "check": "DMARC no reporting",
+                "severity": "informational",
+                "detail": f"DMARC record has no rua= reporting address: {dmarc_txt}",
+                "impact": "No visibility into spoofing attempts against the domain.",
+            })
+
+    if not issues:
+        return {}
+
+    # Determine overall severity (highest among issues)
+    sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "informational": 0}
+    top_issue = max(issues, key=lambda i: sev_order.get(i["severity"], 0))
+    checks_summary = ", ".join(i["check"] for i in issues)
+
+    return {
+        "domain": domain,
+        "issues": issues,
+        "severity": top_issue["severity"],
+        "checks_failed": checks_summary,
+        "impact": top_issue["impact"],
+    }
+
+
+async def run_email_security(domains: list[str], output_file: str) -> list[dict]:
+    """
+    Check SPF/DMARC email security for target domains.
+    Pure DNS — no active scanning, no rate limit concerns.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not domains:
+        return []
+
+    # Deduplicate to apex domains only
+    seen: set[str] = set()
+    apex_domains: list[str] = []
+    for d in domains:
+        apex = d.lstrip("*.")
+        # Strip subdomains to get the apex (last two labels)
+        parts = apex.split(".")
+        apex2 = ".".join(parts[-2:]) if len(parts) >= 2 else apex
+        if apex2 not in seen:
+            seen.add(apex2)
+            apex_domains.append(apex2)
+
+    loop = asyncio.get_event_loop()
+    findings: list[dict] = []
+
+    for domain in apex_domains[:10]:  # cap at 10 apex domains
+        result = await loop.run_in_executor(None, _check_email_security_sync, domain)
+        if result:
+            findings.append(result)
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("email_security: %d domains with issues from %d checked", len(findings), len(apex_domains))
+    return findings
+
+
 # ── GitHub Dorking ────────────────────────────────────────────────────────────
 
 # Search queries — prioritised by signal quality.

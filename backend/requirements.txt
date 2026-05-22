@@ -10,3 +10,4 @@ python-multipart==0.0.9
 sse-starlette==2.1.0
 python-slugify==8.0.4
 arjun==2.2.1
+dnspython>=2.6.0
