@@ -1269,6 +1269,25 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
 
                 if passed:
                     approved_count += 1
+
+                    # Capture HTTP evidence for JS/secret findings (validates key is live)
+                    try:
+                        _raw_ev = json.loads(finding.raw_output)
+                        _ev_src = _raw_ev.get("_source", "")
+                        if _ev_src in ("js_scanner",):
+                            _ev_out = os.path.join(scan_dir, f"evidence_{finding.id}.json")
+                            _ev_data = await tool_runner.capture_finding_evidence(_raw_ev, _ev_out)
+                            finding.http_evidence = json.dumps(_ev_data)
+                            await _push_event(redis, scan_id, "evidence_captured", {
+                                "finding_id": finding.id,
+                                "source": _ev_src,
+                                "key_validated": (
+                                    _ev_data.get("key_validation", {}) or {}
+                                ).get("validated", False),
+                            })
+                    except Exception:
+                        pass
+
                     finding_path = os.path.join(finding_dir, "filtered", f"{finding.id}.json")
                     async with aiofiles.open(finding_path, "w") as f:
                         await f.write(finding.model_dump_json(indent=2))

@@ -32,6 +32,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+import httpx as _httpx
+
 import redis.asyncio as aioredis
 
 from backend.config import settings
@@ -1992,3 +1994,290 @@ async def run_github_dork(domains: list[str], output_file: str,
     log.info("github_dork: %d secrets found across %d domains (%d org queries)",
              len(unique_findings), len(apex_domains), len(orgs))
     return unique_findings
+
+
+# ── Evidence capture ─────────────────────────────────────────────────────────
+
+# Known API key validators: maps secret_type (lowercase, normalized) → validation spec
+_API_KEY_VALIDATORS: dict[str, dict] = {
+    "google-maps-api-key": {
+        "url": "https://maps.googleapis.com/maps/api/geocode/json",
+        "method": "GET",
+        "params": {"address": "London", "key": None},  # key injected at runtime
+        "key_param": "key",
+        "check": "json_field",
+        "field": "status",
+        "active_values": ["OK", "ZERO_RESULTS"],
+        "inactive_values": ["REQUEST_DENIED"],
+    },
+    "google-api-key": {
+        "url": "https://maps.googleapis.com/maps/api/geocode/json",
+        "method": "GET",
+        "params": {"address": "London", "key": None},
+        "key_param": "key",
+        "check": "json_field",
+        "field": "status",
+        "active_values": ["OK", "ZERO_RESULTS"],
+        "inactive_values": ["REQUEST_DENIED"],
+    },
+    "firebase-api-key": {
+        "url": "https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig",
+        "method": "GET",
+        "params": {"key": None},
+        "key_param": "key",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "github-token": {
+        "url": "https://api.github.com/user",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "token {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "github-access-token": {
+        "url": "https://api.github.com/user",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "token {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "stripe-secret-key": {
+        "url": "https://api.stripe.com/v1/balance",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "Bearer {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "slack-token": {
+        "url": "https://slack.com/api/auth.test",
+        "method": "GET",
+        "params": {"token": None},
+        "key_param": "token",
+        "check": "json_field",
+        "field": "ok",
+        "active_values": [True],
+    },
+    "sendgrid-api-key": {
+        "url": "https://api.sendgrid.com/v3/user/profile",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "Bearer {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "mailchimp-api-key": {
+        "url": "https://login.mailchimp.com/oauth2/metadata",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "OAuth {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "twilio-account-sid": {
+        "url": "https://api.twilio.com/2010-04-01/Accounts.json",
+        "method": "GET",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "aws-access-key-id": {
+        "url": "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        "method": "GET",
+        "check": "status_code",
+        "active_status": 200,
+    },
+}
+
+# Normalize secret_type aliases to validator keys
+_SECRET_TYPE_ALIASES: dict[str, str] = {
+    "google maps api key": "google-maps-api-key",
+    "google_maps_api_key": "google-maps-api-key",
+    "googlemapsapikey": "google-maps-api-key",
+    "google api key": "google-api-key",
+    "google_api_key": "google-api-key",
+    "github personal access token": "github-token",
+    "github_pat": "github-token",
+    "ghp_": "github-token",
+    "gho_": "github-access-token",
+    "stripe secret key": "stripe-secret-key",
+    "stripe_secret_key": "stripe-secret-key",
+    "sk_live_": "stripe-secret-key",
+}
+
+
+def _normalize_secret_type(secret_type: str) -> str:
+    """Normalize secret_type string to a validator key."""
+    normalized = secret_type.lower().strip().replace(" ", "-")
+    # Check aliases
+    alias = _SECRET_TYPE_ALIASES.get(secret_type.lower().strip())
+    if alias:
+        return alias
+    return normalized
+
+
+async def validate_api_key(secret_type: str, key_value: str) -> dict:
+    """
+    Validate a discovered API key against the respective service API.
+    Returns dict: {validated, status, status_code, response_snippet, curl_cmd}
+    Does NOT raise — always returns a result dict.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    result: dict = {
+        "validated": False,
+        "status": "unknown",
+        "status_code": None,
+        "response_snippet": None,
+        "curl_cmd": None,
+        "error": None,
+    }
+
+    norm = _normalize_secret_type(secret_type)
+    validator = _API_KEY_VALIDATORS.get(norm)
+    if not validator:
+        result["status"] = "no_validator"
+        return result
+
+    try:
+        url = validator["url"]
+        method = validator.get("method", "GET")
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; security-research)"}
+        params: dict = {}
+
+        # Inject API key into params
+        if "params" in validator and "key_param" in validator:
+            params = dict(validator["params"])
+            params[validator["key_param"]] = key_value
+            # Build curl for evidence
+            param_str = "&".join(f"{k}={v}" for k, v in params.items())
+            result["curl_cmd"] = f'curl -s "{url}?{param_str}" | python3 -m json.tool'
+        elif "header_key" in validator:
+            header_val = validator["header_value_tpl"].replace("{key}", key_value)
+            headers[validator["header_key"]] = header_val
+            # Build curl
+            result["curl_cmd"] = f'curl -s -H "{validator["header_key"]}: {header_val}" "{url}"'
+        else:
+            result["curl_cmd"] = f'curl -s "{url}"'
+
+        async with _httpx.AsyncClient(timeout=12, verify=False) as client:
+            if method == "GET":
+                resp = await client.get(url, params=params, headers=headers)
+            else:
+                resp = await client.post(url, params=params, headers=headers)
+
+            result["status_code"] = resp.status_code
+
+            check = validator.get("check", "status_code")
+            if check == "status_code":
+                active = resp.status_code == validator.get("active_status", 200)
+                result["validated"] = active
+                result["status"] = "active" if active else "inactive"
+                result["response_snippet"] = resp.text[:400]
+
+            elif check == "json_field":
+                try:
+                    data = resp.json()
+                    field_val = data.get(validator["field"])
+                    active_vals = validator.get("active_values", [])
+                    inactive_vals = validator.get("inactive_values", [])
+                    if field_val in active_vals:
+                        result["validated"] = True
+                        result["status"] = "active"
+                    elif field_val in inactive_vals:
+                        result["validated"] = False
+                        result["status"] = "restricted"
+                    else:
+                        result["status"] = f"unknown_response:{field_val}"
+                    result["response_snippet"] = json.dumps(data, indent=2)[:600]
+                except Exception:
+                    result["response_snippet"] = resp.text[:400]
+
+    except Exception as e:
+        result["error"] = str(e)[:120]
+        log.debug("validate_api_key(%s): %s", secret_type, e)
+
+    return result
+
+
+async def capture_http_evidence(js_url: str, search_term: str) -> dict:
+    """
+    Fetch a JS/HTML URL and extract the lines containing the secret.
+    Returns dict: {url, status_code, content_type, context_lines, request_line}
+    Does NOT raise.
+    """
+    result: dict = {
+        "url": js_url,
+        "status_code": None,
+        "content_type": None,
+        "context_lines": [],
+        "request_line": f"GET {js_url} HTTP/1.1",
+        "error": None,
+    }
+
+    try:
+        async with _httpx.AsyncClient(
+            timeout=15,
+            verify=False,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; security-research)"},
+        ) as client:
+            resp = await client.get(js_url)
+            result["status_code"] = resp.status_code
+            result["content_type"] = resp.headers.get("content-type", "")
+
+            # Find lines containing the secret (use first 20 chars of match)
+            search = search_term[:20] if len(search_term) > 20 else search_term
+            lines = resp.text.splitlines()
+            for i, line in enumerate(lines):
+                if search in line:
+                    start = max(0, i - 1)
+                    end = min(len(lines), i + 2)
+                    result["context_lines"] = [ln[:300] for ln in lines[start:end]]
+                    break
+
+    except Exception as e:
+        result["error"] = str(e)[:120]
+
+    return result
+
+
+async def capture_finding_evidence(raw_output_dict: dict, output_file: str) -> dict:
+    """
+    Given a raw finding dict (from raw_findings), capture HTTP evidence and
+    validate any API keys. Returns enriched evidence dict.
+    Saves to output_file if provided.
+    """
+    source = raw_output_dict.get("_source", "")
+    evidence: dict = {
+        "source": source,
+        "http_fetch": None,
+        "key_validation": None,
+    }
+
+    if source == "js_scanner":
+        js_url = raw_output_dict.get("matched-at", "")
+        secret_type = raw_output_dict.get("_secret_type", "")
+        extracted = raw_output_dict.get("extracted-results", [])
+        match_val = extracted[0] if extracted else raw_output_dict.get("_match", "")
+
+        # Capture the JS file content showing the secret in context
+        if js_url and match_val:
+            evidence["http_fetch"] = await capture_http_evidence(js_url, match_val)
+
+        # Validate the API key if we know how
+        if secret_type and match_val:
+            evidence["key_validation"] = await validate_api_key(secret_type, match_val)
+
+    if output_file:
+        try:
+            import aiofiles
+            async with aiofiles.open(output_file, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(evidence, indent=2))
+        except Exception:
+            pass
+
+    return evidence

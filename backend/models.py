@@ -92,6 +92,7 @@ class Finding(BaseModel):
     severity: Severity
     vuln_type: str
     raw_output: str
+    http_evidence: Optional[str] = None  # JSON-encoded evidence from capture_finding_evidence()
     filter_result: Optional[FilterResult] = None
     poc_result: Optional[PocResult] = None
     report_path: Optional[str] = None

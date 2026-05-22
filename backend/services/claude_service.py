@@ -338,6 +338,30 @@ async def generate_report(finding: Finding, scope: Scope) -> str:
     finding_dict = finding.model_dump()
     scope_dict = scope.model_dump()
 
+    # Parse captured HTTP evidence so Claude can embed real validation output
+    evidence_block = ""
+    if finding.http_evidence:
+        try:
+            ev = json.loads(finding.http_evidence)
+            kv = ev.get("key_validation") or {}
+            hf = ev.get("http_fetch") or {}
+            parts = []
+            if hf.get("status_code"):
+                parts.append(f"HTTP fetch: {hf['url']} → {hf['status_code']}")
+                if hf.get("context_lines"):
+                    parts.append("Context from JS file:")
+                    parts.extend(f"  {ln}" for ln in hf["context_lines"])
+            if kv.get("curl_cmd"):
+                parts.append(f"Validation command: {kv['curl_cmd']}")
+            if kv.get("response_snippet"):
+                parts.append(f"API validation response: {kv['response_snippet'][:400]}")
+            if kv.get("status"):
+                parts.append(f"Key status: {kv['status']} (validated={kv.get('validated')})")
+            if parts:
+                evidence_block = "\n\nCaptured evidence (use these exact values in the PoC section):\n" + "\n".join(parts)
+        except Exception:
+            pass
+
     system_prompt = """You are an expert bug bounty reporter. Write professional, reproducible HackerOne reports.
 
 Rules:
@@ -355,7 +379,7 @@ Finding:
 {json.dumps(finding_dict, default=str, indent=2)}
 
 Program:
-{json.dumps(scope_dict, indent=2)}
+{json.dumps(scope_dict, indent=2)}{evidence_block}
 
 Use this exact format:
 
