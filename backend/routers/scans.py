@@ -726,6 +726,11 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                 _raw_parts = [p for p in _path.split("/") if p]
                 if len(_raw_parts) != len(set(_raw_parts)):
                     continue
+                # Skip URLs where a path segment contains '=' — these are gau artifacts
+                # where query strings were incorrectly merged into the URL path
+                # (e.g. /v1/messagesr= from ?r=... losing its '?').
+                if any("=" in part for part in _raw_parts):
+                    continue
                 # Only match within the FIRST TWO path segments.
                 # Real API endpoints live at /api/..., /auth/..., /oauth/...
                 # Deep content pages like /legal/modernslaverystatement/api/ are not APIs.
