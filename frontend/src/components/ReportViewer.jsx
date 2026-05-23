@@ -23,14 +23,23 @@ export default function ReportViewer() {
   const { programId, reportId } = useParams()
 
   const [markdown, setMarkdown] = useState('')
+  const [meta, setMeta] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [view, setView] = useState('rendered') // 'rendered' | 'raw'
   const [copied, setCopied] = useState(false)
 
   useEffect(() => {
-    axios.get(`/api/reports/${programId}/${reportId}`, { responseType: 'text' })
-      .then(r => setMarkdown(r.data))
+    Promise.all([
+      axios.get(`/api/reports/${programId}/${reportId}`, { responseType: 'text' }),
+      axios.get(`/api/reports/${programId}/${reportId}/meta`).catch(() => null),
+    ])
+      .then(([reportResp, metaResp]) => {
+        setMarkdown(reportResp.data)
+        if (metaResp?.data?.data) {
+          setMeta(metaResp.data.data)
+        }
+      })
       .catch(e => setError(e.response?.data?.detail || 'Failed to load report'))
       .finally(() => setLoading(false))
   }, [programId, reportId])
@@ -108,6 +117,32 @@ export default function ReportViewer() {
       <p style={{ color: '#8b949e', fontSize: 12, marginBottom: 16 }}>
         Copy this markdown → open the HackerOne program → click "Submit a report" → paste into the description field.
       </p>
+
+      {meta?.quality && (
+        <div style={{
+          background: '#161b22', border: '1px solid #30363d', borderRadius: 6,
+          padding: '12px 14px', marginBottom: 14,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <strong style={{ color: '#c9d1d9', fontSize: 13 }}>Quality Gate</strong>
+            <span style={{
+              color: meta.quality.hard_blocked ? '#f85149' : meta.quality.gate_passed ? '#3fb950' : '#d29922',
+              fontSize: 12,
+              fontWeight: 700,
+            }}>
+              Score: {meta.quality.score ?? 'N/A'}/100
+            </span>
+            <span style={{ color: '#8b949e', fontSize: 12 }}>
+              Status: {meta.quality.hard_blocked ? 'Hard-blocked' : meta.quality.gate_passed ? 'Passed' : 'Needs review'}
+            </span>
+          </div>
+          {Array.isArray(meta.quality.issues) && meta.quality.issues.length > 0 && (
+            <div style={{ marginTop: 8, color: '#d29922', fontSize: 12 }}>
+              {meta.quality.issues.slice(0, 2).join(' | ')}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Report content */}
       {view === 'rendered' ? (

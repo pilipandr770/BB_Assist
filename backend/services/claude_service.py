@@ -186,7 +186,7 @@ Program text:
 
     message = await client.messages.create(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=4000,
         temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -284,7 +284,7 @@ Return a well-structured, actionable markdown document."""
 
     message = await client.messages.create(
         model=MODEL,
-        max_tokens=4000,
+        max_tokens=6000,
         temperature=0.3,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -589,7 +589,7 @@ import requests
 
     message = await client.messages.create(
         model=MODEL,
-        max_tokens=3000,
+        max_tokens=4500,
         temperature=0.5,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
@@ -615,7 +615,7 @@ Report to rewrite:
 
         rewrite = await client.messages.create(
             model=MODEL,
-            max_tokens=3000,
+            max_tokens=4500,
             temperature=0.2,
             system="You are a strict technical editor for bug bounty reports.",
             messages=[{"role": "user", "content": rewrite_prompt}],
@@ -623,3 +623,34 @@ Report to rewrite:
         report_md = rewrite.content[0].text
 
     return report_md
+
+
+async def rewrite_report_with_quality_feedback(report_md: str, feedback: list[str]) -> str:
+    """
+    Rewrite report markdown using deterministic quality feedback from rule-based gate.
+    """
+    feedback_block = "\n".join(f"- {item}" for item in feedback)
+    rewrite_prompt = f"""Revise the following HackerOne report to satisfy strict quality requirements.
+
+Quality issues to fix:
+{feedback_block}
+
+Requirements:
+- Keep all factual details unchanged unless they are clearly placeholders or unsupported claims.
+- Keep output in English only.
+- Keep the same top-level section structure and markdown format.
+- Keep PoC snippets runnable (curl/Python/HTTP blocks).
+- Do not add speculation; if evidence is missing, state that verification is required.
+
+Report to revise:
+{report_md}
+"""
+
+    rewrite = await client.messages.create(
+        model=MODEL,
+        max_tokens=4500,
+        temperature=0.2,
+        system="You are a strict technical editor for bug bounty reports.",
+        messages=[{"role": "user", "content": rewrite_prompt}],
+    )
+    return rewrite.content[0].text if rewrite.content else report_md
