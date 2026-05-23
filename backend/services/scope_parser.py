@@ -21,7 +21,13 @@ _DOMAIN_RE = re.compile(
 _IGNORE_DOMAINS = {
     "hackerone.com", "disclose.io", "xss.ht", "owasp.org",
     "github.com", "cvss.org", "cve.org",
+    "bugcrowd.com", "intigriti.com", "yeswehack.com", "huntr.com",
 }
+
+
+def _is_ignored_domain(domain: str) -> bool:
+    d = domain.lower().strip().lstrip("*.")
+    return any(d == base or d.endswith("." + base) for base in _IGNORE_DOMAINS)
 
 
 def _infer_domains_from_text(text: str) -> list[str]:
@@ -29,7 +35,7 @@ def _infer_domains_from_text(text: str) -> list[str]:
     candidates: dict[str, int] = {}
     for m in _DOMAIN_RE.finditer(text):
         d = m.group(1).lower()
-        if d not in _IGNORE_DOMAINS and len(d) > 5:
+        if not _is_ignored_domain(d) and len(d) > 5:
             # Weight by frequency — the company's own domain appears most often
             candidates[d] = candidates.get(d, 0) + 1
 

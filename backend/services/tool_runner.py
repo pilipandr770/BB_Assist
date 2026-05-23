@@ -22,6 +22,7 @@ Scan pipeline:
 """
 
 import asyncio
+import csv
 import json
 import os
 import re
@@ -343,7 +344,9 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
       2. For each open port found, emit hostname:port for ALL hostnames on that IP
          (capped at 20 hostnames per IP to avoid probe explosion)
 
-    Returns list of "hostname:port" strings ready for httpx to probe.
+        Returns tuple:
+            - list of "hostname:port" strings ready for httpx to probe
+            - list of detected service/version banners per endpoint
     Always uses hostnames (never raw IPs) so CDN/SNI routing works correctly.
     Caps at 100 hosts input; 30 s per-host timeout keeps the scan under 5 min.
     """
@@ -352,10 +355,15 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
     log = logging.getLogger("tool_runner")
 
     if not hosts:
-        return []
+        return [], []
 
-    # Ports that commonly host web services but are NOT 80/443
-    WEB_PORTS = "8080,8443,8000,8888,8008,3000,3001,4000,4443,5000,5443,9000,9090,9443,7080,7443"
+    # Ports used for version inventory. Includes 80/443 so CVE lookup still works
+    # when a target only exposes standard web ports.
+    WEB_PORTS = "80,443,8080,8443,8000,8888,8008,3000,3001,4000,4443,5000,5443,9000,9090,9443,7080,7443"
+    NON_STANDARD_PORTS: set[str] = {
+        "8080", "8443", "8000", "8888", "8008", "3000", "3001", "4000",
+        "4443", "5000", "5443", "9000", "9090", "9443", "7080", "7443",
+    }
 
     targets = hosts[:100]
     targets_file = _write_temp_list(targets)
@@ -376,17 +384,24 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
             "-iL", targets_file,
             "-p", WEB_PORTS,
             "--open",               # show only open ports
+            "-sC",                  # run default NSE scripts
+            "-sV",                  # detect service versions
+            "--version-light",      # faster version probing
             "-T4",                  # aggressive timing (fast)
             "--max-retries", "1",
-            "--host-timeout", "30s",
+            "--host-timeout", "45s",
             "-oG", output_file,     # greppable output — easy to parse
         ]
-        await _run_command(cmd, timeout_s=300)
+        await _run_command(cmd, timeout_s=600)
 
         # Parse greppable nmap output.
         # Line format: Host: IP (hostname)\tPorts: PORT/open/tcp//service///[,...]
-        # ip_to_open_ports: {ip: set of open port strings}
-        ip_to_open_ports: dict[str, set] = {}
+        # Keep two maps:
+        #   1) ip_to_nonstd_ports for endpoint expansion (httpx probes)
+        #   2) ip_to_versioned_ports for CVE version matching inventory (includes 80/443)
+        ip_to_nonstd_ports: dict[str, set] = {}
+        ip_to_versioned_ports: dict[str, set] = {}
+        ip_port_meta: dict[tuple[str, str], dict] = {}
         if os.path.exists(output_file):
             with open(output_file) as f:
                 for line in f:
@@ -410,16 +425,36 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
                     for entry in ports_section.split(","):
                         entry = entry.strip()
                         if "/open/" in entry:
-                            port = entry.split("/")[0].strip()
+                            fields = entry.split("/")
+                            port = fields[0].strip() if fields else ""
                             if port.isdigit():
-                                ip_to_open_ports.setdefault(ip, set()).add(port)
+                                ip_to_versioned_ports.setdefault(ip, set()).add(port)
+                                # Expand endpoints only for non-standard ports to avoid
+                                # unnecessary duplication with live host list from dnsx/httpx.
+                                if port in NON_STANDARD_PORTS:
+                                    ip_to_nonstd_ports.setdefault(ip, set()).add(port)
+                                service = fields[4].strip() if len(fields) > 4 else ""
+                                banner_raw = fields[6].strip() if len(fields) > 6 else ""
+                                # nmap often puts additional version details in extra fields.
+                                if len(fields) > 7:
+                                    extra = " ".join(x.strip() for x in fields[7:] if x.strip())
+                                    if extra:
+                                        banner_raw = f"{banner_raw} {extra}".strip()
+
+                                fingerprint = " ".join(x for x in [service, banner_raw] if x).strip()
+                                ip_port_meta[(ip, port)] = {
+                                    "service": service,
+                                    "version": banner_raw,
+                                    "fingerprint": fingerprint,
+                                }
 
         # Build final endpoint list: for each open port on each IP, emit hostname:port
         # for ALL hostnames that resolved to that IP. This ensures CDN-fronted hosts
         # are probed with the correct Host header (httpx uses the hostname, not the IP).
         seen: set[str] = set()
         endpoints: list[str] = []
-        for ip, open_ports in ip_to_open_ports.items():
+        service_versions: list[dict] = []
+        for ip, versioned_ports in ip_to_versioned_ports.items():
             # Find hostnames that resolve to this IP (from our pre-resolution map)
             matched_hosts = ip_to_hosts.get(ip, [])
             # If no match (nmap resolved to a different IP than we did), use nmap's hostname
@@ -429,22 +464,144 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
                 matched_hosts = [ip]
             # Cap per-IP to 20 hostnames to avoid probe explosion (e.g. 86 hosts on one Cloudflare IP)
             for hostname in matched_hosts[:20]:
-                for port in sorted(open_ports):
-                    ep = f"{hostname}:{port}"
-                    if ep not in seen:
-                        seen.add(ep)
-                        endpoints.append(ep)
+                for port in sorted(versioned_ports):
+                    if port in NON_STANDARD_PORTS:
+                        ep = f"{hostname}:{port}"
+                        if ep not in seen:
+                            seen.add(ep)
+                            endpoints.append(ep)
+                        meta = ip_port_meta.get((ip, port), {})
+                        service_versions.append({
+                            "host": hostname,
+                            "port": int(port),
+                            "service": meta.get("service", ""),
+                            "version": meta.get("version", ""),
+                            "fingerprint": meta.get("fingerprint", ""),
+                        })
 
         log.info(
-            "nmap: %d open web ports on %d unique IPs → %d hostname:port probes",
-            sum(len(v) for v in ip_to_open_ports.values()),
-            len(ip_to_open_ports),
+            "nmap: %d open web ports on %d unique IPs → %d hostname:port probes, %d version banners",
+            sum(len(v) for v in ip_to_versioned_ports.values()),
+            len(ip_to_versioned_ports),
             len(endpoints),
+            len(service_versions),
         )
-        return endpoints
+        return endpoints, service_versions
     finally:
         if os.path.exists(targets_file):
             os.unlink(targets_file)
+
+
+def match_service_versions_to_cves(
+    service_versions: list[dict],
+    csv_path: Optional[str] = None,
+) -> list[dict]:
+    """
+    Metasploit-style version-based CVE matching.
+    
+    Matches nmap -sV banners against a local CSV database of product:version→CVE mappings.
+    Works exactly like Metasploit: find service+version, look up in database, return matching CVEs.
+    No exploitation, no probing — just version fingerprint lookup.
+    
+    CSV columns: product,version_regex,cve,severity,title,reference
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+    
+    if not service_versions:
+        return []
+
+    if not csv_path:
+        csv_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "data",
+            "cve_service_versions.csv",
+        )
+
+    if not os.path.exists(csv_path):
+        log.warning(f"CVE version database not found: {csv_path}")
+        return []
+
+    # Load and compile CVE rules from CSV
+    rules: list[dict] = []
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pattern = (row.get("version_regex") or "").strip()
+                product = (row.get("product") or "").strip().lower()
+                if not pattern or not product:
+                    continue
+                try:
+                    row["_compiled"] = re.compile(pattern, re.IGNORECASE)
+                    row["_product_lower"] = product
+                    rules.append(row)
+                except re.error as e:
+                    log.warning(f"Invalid regex in CVE rule {row.get('product')}: {e}")
+                    continue
+        log.info(f"cve_matcher: loaded {len(rules)} CVE version rules from {csv_path}")
+    except Exception as e:
+        log.error(f"Failed to load CVE database: {e}")
+        return []
+
+    matches: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    
+    for svc in service_versions:
+        host = str(svc.get("host", "")).strip()
+        port = int(svc.get("port", 0) or 0)
+        service = str(svc.get("service", "")).strip().lower()
+        version = str(svc.get("version", "")).strip()
+        fingerprint = str(svc.get("fingerprint", "")).strip()
+        
+        # Build comprehensive search string: service, version, and full fingerprint
+        haystack = " ".join(x for x in [service, version, fingerprint] if x).lower()
+        if not haystack or not service:
+            continue
+
+        # Try matching against each CVE rule
+        for rule in rules:
+            product = rule.get("_product_lower", "")
+            compiled = rule.get("_compiled")
+            
+            # First: product name must appear in service/fingerprint
+            if product not in service and product not in fingerprint:
+                continue
+            
+            # Second: version pattern must match the full haystack
+            if not compiled or not compiled.search(haystack):
+                continue
+
+            cve = (rule.get("cve") or "CVE-UNKNOWN").strip()
+            key = (host, port, cve)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            sev = (rule.get("severity") or "medium").strip().lower()
+            if sev not in {"critical", "high", "medium", "low", "info", "informative"}:
+                sev = "medium"
+            if sev == "info":
+                sev = "informative"
+
+            matches.append({
+                "host": host,
+                "port": port,
+                "service": service,
+                "version": version,
+                "fingerprint": fingerprint,
+                "product": product,
+                "cve": cve,
+                "severity": sev,
+                "title": (rule.get("title") or "Version-based CVE").strip(),
+                "reference": (rule.get("reference") or "").strip(),
+                "pattern": (rule.get("version_regex") or "").strip(),
+            })
+
+    if matches:
+        log.info(f"cve_matcher: found {len(matches)} version-based CVE candidates across {len(service_versions)} services")
+    
+    return matches
 
 
 async def run_httpx(hosts: list[str], output_file: str) -> list[dict]:
@@ -816,18 +973,9 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
     """
     # Try wordlist locations in priority order.
     # /wordlists/ is populated at Docker build time from SecLists.
-    if not wordlist or not os.path.exists(wordlist):
-        for candidate in [
-            "/wordlists/web-combined.txt",          # our curated merge (common + api endpoints)
-            "/wordlists/common.txt",                 # SecLists common
-            "/usr/share/seclists/Discovery/Web-Content/common.txt",
-            "/usr/share/wordlists/dirb/common.txt",
-        ]:
-            if os.path.exists(candidate):
-                wordlist = candidate
-                break
-        else:
-            return []  # No wordlist available — Docker image not rebuilt yet
+    wordlist = resolve_ffuf_wordlist(wordlist)
+    if not wordlist:
+        return []  # No wordlist available — Docker image not rebuilt yet
 
     cmd = [
         "ffuf",
@@ -851,6 +999,22 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
         except (json.JSONDecodeError, KeyError):
             return []
     return []
+
+
+def resolve_ffuf_wordlist(wordlist: str) -> str:
+    """Return an existing ffuf wordlist path or empty string if unavailable."""
+    if wordlist and os.path.exists(wordlist):
+        return wordlist
+
+    for candidate in [
+        "/wordlists/web-combined.txt",          # our curated merge (common + api endpoints)
+        "/wordlists/common.txt",                 # SecLists common
+        "/usr/share/seclists/Discovery/Web-Content/common.txt",
+        "/usr/share/wordlists/dirb/common.txt",
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+    return ""
 
 
 async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict]:
@@ -1625,14 +1789,22 @@ async def run_s3_enum(domains: list[str], output_file: str) -> list[dict]:
         company_names.add(name.replace("-", ""))
         company_names.add(name.replace("_", ""))
 
-    bucket_names: list[str] = []
-    for name in sorted(company_names):
-        for suffix in _S3_BUCKET_SUFFIXES:
-            candidate = f"{name}{suffix}"
-            if 3 <= len(candidate) <= 63:  # S3 bucket name length constraints
-                bucket_names.append(candidate)
+    bucket_to_scope_url: dict[str, str] = {}
+    for domain in domains:
+        scope_url = f"https://{domain.lstrip('*.')}"
+        base = domain.lstrip("*.")
+        name = base.split(".")[0].lower()
+        names = [name, name.replace("-", ""), name.replace("_", "")]
+        for derived_name in names:
+            if not derived_name:
+                continue
+            for suffix in _S3_BUCKET_SUFFIXES:
+                candidate = f"{derived_name}{suffix}"
+                if 3 <= len(candidate) <= 63 and candidate not in bucket_to_scope_url:
+                    # Keep first seen scope URL for deterministic attribution.
+                    bucket_to_scope_url[candidate] = scope_url
 
-    bucket_names = list(dict.fromkeys(bucket_names))  # deduplicate
+    bucket_names = list(bucket_to_scope_url.keys())
 
     findings: list[dict] = []
     semaphore = asyncio.Semaphore(20)
@@ -1642,6 +1814,7 @@ async def run_s3_enum(domains: list[str], output_file: str) -> list[dict]:
         async with semaphore:
             result = await loop.run_in_executor(None, _check_s3_bucket_sync, bucket)
         if result:
+            result["scope_url"] = bucket_to_scope_url.get(bucket, "")
             findings.append(result)
 
     await asyncio.gather(*[_check_one(b) for b in bucket_names])
@@ -2108,6 +2281,30 @@ _SECRET_TYPE_ALIASES: dict[str, str] = {
 }
 
 
+def _infer_secret_type_from_value(key_value: str) -> Optional[str]:
+    """Infer validator key from the key/token shape when secret_type is generic."""
+    if not key_value:
+        return None
+
+    key = key_value.strip()
+
+    # Google API/Firebase keys (both start with AIza)
+    if re.match(r"^AIza[0-9A-Za-z\-_]{35}$", key):
+        return "google-api-key"
+
+    # GitHub tokens
+    if key.startswith("ghp_"):
+        return "github-token"
+    if key.startswith("gho_"):
+        return "github-access-token"
+
+    # Stripe secret keys
+    if key.startswith("sk_live_") or key.startswith("sk_test_"):
+        return "stripe-secret-key"
+
+    return None
+
+
 def _normalize_secret_type(secret_type: str) -> str:
     """Normalize secret_type string to a validator key."""
     normalized = secret_type.lower().strip().replace(" ", "-")
@@ -2138,6 +2335,14 @@ async def validate_api_key(secret_type: str, key_value: str) -> dict:
 
     norm = _normalize_secret_type(secret_type)
     validator = _API_KEY_VALIDATORS.get(norm)
+
+    # If detector returned a generic label (e.g. "API Key"), infer type from key value.
+    if not validator:
+        inferred = _infer_secret_type_from_value(key_value)
+        if inferred:
+            validator = _API_KEY_VALIDATORS.get(inferred)
+            norm = inferred
+
     if not validator:
         result["status"] = "no_validator"
         return result
@@ -2245,7 +2450,61 @@ async def capture_http_evidence(js_url: str, search_term: str) -> dict:
     return result
 
 
-async def capture_finding_evidence(raw_output_dict: dict, output_file: str) -> dict:
+async def capture_page_screenshot(url: str, screenshot_file: str) -> dict:
+    """
+    Best-effort full-page screenshot capture for evidence.
+    Returns dict with path/status and never raises.
+    """
+    result: dict = {
+        "saved": False,
+        "path": screenshot_file,
+        "error": None,
+    }
+
+    if not screenshot_file:
+        result["error"] = "no_output_path"
+        return result
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        result["error"] = f"playwright_unavailable:{type(e).__name__}"
+        return result
+
+    try:
+        Path(screenshot_file).parent.mkdir(parents=True, exist_ok=True)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(viewport={"width": 1440, "height": 1024})
+
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                # Still attempt screenshot even if networkidle waits out.
+                pass
+
+            await page.screenshot(path=screenshot_file, full_page=True)
+            await browser.close()
+
+        result["saved"] = os.path.exists(screenshot_file)
+        if not result["saved"]:
+            result["error"] = "screenshot_not_created"
+
+    except Exception as e:
+        result["error"] = f"screenshot_failed:{type(e).__name__}:{str(e)[:120]}"
+
+    return result
+
+
+async def capture_finding_evidence(
+    raw_output_dict: dict,
+    output_file: str,
+    screenshot_file: Optional[str] = None,
+) -> dict:
     """
     Given a raw finding dict (from raw_findings), capture HTTP evidence and
     validate any API keys. Returns enriched evidence dict.
@@ -2256,6 +2515,7 @@ async def capture_finding_evidence(raw_output_dict: dict, output_file: str) -> d
         "source": source,
         "http_fetch": None,
         "key_validation": None,
+        "screenshot": None,
     }
 
     if source == "js_scanner":
@@ -2267,6 +2527,10 @@ async def capture_finding_evidence(raw_output_dict: dict, output_file: str) -> d
         # Capture the JS file content showing the secret in context
         if js_url and match_val:
             evidence["http_fetch"] = await capture_http_evidence(js_url, match_val)
+
+        # Capture visual evidence as PNG (best-effort; never blocks finding flow).
+        if js_url and screenshot_file:
+            evidence["screenshot"] = await capture_page_screenshot(js_url, screenshot_file)
 
         # Validate the API key if we know how
         if secret_type and match_val:

@@ -44,6 +44,15 @@ router = APIRouter()
 
 WORKSPACE = settings.workspace_dir
 
+_PLATFORM_SCOPE_DOMAINS = {
+    "hackerone.com", "bugcrowd.com", "intigriti.com", "yeswehack.com", "huntr.com",
+}
+
+
+def _is_platform_scope_domain(domain: str) -> bool:
+    d = domain.lower().strip().lstrip("*.")
+    return any(d == base or d.endswith("." + base) for base in _PLATFORM_SCOPE_DOMAINS)
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -256,6 +265,7 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
     return [url for _, url in scored[:max_hosts]]
 
 
+async def _run_scan_pipeline(job: ScanJob) -> None:
     """
     Full scan pipeline executed as a background task.
     Phase 1: Passive recon
@@ -430,12 +440,42 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
         # are expanded back to all hostnames sharing that IP → correct SNI/Host routing.
         await _push_event(redis, scan_id, "tool_start", {
             "tool": "nmap",
-            "detail": f"non-standard web ports on {min(len(live_hosts), 100)} hosts",
+            "detail": f"service versions on 80/443 + non-standard web ports for {min(len(live_hosts), 100)} hosts",
         })
         nmap_out = os.path.join(recon_dir, "nmap.gnmap")
-        nmap_endpoints = await tool_runner.run_nmap(live_hosts, nmap_out)
+        nmap_endpoints, nmap_service_versions = await tool_runner.run_nmap(live_hosts, nmap_out)
+        nmap_csv_cve_hits = tool_runner.match_service_versions_to_cves(nmap_service_versions)
+        version_samples = []
+        for svc in nmap_service_versions:
+            service = str(svc.get("service", "")).strip()
+            version = str(svc.get("version", "")).strip()
+            fingerprint = str(svc.get("fingerprint", "")).strip()
+            display = fingerprint or " ".join(x for x in [service, version] if x).strip()
+            if not display:
+                continue
+            version_samples.append({
+                "host": svc.get("host", ""),
+                "port": svc.get("port", 0),
+                "display": display,
+            })
+            if len(version_samples) >= 12:
+                break
         await _push_event(redis, scan_id, "tool_done", {
-            "tool": "nmap", "count": len(nmap_endpoints),
+            "tool": "nmap",
+            "count": len(nmap_endpoints),
+            "versioned_services": len(nmap_service_versions),
+            "csv_cve_hits": len(nmap_csv_cve_hits),
+        })
+        if version_samples:
+            await _push_event(redis, scan_id, "service_versions", {
+                "count": len(nmap_service_versions),
+                "samples": version_samples,
+            })
+
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "cve_csv",
+            "count": len(nmap_csv_cve_hits),
+            "services_checked": len(nmap_service_versions),
         })
 
         detected_techs: set[str] = set()  # populated after httpx completes
@@ -635,6 +675,14 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
             if not ffuf_hosts and scope.in_scope_urls:
                 ffuf_hosts = [u for u in scope.in_scope_urls if u.startswith("http")][:3]
 
+            resolved_ffuf_wordlist = tool_runner.resolve_ffuf_wordlist("")
+            ffuf_wordlist_missing = not bool(resolved_ffuf_wordlist)
+            if ffuf_wordlist_missing:
+                await _push_event(redis, scan_id, "pipeline_warning", {
+                    "phase": "content_discovery",
+                    "warning": "ffuf wordlist not found in container; skipping content discovery",
+                })
+
             for host_url in ffuf_hosts:
                 await _push_event(redis, scan_id, "tool_start", {
                     "tool": "ffuf", "detail": host_url,
@@ -648,6 +696,7 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                 await _push_event(redis, scan_id, "tool_done", {
                     "tool": "ffuf", "count": len(results),
                     "found": len(found), "forbidden": len(fbd_403),
+                    **({"warning": "wordlist_missing"} if ffuf_wordlist_missing else {}),
                 })
 
             # Add discovered URLs to the target pool (in-scope only)
@@ -658,6 +707,7 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                 "phase": "content_discovery",
                 "new_paths": len(new_urls),
                 "forbidden": len(ffuf_403_urls),
+                **({"skipped_reason": "wordlist_missing"} if ffuf_wordlist_missing else {}),
             })
         else:
             await _push_event(redis, scan_id, "phase_done", {
@@ -987,6 +1037,29 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
         rejected_count = 0
 
         # Convert JS secrets → Finding objects and add to the evaluation queue
+        for hit in nmap_csv_cve_hits:
+            target_url = f"https://{hit['host']}:{hit['port']}"
+            raw_findings.append({
+                "_source": "nmap_csv",
+                "info": {
+                    "name": f"Version-based CVE Candidate: {hit['cve']} ({hit['title']})",
+                    "severity": hit["severity"],
+                    "tags": ["cve", "version-detection", "nmap"],
+                    "description": (
+                        f"nmap -sV banner matched CSV rule for {hit['cve']} "
+                        f"on {hit['host']}:{hit['port']}. "
+                        f"service='{hit['service']}' version='{hit['version']}'. "
+                        f"pattern='{hit['pattern']}'. reference='{hit['reference']}'"
+                    ),
+                },
+                "matched-at": target_url,
+                "type": "cve",
+                "_cve": hit["cve"],
+                "_service": hit["service"],
+                "_version": hit["version"],
+                "_reference": hit["reference"],
+            })
+
         for secret in js_secrets:
             raw_findings.append({
                 "_source": "js_scanner",
@@ -1104,10 +1177,11 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                     "tags": ["exposure", "s3", "misconfig", "cloud"],
                     "description": _s3["impact"],
                 },
-                "matched-at": _s3["url"],
+                "matched-at": _s3.get("scope_url") or _s3["url"],
                 "type": "exposure",
                 "_bucket": _s3["bucket"],
                 "_publicly_listed": _s3["publicly_listed"],
+                "_bucket_url": _s3["url"],
             })
 
         # Convert dalfox XSS findings → Finding objects
@@ -1276,11 +1350,17 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                         _ev_src = _raw_ev.get("_source", "")
                         if _ev_src in ("js_scanner",):
                             _ev_out = os.path.join(scan_dir, f"evidence_{finding.id}.json")
-                            _ev_data = await tool_runner.capture_finding_evidence(_raw_ev, _ev_out)
+                            _ev_png = os.path.join(scan_dir, f"evidence_{finding.id}.png")
+                            _ev_data = await tool_runner.capture_finding_evidence(
+                                _raw_ev, _ev_out, _ev_png
+                            )
                             finding.http_evidence = json.dumps(_ev_data)
                             await _push_event(redis, scan_id, "evidence_captured", {
                                 "finding_id": finding.id,
                                 "source": _ev_src,
+                                "screenshot_saved": (
+                                    _ev_data.get("screenshot", {}) or {}
+                                ).get("saved", False),
                                 "key_validated": (
                                     _ev_data.get("key_validation", {}) or {}
                                 ).get("validated", False),
@@ -1303,6 +1383,11 @@ def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
                     try:
                         report = await report_generator.generate(finding, scope)
                         job.reports_count += 1
+
+                        # Re-save finding so report_path is persisted in filtered JSON.
+                        async with aiofiles.open(finding_path, "w") as f:
+                            await f.write(finding.model_dump_json(indent=2))
+
                         await _push_event(redis, scan_id, "report_generated", {
                             "finding_id": finding.id,
                             "report_id": report.id,
@@ -1423,6 +1508,17 @@ async def start_scan(body: ScanCreate):
                    "Re-create the program with a complete HackerOne scope section that lists specific domains.",
         )
 
+    in_scope_clean = [d.lstrip("*.").lower() for d in (program.scope.in_scope_domains or []) if d]
+    if in_scope_clean and all(_is_platform_scope_domain(d) for d in in_scope_clean):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Parsed scope only contains bug bounty platform domains (e.g., bugcrowd/hackerone), "
+                "which indicates scope extraction fallback failed. Re-create the program using the full "
+                "live scope table and verify in-scope domains before starting a scan."
+            ),
+        )
+
     job = ScanJob(
         id=str(uuid.uuid4()),
         program_id=body.program_id,
@@ -1433,7 +1529,7 @@ async def start_scan(body: ScanCreate):
 
     # Launch scan as a free asyncio task (not a FastAPI BackgroundTask) so it
     # survives across uvicorn hot-reloads and doesn't block shutdown.
-    asyncio.create_task(_run_scan(job, body.approved_plan))
+    asyncio.create_task(_run_scan_pipeline(job))
 
     return ApiResponse(success=True, data=json.loads(job.model_dump_json()))
 
