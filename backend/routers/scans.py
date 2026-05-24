@@ -543,6 +543,127 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
                 "tool": "httpx-gen-fallback", "count": len(live_urls),
             })
 
+        # If pre-httpx nmap saw no version banners, retry version detection on
+        # confirmed live URLs. This avoids false "0 services fingerprinted" cases
+        # when the first 100 dnsx hosts don't overlap with the actually responsive
+        # web hosts for this program.
+        if not nmap_service_versions and live_urls:
+            nmap_retry_hosts: list[str] = []
+            seen_retry_hosts: set[str] = set()
+            for _u in live_urls:
+                _h = (urlparse(_u).hostname or "").strip()
+                if _h and _h not in seen_retry_hosts:
+                    seen_retry_hosts.add(_h)
+                    nmap_retry_hosts.append(_h)
+                if len(nmap_retry_hosts) >= 100:
+                    break
+
+            if nmap_retry_hosts:
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "nmap_retry",
+                    "detail": f"service versions on {len(nmap_retry_hosts)} confirmed live hosts",
+                })
+                nmap_retry_out = os.path.join(recon_dir, "nmap_retry.gnmap")
+                _, retry_service_versions = await tool_runner.run_nmap(nmap_retry_hosts, nmap_retry_out)
+                retry_csv_hits = tool_runner.match_service_versions_to_cves(retry_service_versions)
+
+                nmap_service_versions = retry_service_versions
+                nmap_csv_cve_hits = retry_csv_hits
+
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "nmap_retry",
+                    "count": 0,
+                    "versioned_services": len(nmap_service_versions),
+                    "csv_cve_hits": len(nmap_csv_cve_hits),
+                })
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "cve_csv_retry",
+                    "count": len(nmap_csv_cve_hits),
+                    "services_checked": len(nmap_service_versions),
+                })
+
+                if nmap_service_versions:
+                    retry_samples = []
+                    for svc in nmap_service_versions:
+                        service = str(svc.get("service", "")).strip()
+                        version = str(svc.get("version", "")).strip()
+                        fingerprint = str(svc.get("fingerprint", "")).strip()
+                        display = fingerprint or " ".join(x for x in [service, version] if x).strip()
+                        if not display:
+                            continue
+                        retry_samples.append({
+                            "host": svc.get("host", ""),
+                            "port": svc.get("port", 0),
+                            "display": display,
+                        })
+                        if len(retry_samples) >= 12:
+                            break
+                    if retry_samples:
+                        await _push_event(redis, scan_id, "service_versions", {
+                            "count": len(nmap_service_versions),
+                            "samples": retry_samples,
+                        })
+            else:
+                await _push_event(redis, scan_id, "tool_skip", {
+                    "tool": "nmap_retry",
+                    "reason": "no valid hostnames extracted from live URLs",
+                })
+        elif nmap_service_versions:
+            await _push_event(redis, scan_id, "tool_skip", {
+                "tool": "nmap_retry",
+                "reason": f"initial nmap already fingerprinted {len(nmap_service_versions)} services",
+            })
+        else:
+            await _push_event(redis, scan_id, "tool_skip", {
+                "tool": "nmap_retry",
+                "reason": "no confirmed live URLs for retry",
+            })
+
+        # Final fallback: extract version tokens from httpx metadata (Server /
+        # X-Powered-By / tech fields) and run the same CSV CVE matcher.
+        # Useful for CDN-fronted targets where nmap -sV often returns no banners.
+        if not nmap_service_versions and http_results:
+            httpx_service_versions = tool_runner.extract_service_versions_from_httpx(http_results)
+            if httpx_service_versions:
+                nmap_service_versions = httpx_service_versions
+                nmap_csv_cve_hits = tool_runner.match_service_versions_to_cves(nmap_service_versions)
+
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "httpx_version_inventory",
+                    "count": len(nmap_service_versions),
+                })
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "cve_csv_httpx",
+                    "count": len(nmap_csv_cve_hits),
+                    "services_checked": len(nmap_service_versions),
+                })
+
+                httpx_samples = []
+                for svc in nmap_service_versions:
+                    service = str(svc.get("service", "")).strip()
+                    version = str(svc.get("version", "")).strip()
+                    fingerprint = str(svc.get("fingerprint", "")).strip()
+                    display = fingerprint or " ".join(x for x in [service, version] if x).strip()
+                    if not display:
+                        continue
+                    httpx_samples.append({
+                        "host": svc.get("host", ""),
+                        "port": svc.get("port", 0),
+                        "display": display,
+                    })
+                    if len(httpx_samples) >= 12:
+                        break
+                if httpx_samples:
+                    await _push_event(redis, scan_id, "service_versions", {
+                        "count": len(nmap_service_versions),
+                        "samples": httpx_samples,
+                    })
+            else:
+                await _push_event(redis, scan_id, "tool_skip", {
+                    "tool": "cve_csv_httpx",
+                    "reason": "httpx headers/tech contained no parseable version tokens",
+                })
+
         # gau — run on unique apex domains only (same dedup logic as passive recon).
         # Programs with 45 explicit subdomains should not trigger 45 gau runs —
         # gau queries by apex anyway, so tw.coupang.com covers all its subdomains.

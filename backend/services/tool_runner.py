@@ -29,6 +29,7 @@ import re
 import tempfile
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -182,6 +183,84 @@ def extract_tech_stack(http_results: list[dict]) -> set[str]:
 
     # Final pass: strip protocol/policy noise regardless of which layer added it
     return techs - _TECH_NOISE
+
+
+_HTTPX_VERSION_TOKEN_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9._-]{1,32})[/ ]v?(\d+(?:\.\d+){1,3}[A-Za-z0-9._-]*)",
+    re.IGNORECASE,
+)
+
+_HTTPX_VERSION_STOPWORDS: frozenset[str] = frozenset({
+    "http", "https", "tls", "ssl", "ubuntu", "debian", "linux", "windows",
+    "alpine", "apache", "mozilla", "gecko", "chrome", "safari",
+})
+
+
+def extract_service_versions_from_httpx(http_results: list[dict]) -> list[dict]:
+    """
+    Best-effort service/version inventory from httpx metadata.
+
+    This is a fallback path for CDN-heavy targets where nmap -sV often returns
+    empty service banners. We parse version tokens from:
+      - webserver / Server header
+      - X-Powered-By header
+      - httpx technology entries that include versions (e.g. nginx:1.24.0)
+    """
+    services: list[dict] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    for r in http_results:
+        raw_url = str(r.get("url", "")).strip()
+        if not raw_url:
+            continue
+
+        parsed = urlparse(raw_url)
+        host = (parsed.hostname or "").strip()
+        if not host:
+            continue
+
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+
+        headers: dict = r.get("headers") or {}
+        webserver = str(r.get("webserver", "") or headers.get("server", "") or headers.get("Server", ""))
+        x_powered_by = str(headers.get("x-powered-by", "") or headers.get("X-Powered-By", ""))
+
+        candidates: list[str] = []
+        for candidate in (webserver, x_powered_by):
+            if candidate:
+                candidates.append(candidate)
+
+        for field in ("tech", "technologies", "technology"):
+            for tech in (r.get(field) or []):
+                t = str(tech).strip()
+                if t:
+                    candidates.append(t)
+
+        for candidate in candidates:
+            for match in _HTTPX_VERSION_TOKEN_RE.finditer(candidate):
+                service = match.group(1).lower().strip("._-")
+                version = match.group(2).strip()
+                if not service or not version:
+                    continue
+                if service in _HTTPX_VERSION_STOPWORDS:
+                    continue
+
+                key = (host, int(port), service, version)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                services.append({
+                    "host": host,
+                    "port": int(port),
+                    "service": service,
+                    "version": version,
+                    "fingerprint": candidate.strip(),
+                })
+
+    return services
 
 
 def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:

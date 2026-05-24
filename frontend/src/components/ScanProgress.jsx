@@ -153,11 +153,11 @@ export default function ScanProgress() {
 
       case 'tool_done': {
         const extras = []
-        if (data.tool === 'nmap') {
+        if (data.tool === 'nmap' || data.tool === 'nmap_retry') {
           if (data.count != null) extras.push(`${data.count} new endpoints`)
           if (data.versioned_services != null) extras.push(`${data.versioned_services} services fingerprinted`)
           if (data.csv_cve_hits != null) extras.push(`${data.csv_cve_hits} CVE matches`)
-        } else if (data.tool === 'cve_csv') {
+        } else if (data.tool === 'cve_csv' || data.tool === 'cve_csv_retry' || data.tool === 'cve_csv_httpx') {
           if (data.count != null) extras.push(`${data.count} matches`)
           if (data.services_checked != null) extras.push(`${data.services_checked} services checked`)
         } else {
