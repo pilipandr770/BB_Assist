@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     # all active-recon requests, as required by many H1 programs (e.g. Coupang).
     h1_username: Optional[str] = None
 
+    # Optional remote curated CVE CSV URL for version-based matching database.
+    # If set, backend refreshes the local CSV on startup and then periodically.
+    cve_csv_remote_url: Optional[str] = None
+    cve_csv_refresh_hours: int = 24
+    # How many recent years from cvelistV5 to process into matcher CSV.
+    cve_cvelist_years_back: int = 8
+    # Hard cap to keep generated CSV bounded and scan-time matching fast.
+    cve_cvelist_max_rows: int = 20000
+
     class Config:
         env_file = ".env"
 

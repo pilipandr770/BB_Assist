@@ -31,7 +31,7 @@ _ARJUN_PATH_RE = re.compile(
 
 import aiofiles
 import redis.asyncio as aioredis
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from backend.config import settings
@@ -43,6 +43,15 @@ from backend.services.scope_parser import is_in_scope
 router = APIRouter()
 
 WORKSPACE = settings.workspace_dir
+
+_PLATFORM_SCOPE_DOMAINS = {
+    "hackerone.com", "bugcrowd.com", "intigriti.com", "yeswehack.com", "huntr.com",
+}
+
+
+def _is_platform_scope_domain(domain: str) -> bool:
+    d = domain.lower().strip().lstrip("*.")
+    return any(d == base or d.endswith("." + base) for base in _PLATFORM_SCOPE_DOMAINS)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -187,7 +196,76 @@ def _select_nuclei_targets(all_urls: list[str], live_urls: list[str], max_urls: 
     return [url for _, url in scored[:max_urls]]
 
 
-async def _run_scan(job: ScanJob, approved_plan: str) -> None:
+def _select_ffuf_targets(live_urls: list[str], max_hosts: int = 5) -> list[str]:
+    """
+    Pick the best base hosts for directory fuzzing.
+    Prefer API/admin subdomains on standard ports; skip CDN/media/CS hosts.
+    """
+    from urllib.parse import urlparse
+
+    # Subdomain name patterns that are interesting for directory fuzzing
+    INTERESTING_SUB = (
+        "api", "admin", "portal", "dashboard", "dev", "staging", "internal",
+        "test", "beta", "app", "manage", "console", "panel", "monitor",
+        "login", "auth", "upload", "backend", "service", "services",
+    )
+    # Subdomain/path patterns that indicate CDN, media, or delivery hosts
+    CDN_SKIP = (
+        "edge", "cdn", "rtm", "streaming", "delivery", "media", "img",
+        "static", "live", "video", "cam", "thumb", "photo", "image",
+        "archive", "mirror", "relay",
+    )
+
+    def _host_score(url: str) -> int:
+        try:
+            p = urlparse(url)
+        except Exception:
+            return -999
+        host = p.hostname or ""
+        subdomain = host.split(".")[0].lower() if "." in host else host.lower()
+
+        # Skip clear CDN/media delivery nodes
+        if any(c in host.lower() for c in CDN_SKIP):
+            return -999
+
+        score = 0
+
+        # Prefer HTTPS
+        if p.scheme == "https":
+            score += 20
+        # Prefer standard ports (no explicit port = 443/80)
+        if not p.port:
+            score += 15
+        elif p.port in (80, 443):
+            score += 10
+        else:
+            score -= 20  # non-standard port (8443, 8080, etc.)
+
+        # Boost interesting subdomains
+        if any(kw == subdomain or subdomain.startswith(kw) for kw in INTERESTING_SUB):
+            score += 40
+
+        return score
+
+    # Deduplicate by base host (scheme+netloc) — one entry per host
+    seen_hosts: dict[str, tuple[int, str]] = {}
+    for url in live_urls:
+        try:
+            p = urlparse(url)
+            base = f"{p.scheme}://{p.netloc}"
+        except Exception:
+            continue
+        s = _host_score(url)
+        if s <= -999:
+            continue
+        if base not in seen_hosts or s > seen_hosts[base][0]:
+            seen_hosts[base] = (s, base)
+
+    scored = sorted(seen_hosts.values(), key=lambda x: x[0], reverse=True)
+    return [url for _, url in scored[:max_hosts]]
+
+
+async def _run_scan_pipeline(job: ScanJob) -> None:
     """
     Full scan pipeline executed as a background task.
     Phase 1: Passive recon
@@ -223,6 +301,29 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         job.status = ScanStatus.running
         job.started_at = datetime.utcnow()
         await _save_job(job, program_id)
+
+        # ── Delta scanning: load baseline from previous scan ─────────────────
+        # Comparing current scan against the previous one lets us highlight NEW
+        # subdomains / endpoints that appeared since last run — first-mover advantage.
+        _delta_file = os.path.join(WORKSPACE, program_id, "scan_history.json")
+        _prev_subdomains: set[str] = set()
+        _prev_live_urls: set[str] = set()
+        _prev_scan_date: str = ""
+        if os.path.exists(_delta_file):
+            try:
+                import aiofiles as _af
+                async with _af.open(_delta_file, encoding="utf-8") as _df:
+                    _prev_data = json.loads(await _df.read())
+                _prev_subdomains = set(_prev_data.get("subdomains", []))
+                _prev_live_urls = set(_prev_data.get("live_urls", []))
+                _prev_scan_date = _prev_data.get("scan_date", "")
+                await _push_event(redis, scan_id, "delta_baseline", {
+                    "prev_scan_date": _prev_scan_date,
+                    "prev_subdomains": len(_prev_subdomains),
+                    "prev_live_urls": len(_prev_live_urls),
+                })
+            except Exception:
+                pass  # No valid history — first scan for this program
 
         program = await _load_scope_and_program(program_id)
         scope = program.scope
@@ -284,9 +385,8 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             if len(passive_domains) >= 5:  # hard cap — passive recon has no scanner value beyond 5
                 break
 
-        await _push_event(redis, scan_id, "phase_start", {
-            "phase": "passive_recon_detail",
-            "domains": passive_domains,
+        await _push_event(redis, scan_id, "pipeline_config", {
+            "passive_domains": passive_domains,
             "total_scope_domains": len(scope.in_scope_domains),
         })
 
@@ -340,12 +440,42 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         # are expanded back to all hostnames sharing that IP → correct SNI/Host routing.
         await _push_event(redis, scan_id, "tool_start", {
             "tool": "nmap",
-            "detail": f"non-standard web ports on {min(len(live_hosts), 100)} hosts",
+            "detail": f"service versions on 80/443 + non-standard web ports for {min(len(live_hosts), 100)} hosts",
         })
         nmap_out = os.path.join(recon_dir, "nmap.gnmap")
-        nmap_endpoints = await tool_runner.run_nmap(live_hosts, nmap_out)
+        nmap_endpoints, nmap_service_versions = await tool_runner.run_nmap(live_hosts, nmap_out)
+        nmap_csv_cve_hits = tool_runner.match_service_versions_to_cves(nmap_service_versions)
+        version_samples = []
+        for svc in nmap_service_versions:
+            service = str(svc.get("service", "")).strip()
+            version = str(svc.get("version", "")).strip()
+            fingerprint = str(svc.get("fingerprint", "")).strip()
+            display = fingerprint or " ".join(x for x in [service, version] if x).strip()
+            if not display:
+                continue
+            version_samples.append({
+                "host": svc.get("host", ""),
+                "port": svc.get("port", 0),
+                "display": display,
+            })
+            if len(version_samples) >= 12:
+                break
         await _push_event(redis, scan_id, "tool_done", {
-            "tool": "nmap", "count": len(nmap_endpoints),
+            "tool": "nmap",
+            "count": len(nmap_endpoints),
+            "versioned_services": len(nmap_service_versions),
+            "csv_cve_hits": len(nmap_csv_cve_hits),
+        })
+        if version_samples:
+            await _push_event(redis, scan_id, "service_versions", {
+                "count": len(nmap_service_versions),
+                "samples": version_samples,
+            })
+
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "cve_csv",
+            "count": len(nmap_csv_cve_hits),
+            "services_checked": len(nmap_service_versions),
         })
 
         detected_techs: set[str] = set()  # populated after httpx completes
@@ -412,6 +542,127 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             await _push_event(redis, scan_id, "tool_done", {
                 "tool": "httpx-gen-fallback", "count": len(live_urls),
             })
+
+        # If pre-httpx nmap saw no version banners, retry version detection on
+        # confirmed live URLs. This avoids false "0 services fingerprinted" cases
+        # when the first 100 dnsx hosts don't overlap with the actually responsive
+        # web hosts for this program.
+        if not nmap_service_versions and live_urls:
+            nmap_retry_hosts: list[str] = []
+            seen_retry_hosts: set[str] = set()
+            for _u in live_urls:
+                _h = (urlparse(_u).hostname or "").strip()
+                if _h and _h not in seen_retry_hosts:
+                    seen_retry_hosts.add(_h)
+                    nmap_retry_hosts.append(_h)
+                if len(nmap_retry_hosts) >= 100:
+                    break
+
+            if nmap_retry_hosts:
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "nmap_retry",
+                    "detail": f"service versions on {len(nmap_retry_hosts)} confirmed live hosts",
+                })
+                nmap_retry_out = os.path.join(recon_dir, "nmap_retry.gnmap")
+                _, retry_service_versions = await tool_runner.run_nmap(nmap_retry_hosts, nmap_retry_out)
+                retry_csv_hits = tool_runner.match_service_versions_to_cves(retry_service_versions)
+
+                nmap_service_versions = retry_service_versions
+                nmap_csv_cve_hits = retry_csv_hits
+
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "nmap_retry",
+                    "count": 0,
+                    "versioned_services": len(nmap_service_versions),
+                    "csv_cve_hits": len(nmap_csv_cve_hits),
+                })
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "cve_csv_retry",
+                    "count": len(nmap_csv_cve_hits),
+                    "services_checked": len(nmap_service_versions),
+                })
+
+                if nmap_service_versions:
+                    retry_samples = []
+                    for svc in nmap_service_versions:
+                        service = str(svc.get("service", "")).strip()
+                        version = str(svc.get("version", "")).strip()
+                        fingerprint = str(svc.get("fingerprint", "")).strip()
+                        display = fingerprint or " ".join(x for x in [service, version] if x).strip()
+                        if not display:
+                            continue
+                        retry_samples.append({
+                            "host": svc.get("host", ""),
+                            "port": svc.get("port", 0),
+                            "display": display,
+                        })
+                        if len(retry_samples) >= 12:
+                            break
+                    if retry_samples:
+                        await _push_event(redis, scan_id, "service_versions", {
+                            "count": len(nmap_service_versions),
+                            "samples": retry_samples,
+                        })
+            else:
+                await _push_event(redis, scan_id, "tool_skip", {
+                    "tool": "nmap_retry",
+                    "reason": "no valid hostnames extracted from live URLs",
+                })
+        elif nmap_service_versions:
+            await _push_event(redis, scan_id, "tool_skip", {
+                "tool": "nmap_retry",
+                "reason": f"initial nmap already fingerprinted {len(nmap_service_versions)} services",
+            })
+        else:
+            await _push_event(redis, scan_id, "tool_skip", {
+                "tool": "nmap_retry",
+                "reason": "no confirmed live URLs for retry",
+            })
+
+        # Final fallback: extract version tokens from httpx metadata (Server /
+        # X-Powered-By / tech fields) and run the same CSV CVE matcher.
+        # Useful for CDN-fronted targets where nmap -sV often returns no banners.
+        if not nmap_service_versions and http_results:
+            httpx_service_versions = tool_runner.extract_service_versions_from_httpx(http_results)
+            if httpx_service_versions:
+                nmap_service_versions = httpx_service_versions
+                nmap_csv_cve_hits = tool_runner.match_service_versions_to_cves(nmap_service_versions)
+
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "httpx_version_inventory",
+                    "count": len(nmap_service_versions),
+                })
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "cve_csv_httpx",
+                    "count": len(nmap_csv_cve_hits),
+                    "services_checked": len(nmap_service_versions),
+                })
+
+                httpx_samples = []
+                for svc in nmap_service_versions:
+                    service = str(svc.get("service", "")).strip()
+                    version = str(svc.get("version", "")).strip()
+                    fingerprint = str(svc.get("fingerprint", "")).strip()
+                    display = fingerprint or " ".join(x for x in [service, version] if x).strip()
+                    if not display:
+                        continue
+                    httpx_samples.append({
+                        "host": svc.get("host", ""),
+                        "port": svc.get("port", 0),
+                        "display": display,
+                    })
+                    if len(httpx_samples) >= 12:
+                        break
+                if httpx_samples:
+                    await _push_event(redis, scan_id, "service_versions", {
+                        "count": len(nmap_service_versions),
+                        "samples": httpx_samples,
+                    })
+            else:
+                await _push_event(redis, scan_id, "tool_skip", {
+                    "tool": "cve_csv_httpx",
+                    "reason": "httpx headers/tech contained no parseable version tokens",
+                })
 
         # gau — run on unique apex domains only (same dedup logic as passive recon).
         # Programs with 45 explicit subdomains should not trigger 45 gau runs —
@@ -503,6 +754,18 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             **({"cred_urls": len(cred_urls)} if cred_urls else {}),
         })
 
+        # ── Delta: compare with previous scan ────────────────────────────────
+        if _prev_subdomains or _prev_live_urls:
+            _new_subs = sorted(all_subdomains - _prev_subdomains)
+            _new_urls = sorted(set(live_urls) - _prev_live_urls)
+            if _new_subs or _new_urls:
+                await _push_event(redis, scan_id, "delta_new_surface", {
+                    "new_subdomains_count": len(_new_subs),
+                    "new_subdomains": _new_subs[:20],
+                    "new_live_urls_count": len(_new_urls),
+                    "new_live_urls": _new_urls[:10],
+                })
+
         # ── Phase 1.5: GitHub Dorking (passive, no target contact) ──────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "github_dork"})
         await _push_event(redis, scan_id, "tool_start", {
@@ -529,9 +792,17 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         ffuf_403_urls: list[str] = []
 
         if do_ffuf:
-            ffuf_hosts = live_urls[:5] if live_urls else []
+            ffuf_hosts = _select_ffuf_targets(live_urls, max_hosts=5)
             if not ffuf_hosts and scope.in_scope_urls:
                 ffuf_hosts = [u for u in scope.in_scope_urls if u.startswith("http")][:3]
+
+            resolved_ffuf_wordlist = tool_runner.resolve_ffuf_wordlist("")
+            ffuf_wordlist_missing = not bool(resolved_ffuf_wordlist)
+            if ffuf_wordlist_missing:
+                await _push_event(redis, scan_id, "pipeline_warning", {
+                    "phase": "content_discovery",
+                    "warning": "ffuf wordlist not found in container; skipping content discovery",
+                })
 
             for host_url in ffuf_hosts:
                 await _push_event(redis, scan_id, "tool_start", {
@@ -546,6 +817,7 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 await _push_event(redis, scan_id, "tool_done", {
                     "tool": "ffuf", "count": len(results),
                     "found": len(found), "forbidden": len(fbd_403),
+                    **({"warning": "wordlist_missing"} if ffuf_wordlist_missing else {}),
                 })
 
             # Add discovered URLs to the target pool (in-scope only)
@@ -556,6 +828,7 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 "phase": "content_discovery",
                 "new_paths": len(new_urls),
                 "forbidden": len(ffuf_403_urls),
+                **({"skipped_reason": "wordlist_missing"} if ffuf_wordlist_missing else {}),
             })
         else:
             await _push_event(redis, scan_id, "phase_done", {
@@ -587,10 +860,30 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
             "tool": "js_scanner", "count": len(js_secrets),
         })
 
+        # Pre-filter: skip known-public client-side key patterns that are intentionally
+        # embedded in JS. Algolia search-only keys, Next.js NEXT_PUBLIC_ vars, and
+        # similar patterns are by design public-facing and not security vulnerabilities.
+        # Filtering here avoids wasting L2 AI calls on guaranteed-reject findings.
+        _JS_PUBLIC_CTX = (
+            "algolia", "search-api-key", "searchapikey",
+            "next_public_", "react_app_", "vite_public_",
+            "gtm-", "googletagmanager", "ga-measurement",
+        )
+        _js_pre_filtered = 0
+        _js_kept = []
+        for _s in js_secrets:
+            _ctx_lower = (_s.get("context", "") + " " + _s.get("match", "")).lower()
+            if any(_p in _ctx_lower for _p in _JS_PUBLIC_CTX):
+                _js_pre_filtered += 1
+            else:
+                _js_kept.append(_s)
+        js_secrets = _js_kept
+
         await _push_event(redis, scan_id, "phase_done", {
             "phase": "js_scan",
             "js_files": len(js_urls),
             "secrets_found": len(js_secrets),
+            **({"pre_filtered_public_keys": _js_pre_filtered} if _js_pre_filtered else {}),
         })
 
         # ── Phase 2.7: 403 Bypass Testing ────────────────────────────────────
@@ -616,7 +909,14 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         STATIC_EXTS = {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
                        ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
                        ".txt", ".xml", ".yaml", ".yml", ".json", ".lock",
-                       ".pdf", ".zip", ".gz", ".tar", ".md", ".csv"}
+                       ".pdf", ".zip", ".gz", ".tar", ".md", ".csv",
+                       ".html", ".htm", ".min.html", ".min.htm"}  # HTML pages have no query params
+
+        # Static directory path segments — arjun has no value testing assets/static dirs
+        _STATIC_PATH_SEGS = frozenset({
+            "static", "assets", "vendor", "dist", "build", "public",
+            "images", "img", "fonts", "media", "css", "views",
+        })
 
         arjun_params: dict[str, list[str]] = {}
 
@@ -630,14 +930,26 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                     _path = _parsed_u.path.lower()
                 except Exception:
                     continue
+                # Skip directory listings (path ends with /)
+                if _path.endswith("/") and _path != "/":
+                    continue
                 # Skip static / asset files — arjun has no business scanning them
                 if any(_path.endswith(_ext) for _ext in STATIC_EXTS):
+                    continue
+                # Skip paths that pass through known static asset directories
+                # e.g. /login/static/views/mfa.html, /login/static/css/images/
+                _raw_parts = [p for p in _path.split("/") if p]
+                if any(seg in _STATIC_PATH_SEGS for seg in _raw_parts[:-1]):
                     continue
                 # Skip URLs with duplicate path segments — these are crawler artifacts
                 # e.g. /customer_support/API/register/API/register/API/logging/ from katana
                 # following relative hrefs recursively on SPAs.
-                _raw_parts = [p for p in _path.split("/") if p]
                 if len(_raw_parts) != len(set(_raw_parts)):
+                    continue
+                # Skip URLs where a path segment contains '=' — these are gau artifacts
+                # where query strings were incorrectly merged into the URL path
+                # (e.g. /v1/messagesr= from ?r=... losing its '?').
+                if any("=" in part for part in _raw_parts):
                     continue
                 # Only match within the FIRST TWO path segments.
                 # Real API endpoints live at /api/..., /auth/..., /oauth/...
@@ -677,6 +989,28 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 "reason": f"program_type={prog_type}",
             })
 
+        # ── Phase 2.8.5: XSS Scan (dalfox on arjun-discovered params) ──────────
+        # Only runs when arjun found actual injectable parameters — no arjun params
+        # means no URLs to fuzz, so dalfox is skipped entirely.
+        dalfox_findings: list[dict] = []
+        if arjun_params:
+            await _push_event(redis, scan_id, "phase_start", {"phase": "xss_scan"})
+            for _xss_base, _xss_params in list(arjun_params.items())[:3]:  # cap at 3 endpoints
+                _xss_url = _xss_base + "?" + "&".join(f"{p}=test" for p in _xss_params[:5])
+                await _push_event(redis, scan_id, "tool_start", {
+                    "tool": "dalfox",
+                    "detail": f"{_xss_base} ({len(_xss_params)} params)",
+                })
+                _dalfox_out = os.path.join(scan_dir, f"dalfox_{len(dalfox_findings)}.json")
+                _dalfox_results = await tool_runner.run_dalfox(_xss_url, _xss_params, _dalfox_out)
+                dalfox_findings.extend(_dalfox_results)
+                await _push_event(redis, scan_id, "tool_done", {
+                    "tool": "dalfox", "count": len(_dalfox_results),
+                })
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "xss_scan", "findings": len(dalfox_findings),
+            })
+
         # ── Phase 2.9: CORS Checker ──────────────────────────────────────────
         await _push_event(redis, scan_id, "phase_start", {"phase": "cors_check"})
         await _push_event(redis, scan_id, "tool_start", {
@@ -707,6 +1041,67 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         })
         await _push_event(redis, scan_id, "phase_done", {
             "phase": "subdomain_takeover", "vulnerable": len(takeover_findings),
+        })
+
+        # ── Phase 2.11: Email Security (SPF / DMARC) ─────────────────────────
+        # Pure DNS — no active scanning, no rate limits, no WAF concerns.
+        # Missing/weak DMARC is a frequent Medium finding on H1.
+        await _push_event(redis, scan_id, "phase_start", {"phase": "email_security"})
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "email_security",
+            "detail": f"{len(scope.in_scope_domains)} domains",
+        })
+        email_out = os.path.join(scan_dir, "email_security.jsonl")
+        email_findings = await tool_runner.run_email_security(
+            scope.in_scope_domains, email_out
+        )
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "email_security", "count": len(email_findings),
+        })
+        await _push_event(redis, scan_id, "phase_done", {
+            "phase": "email_security", "issues": len(email_findings),
+        })
+
+        # ── Phase 2.12: Swagger / OpenAPI Discovery ───────────────────────────
+        # Exposed API specs are Medium findings AND map the full API surface
+        # so subsequent nuclei/arjun passes have more precise targets.
+        await _push_event(redis, scan_id, "phase_start", {"phase": "swagger_discovery"})
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "swagger_discovery",
+            "detail": f"{len(live_urls)} live hosts",
+        })
+        swagger_out = os.path.join(scan_dir, "swagger.jsonl")
+        swagger_findings = await tool_runner.run_swagger_discovery(live_urls, swagger_out)
+        # If specs found, extract their API paths → add to nuclei target pool
+        for _sw in swagger_findings:
+            for _api_path in _sw.get("sample_paths", []):
+                _full = _sw["base_url"].rstrip("/") + _api_path
+                if is_in_scope(_full, scope) and _full not in all_target_urls:
+                    all_target_urls.append(_full)
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "swagger_discovery", "count": len(swagger_findings),
+        })
+        await _push_event(redis, scan_id, "phase_done", {
+            "phase": "swagger_discovery",
+            "specs_found": len(swagger_findings),
+            "new_endpoints": sum(s.get("endpoints_count", 0) for s in swagger_findings),
+        })
+
+        # ── Phase 2.13: S3 Bucket Enumeration ────────────────────────────────
+        # Checks public S3 buckets using company name variants derived from
+        # the target domains. Public buckets = Critical/High on H1.
+        await _push_event(redis, scan_id, "phase_start", {"phase": "s3_enum"})
+        await _push_event(redis, scan_id, "tool_start", {
+            "tool": "s3_enum",
+            "detail": f"{len(scope.in_scope_domains)} domains → bucket variants",
+        })
+        s3_out = os.path.join(scan_dir, "s3_buckets.jsonl")
+        s3_findings = await tool_runner.run_s3_enum(scope.in_scope_domains, s3_out)
+        await _push_event(redis, scan_id, "tool_done", {
+            "tool": "s3_enum", "count": len(s3_findings),
+        })
+        await _push_event(redis, scan_id, "phase_done", {
+            "phase": "s3_enum", "public_buckets": len(s3_findings),
         })
 
         # ── Phase 3: Nuclei scan ──────────────────────────────────────────────
@@ -763,6 +1158,29 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
         rejected_count = 0
 
         # Convert JS secrets → Finding objects and add to the evaluation queue
+        for hit in nmap_csv_cve_hits:
+            target_url = f"https://{hit['host']}:{hit['port']}"
+            raw_findings.append({
+                "_source": "nmap_csv",
+                "info": {
+                    "name": f"Version-based CVE Candidate: {hit['cve']} ({hit['title']})",
+                    "severity": hit["severity"],
+                    "tags": ["cve", "version-detection", "nmap"],
+                    "description": (
+                        f"nmap -sV banner matched CSV rule for {hit['cve']} "
+                        f"on {hit['host']}:{hit['port']}. "
+                        f"service='{hit['service']}' version='{hit['version']}'. "
+                        f"pattern='{hit['pattern']}'. reference='{hit['reference']}'"
+                    ),
+                },
+                "matched-at": target_url,
+                "type": "cve",
+                "_cve": hit["cve"],
+                "_service": hit["service"],
+                "_version": hit["version"],
+                "_reference": hit["reference"],
+            })
+
         for secret in js_secrets:
             raw_findings.append({
                 "_source": "js_scanner",
@@ -825,6 +1243,82 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                 "_provider": takeover["provider"],
                 "_fingerprint": takeover["fingerprint"],
                 "_evidence_url": takeover.get("evidence_url", ""),
+            })
+
+        # Convert email security findings → Finding objects
+        for email_issue in email_findings:
+            domain = email_issue["domain"]
+            checks = email_issue["checks_failed"]
+            # matched-at = target domain URL so L1 scope filter passes
+            target_url = f"https://{domain}"
+            issues_text = "; ".join(
+                f"{i['check']}: {i['detail']}" for i in email_issue.get("issues", [])
+            )
+            raw_findings.append({
+                "_source": "email_security",
+                "info": {
+                    "name": f"Email Security Misconfiguration — {checks} ({domain})",
+                    "severity": email_issue["severity"],
+                    "tags": ["misconfig", "email-security", "spf", "dmarc"],
+                    "description": (
+                        f"Email security issues detected for {domain}: {issues_text}. "
+                        f"Impact: {email_issue['impact']}"
+                    ),
+                },
+                "matched-at": target_url,
+                "type": "email-misconfig",
+                "_domain": domain,
+                "_checks_failed": checks,
+                "_issues": email_issue.get("issues", []),
+            })
+
+        # Convert Swagger/OpenAPI spec findings → Finding objects
+        for _sw in swagger_findings:
+            raw_findings.append({
+                "_source": "swagger_discovery",
+                "info": {
+                    "name": f"Exposed API Specification — {_sw['spec_url']}",
+                    "severity": _sw["severity"],
+                    "tags": ["exposure", "api-docs", "information-disclosure"],
+                    "description": _sw["impact"],
+                },
+                "matched-at": _sw["spec_url"],
+                "type": "exposure",
+                "_endpoints_count": _sw["endpoints_count"],
+                "_sample_paths": _sw.get("sample_paths", []),
+            })
+
+        # Convert S3 bucket enum findings → Finding objects
+        for _s3 in s3_findings:
+            raw_findings.append({
+                "_source": "s3_enum",
+                "info": {
+                    "name": f"Public S3 Bucket — {_s3['bucket']}",
+                    "severity": _s3["severity"],
+                    "tags": ["exposure", "s3", "misconfig", "cloud"],
+                    "description": _s3["impact"],
+                },
+                "matched-at": _s3.get("scope_url") or _s3["url"],
+                "type": "exposure",
+                "_bucket": _s3["bucket"],
+                "_publicly_listed": _s3["publicly_listed"],
+                "_bucket_url": _s3["url"],
+            })
+
+        # Convert dalfox XSS findings → Finding objects
+        for _xss in dalfox_findings:
+            raw_findings.append({
+                "_source": "dalfox",
+                "info": {
+                    "name": f"Cross-Site Scripting (XSS) — {_xss.get('param', 'unknown param')}",
+                    "severity": "high",
+                    "tags": ["xss", "injection"],
+                    "description": str(_xss.get("evidence", _xss)),
+                },
+                "matched-at": _xss.get("url", ""),
+                "type": "xss",
+                "_param": _xss.get("param", ""),
+                "_evidence": str(_xss.get("evidence", ""))[:500],
             })
 
         # Convert credential-in-URL findings → Finding objects
@@ -970,6 +1464,31 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
 
                 if passed:
                     approved_count += 1
+
+                    # Capture HTTP evidence for JS/secret findings (validates key is live)
+                    try:
+                        _raw_ev = json.loads(finding.raw_output)
+                        _ev_src = _raw_ev.get("_source", "")
+                        if _ev_src in ("js_scanner",):
+                            _ev_out = os.path.join(scan_dir, f"evidence_{finding.id}.json")
+                            _ev_png = os.path.join(scan_dir, f"evidence_{finding.id}.png")
+                            _ev_data = await tool_runner.capture_finding_evidence(
+                                _raw_ev, _ev_out, _ev_png
+                            )
+                            finding.http_evidence = json.dumps(_ev_data)
+                            await _push_event(redis, scan_id, "evidence_captured", {
+                                "finding_id": finding.id,
+                                "source": _ev_src,
+                                "screenshot_saved": (
+                                    _ev_data.get("screenshot", {}) or {}
+                                ).get("saved", False),
+                                "key_validated": (
+                                    _ev_data.get("key_validation", {}) or {}
+                                ).get("validated", False),
+                            })
+                    except Exception:
+                        pass
+
                     finding_path = os.path.join(finding_dir, "filtered", f"{finding.id}.json")
                     async with aiofiles.open(finding_path, "w") as f:
                         await f.write(finding.model_dump_json(indent=2))
@@ -985,6 +1504,11 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                     try:
                         report = await report_generator.generate(finding, scope)
                         job.reports_count += 1
+
+                        # Re-save finding so report_path is persisted in filtered JSON.
+                        async with aiofiles.open(finding_path, "w") as f:
+                            await f.write(finding.model_dump_json(indent=2))
+
                         await _push_event(redis, scan_id, "report_generated", {
                             "finding_id": finding.id,
                             "report_id": report.id,
@@ -1016,6 +1540,19 @@ async def _run_scan(job: ScanJob, approved_plan: str) -> None:
                     "error": str(_finding_err),
                     "raw_title": str(raw.get("info", {}).get("name", ""))[:120],
                 })
+
+        # Save scan state for delta comparison on next scan
+        try:
+            _delta_data = {
+                "scan_id": scan_id,
+                "scan_date": datetime.utcnow().isoformat(),
+                "subdomains": sorted(all_subdomains),
+                "live_urls": sorted(live_urls),
+            }
+            async with aiofiles.open(_delta_file, "w", encoding="utf-8") as _df:
+                await _df.write(json.dumps(_delta_data, indent=2))
+        except Exception:
+            pass
 
         job.findings_count = approved_count
         job.status = ScanStatus.done
@@ -1092,6 +1629,17 @@ async def start_scan(body: ScanCreate):
                    "Re-create the program with a complete HackerOne scope section that lists specific domains.",
         )
 
+    in_scope_clean = [d.lstrip("*.").lower() for d in (program.scope.in_scope_domains or []) if d]
+    if in_scope_clean and all(_is_platform_scope_domain(d) for d in in_scope_clean):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Parsed scope only contains bug bounty platform domains (e.g., bugcrowd/hackerone), "
+                "which indicates scope extraction fallback failed. Re-create the program using the full "
+                "live scope table and verify in-scope domains before starting a scan."
+            ),
+        )
+
     job = ScanJob(
         id=str(uuid.uuid4()),
         program_id=body.program_id,
@@ -1102,22 +1650,26 @@ async def start_scan(body: ScanCreate):
 
     # Launch scan as a free asyncio task (not a FastAPI BackgroundTask) so it
     # survives across uvicorn hot-reloads and doesn't block shutdown.
-    asyncio.create_task(_run_scan(job, body.approved_plan))
+    asyncio.create_task(_run_scan_pipeline(job))
 
     return ApiResponse(success=True, data=json.loads(job.model_dump_json()))
 
 
 @router.get("/{program_id}/{scan_id}/stream")
-async def stream_scan(program_id: str, scan_id: str):
+async def stream_scan(program_id: str, scan_id: str, request: Request):
     """
     SSE stream of live scan output.
     Reads events from Redis list for this scan_id.
+    Uses SSE event IDs so browser reconnects resume from the last received event
+    instead of replaying everything from position 0.
     Detects zombie scans (interrupted mid-run) and emits scan_error rather than
     waiting 2 hours for events that will never arrive.
     """
     async def event_generator():
         redis = await _get_redis()
-        cursor = 0
+        # Resume from Last-Event-ID if the browser is reconnecting
+        _last_id = request.headers.get("last-event-id", "")
+        cursor = (int(_last_id) + 1) if _last_id.isdigit() else 0
         idle_ticks = 0
         last_event_type: str = ""
 
@@ -1127,10 +1679,11 @@ async def stream_scan(program_id: str, scan_id: str):
                 if events:
                     idle_ticks = 0
                     for raw_event in events:
+                        event_id = cursor   # capture before increment
                         cursor += 1
                         parsed = json.loads(raw_event)
                         last_event_type = parsed["type"]
-                        yield {"event": last_event_type, "data": json.dumps(parsed["data"])}
+                        yield {"event": last_event_type, "data": json.dumps(parsed["data"]), "id": str(event_id)}
 
                     # Check if scan is done
                     if last_event_type in ("scan_done", "scan_error"):

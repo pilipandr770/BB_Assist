@@ -10,6 +10,7 @@ const EVENT_COLORS = {
   nuclei_progress: '#8b949e',
   pipeline_config: '#8b949e',
   tech_detected: '#a371f7',
+  service_versions: '#79c0ff',
   finding_approved: '#f0883e',
   finding_rejected: '#6e7681',
   finding_evaluating: '#d29922',
@@ -139,9 +140,29 @@ export default function ScanProgress() {
         break
       }
 
+      case 'service_versions': {
+        const samples = (data.samples || [])
+          .map(s => `${s.host}:${s.port} -> ${s.display}`)
+          .join('; ')
+        addLine(
+          `  🧾 Service versions: ${samples || 'none'}${data.count > (data.samples || []).length ? ` … +${data.count - (data.samples || []).length} more` : ''}`,
+          color,
+        )
+        break
+      }
+
       case 'tool_done': {
         const extras = []
-        if (data.count != null) extras.push(`${data.count} results`)
+        if (data.tool === 'nmap' || data.tool === 'nmap_retry') {
+          if (data.count != null) extras.push(`${data.count} new endpoints`)
+          if (data.versioned_services != null) extras.push(`${data.versioned_services} services fingerprinted`)
+          if (data.csv_cve_hits != null) extras.push(`${data.csv_cve_hits} CVE matches`)
+        } else if (data.tool === 'cve_csv' || data.tool === 'cve_csv_retry' || data.tool === 'cve_csv_httpx') {
+          if (data.count != null) extras.push(`${data.count} matches`)
+          if (data.services_checked != null) extras.push(`${data.services_checked} services checked`)
+        } else {
+          if (data.count != null) extras.push(`${data.count} results`)
+        }
         if (data.found != null) extras.push(`${data.found} found`)
         if (data.forbidden != null) extras.push(`${data.forbidden} forbidden`)
         addLine(`    ✓ ${data.tool} → ${extras.join(', ') || '0 results'}`, color)

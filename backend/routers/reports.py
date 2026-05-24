@@ -51,6 +51,17 @@ async def generate_report(program_id: str, finding_id: str):
     return ApiResponse(success=True, data=json.loads(report.model_dump_json()))
 
 
+@router.get("/{program_id}/{report_id}/meta", response_model=ApiResponse)
+async def get_report_meta(program_id: str, report_id: str):
+    """Return report metadata (.json) including quality gate info."""
+    meta_path = os.path.join(WORKSPACE, program_id, "reports", f"{report_id}.json")
+    if not os.path.exists(meta_path):
+        raise HTTPException(status_code=404, detail=f"Report metadata '{report_id}' not found")
+
+    async with aiofiles.open(meta_path, encoding="utf-8") as f:
+        return ApiResponse(success=True, data=json.loads(await f.read()))
+
+
 @router.get("/{program_id}/{report_id}", response_class=PlainTextResponse)
 async def get_report(program_id: str, report_id: str):
     """Return raw markdown report."""

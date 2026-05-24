@@ -1,12 +1,14 @@
 import json
 import os
 import signal
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.routers import programs, scans, reports
+from backend.services import cve_updater
 
 
 def _kill_child_processes():
@@ -86,8 +88,14 @@ async def lifespan(app: FastAPI):
     # Startup: kill orphan tool processes and mark zombie scans as error
     _kill_child_processes()
     await _mark_zombie_scans()
+    cve_refresh_task = asyncio.create_task(cve_updater.periodic_cve_csv_refresh_loop())
     yield
     # Shutdown: kill all child tool processes
+    cve_refresh_task.cancel()
+    try:
+        await cve_refresh_task
+    except asyncio.CancelledError:
+        pass
     _kill_child_processes()
 
 

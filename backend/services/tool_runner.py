@@ -22,15 +22,19 @@ Scan pipeline:
 """
 
 import asyncio
+import csv
 import json
 import os
 import re
 import tempfile
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
+
+import httpx as _httpx
 
 import redis.asyncio as aioredis
 
@@ -124,6 +128,18 @@ _HEADER_TECH_MAP = {
 }
 
 
+_TECH_NOISE: frozenset[str] = frozenset({
+    # HTTP protocol / feature labels — not technologies
+    "http", "https", "http/1.1", "http/2", "http/3", "h2", "h3",
+    # Security policy names
+    "hsts", "basic", "digest", "bearer", "ntlm",
+    # Generic CDN/infra that aren't useful for CVE targeting
+    "cdn", "waf",
+    # Single-letter leftovers from bad parsing
+    "", "-", "_",
+})
+
+
 def extract_tech_stack(http_results: list[dict]) -> set[str]:
     """
     Parse httpx JSONL results to extract a normalized set of detected technologies.
@@ -140,7 +156,7 @@ def extract_tech_stack(http_results: list[dict]) -> set[str]:
         for field in ("tech", "technologies", "technology"):
             for t in (r.get(field) or []):
                 name = str(t).split(":")[0].split("/")[0].lower().strip()
-                if name and len(name) > 1:
+                if name and len(name) > 1 and name not in _TECH_NOISE:
                     techs.add(name)
 
         # Layer 2: webserver banner
@@ -165,7 +181,86 @@ def extract_tech_stack(http_results: list[dict]) -> set[str]:
             if cookie_prefix in set_cookie:
                 techs.add(tech)
 
-    return techs
+    # Final pass: strip protocol/policy noise regardless of which layer added it
+    return techs - _TECH_NOISE
+
+
+_HTTPX_VERSION_TOKEN_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9._-]{1,32})[/ ]v?(\d+(?:\.\d+){1,3}[A-Za-z0-9._-]*)",
+    re.IGNORECASE,
+)
+
+_HTTPX_VERSION_STOPWORDS: frozenset[str] = frozenset({
+    "http", "https", "tls", "ssl", "ubuntu", "debian", "linux", "windows",
+    "alpine", "apache", "mozilla", "gecko", "chrome", "safari",
+})
+
+
+def extract_service_versions_from_httpx(http_results: list[dict]) -> list[dict]:
+    """
+    Best-effort service/version inventory from httpx metadata.
+
+    This is a fallback path for CDN-heavy targets where nmap -sV often returns
+    empty service banners. We parse version tokens from:
+      - webserver / Server header
+      - X-Powered-By header
+      - httpx technology entries that include versions (e.g. nginx:1.24.0)
+    """
+    services: list[dict] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    for r in http_results:
+        raw_url = str(r.get("url", "")).strip()
+        if not raw_url:
+            continue
+
+        parsed = urlparse(raw_url)
+        host = (parsed.hostname or "").strip()
+        if not host:
+            continue
+
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+
+        headers: dict = r.get("headers") or {}
+        webserver = str(r.get("webserver", "") or headers.get("server", "") or headers.get("Server", ""))
+        x_powered_by = str(headers.get("x-powered-by", "") or headers.get("X-Powered-By", ""))
+
+        candidates: list[str] = []
+        for candidate in (webserver, x_powered_by):
+            if candidate:
+                candidates.append(candidate)
+
+        for field in ("tech", "technologies", "technology"):
+            for tech in (r.get(field) or []):
+                t = str(tech).strip()
+                if t:
+                    candidates.append(t)
+
+        for candidate in candidates:
+            for match in _HTTPX_VERSION_TOKEN_RE.finditer(candidate):
+                service = match.group(1).lower().strip("._-")
+                version = match.group(2).strip()
+                if not service or not version:
+                    continue
+                if service in _HTTPX_VERSION_STOPWORDS:
+                    continue
+
+                key = (host, int(port), service, version)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                services.append({
+                    "host": host,
+                    "port": int(port),
+                    "service": service,
+                    "version": version,
+                    "fingerprint": candidate.strip(),
+                })
+
+    return services
 
 
 def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:
@@ -328,7 +423,9 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
       2. For each open port found, emit hostname:port for ALL hostnames on that IP
          (capped at 20 hostnames per IP to avoid probe explosion)
 
-    Returns list of "hostname:port" strings ready for httpx to probe.
+        Returns tuple:
+            - list of "hostname:port" strings ready for httpx to probe
+            - list of detected service/version banners per endpoint
     Always uses hostnames (never raw IPs) so CDN/SNI routing works correctly.
     Caps at 100 hosts input; 30 s per-host timeout keeps the scan under 5 min.
     """
@@ -337,10 +434,15 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
     log = logging.getLogger("tool_runner")
 
     if not hosts:
-        return []
+        return [], []
 
-    # Ports that commonly host web services but are NOT 80/443
-    WEB_PORTS = "8080,8443,8000,8888,8008,3000,3001,4000,4443,5000,5443,9000,9090,9443,7080,7443"
+    # Ports used for version inventory. Includes 80/443 so CVE lookup still works
+    # when a target only exposes standard web ports.
+    WEB_PORTS = "80,443,8080,8443,8000,8888,8008,3000,3001,4000,4443,5000,5443,9000,9090,9443,7080,7443"
+    NON_STANDARD_PORTS: set[str] = {
+        "8080", "8443", "8000", "8888", "8008", "3000", "3001", "4000",
+        "4443", "5000", "5443", "9000", "9090", "9443", "7080", "7443",
+    }
 
     targets = hosts[:100]
     targets_file = _write_temp_list(targets)
@@ -361,17 +463,24 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
             "-iL", targets_file,
             "-p", WEB_PORTS,
             "--open",               # show only open ports
+            "-sC",                  # run default NSE scripts
+            "-sV",                  # detect service versions
+            "--version-light",      # faster version probing
             "-T4",                  # aggressive timing (fast)
             "--max-retries", "1",
-            "--host-timeout", "30s",
+            "--host-timeout", "45s",
             "-oG", output_file,     # greppable output — easy to parse
         ]
-        await _run_command(cmd, timeout_s=300)
+        await _run_command(cmd, timeout_s=600)
 
         # Parse greppable nmap output.
         # Line format: Host: IP (hostname)\tPorts: PORT/open/tcp//service///[,...]
-        # ip_to_open_ports: {ip: set of open port strings}
-        ip_to_open_ports: dict[str, set] = {}
+        # Keep two maps:
+        #   1) ip_to_nonstd_ports for endpoint expansion (httpx probes)
+        #   2) ip_to_versioned_ports for CVE version matching inventory (includes 80/443)
+        ip_to_nonstd_ports: dict[str, set] = {}
+        ip_to_versioned_ports: dict[str, set] = {}
+        ip_port_meta: dict[tuple[str, str], dict] = {}
         if os.path.exists(output_file):
             with open(output_file) as f:
                 for line in f:
@@ -395,16 +504,36 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
                     for entry in ports_section.split(","):
                         entry = entry.strip()
                         if "/open/" in entry:
-                            port = entry.split("/")[0].strip()
+                            fields = entry.split("/")
+                            port = fields[0].strip() if fields else ""
                             if port.isdigit():
-                                ip_to_open_ports.setdefault(ip, set()).add(port)
+                                ip_to_versioned_ports.setdefault(ip, set()).add(port)
+                                # Expand endpoints only for non-standard ports to avoid
+                                # unnecessary duplication with live host list from dnsx/httpx.
+                                if port in NON_STANDARD_PORTS:
+                                    ip_to_nonstd_ports.setdefault(ip, set()).add(port)
+                                service = fields[4].strip() if len(fields) > 4 else ""
+                                banner_raw = fields[6].strip() if len(fields) > 6 else ""
+                                # nmap often puts additional version details in extra fields.
+                                if len(fields) > 7:
+                                    extra = " ".join(x.strip() for x in fields[7:] if x.strip())
+                                    if extra:
+                                        banner_raw = f"{banner_raw} {extra}".strip()
+
+                                fingerprint = " ".join(x for x in [service, banner_raw] if x).strip()
+                                ip_port_meta[(ip, port)] = {
+                                    "service": service,
+                                    "version": banner_raw,
+                                    "fingerprint": fingerprint,
+                                }
 
         # Build final endpoint list: for each open port on each IP, emit hostname:port
         # for ALL hostnames that resolved to that IP. This ensures CDN-fronted hosts
         # are probed with the correct Host header (httpx uses the hostname, not the IP).
         seen: set[str] = set()
         endpoints: list[str] = []
-        for ip, open_ports in ip_to_open_ports.items():
+        service_versions: list[dict] = []
+        for ip, versioned_ports in ip_to_versioned_ports.items():
             # Find hostnames that resolve to this IP (from our pre-resolution map)
             matched_hosts = ip_to_hosts.get(ip, [])
             # If no match (nmap resolved to a different IP than we did), use nmap's hostname
@@ -414,22 +543,144 @@ async def run_nmap(hosts: list[str], output_file: str) -> list[str]:
                 matched_hosts = [ip]
             # Cap per-IP to 20 hostnames to avoid probe explosion (e.g. 86 hosts on one Cloudflare IP)
             for hostname in matched_hosts[:20]:
-                for port in sorted(open_ports):
-                    ep = f"{hostname}:{port}"
-                    if ep not in seen:
-                        seen.add(ep)
-                        endpoints.append(ep)
+                for port in sorted(versioned_ports):
+                    if port in NON_STANDARD_PORTS:
+                        ep = f"{hostname}:{port}"
+                        if ep not in seen:
+                            seen.add(ep)
+                            endpoints.append(ep)
+                        meta = ip_port_meta.get((ip, port), {})
+                        service_versions.append({
+                            "host": hostname,
+                            "port": int(port),
+                            "service": meta.get("service", ""),
+                            "version": meta.get("version", ""),
+                            "fingerprint": meta.get("fingerprint", ""),
+                        })
 
         log.info(
-            "nmap: %d open web ports on %d unique IPs → %d hostname:port probes",
-            sum(len(v) for v in ip_to_open_ports.values()),
-            len(ip_to_open_ports),
+            "nmap: %d open web ports on %d unique IPs → %d hostname:port probes, %d version banners",
+            sum(len(v) for v in ip_to_versioned_ports.values()),
+            len(ip_to_versioned_ports),
             len(endpoints),
+            len(service_versions),
         )
-        return endpoints
+        return endpoints, service_versions
     finally:
         if os.path.exists(targets_file):
             os.unlink(targets_file)
+
+
+def match_service_versions_to_cves(
+    service_versions: list[dict],
+    csv_path: Optional[str] = None,
+) -> list[dict]:
+    """
+    Metasploit-style version-based CVE matching.
+    
+    Matches nmap -sV banners against a local CSV database of product:version→CVE mappings.
+    Works exactly like Metasploit: find service+version, look up in database, return matching CVEs.
+    No exploitation, no probing — just version fingerprint lookup.
+    
+    CSV columns: product,version_regex,cve,severity,title,reference
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+    
+    if not service_versions:
+        return []
+
+    if not csv_path:
+        csv_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "data",
+            "cve_service_versions.csv",
+        )
+
+    if not os.path.exists(csv_path):
+        log.warning(f"CVE version database not found: {csv_path}")
+        return []
+
+    # Load and compile CVE rules from CSV
+    rules: list[dict] = []
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pattern = (row.get("version_regex") or "").strip()
+                product = (row.get("product") or "").strip().lower()
+                if not pattern or not product:
+                    continue
+                try:
+                    row["_compiled"] = re.compile(pattern, re.IGNORECASE)
+                    row["_product_lower"] = product
+                    rules.append(row)
+                except re.error as e:
+                    log.warning(f"Invalid regex in CVE rule {row.get('product')}: {e}")
+                    continue
+        log.info(f"cve_matcher: loaded {len(rules)} CVE version rules from {csv_path}")
+    except Exception as e:
+        log.error(f"Failed to load CVE database: {e}")
+        return []
+
+    matches: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    
+    for svc in service_versions:
+        host = str(svc.get("host", "")).strip()
+        port = int(svc.get("port", 0) or 0)
+        service = str(svc.get("service", "")).strip().lower()
+        version = str(svc.get("version", "")).strip()
+        fingerprint = str(svc.get("fingerprint", "")).strip()
+        
+        # Build comprehensive search string: service, version, and full fingerprint
+        haystack = " ".join(x for x in [service, version, fingerprint] if x).lower()
+        if not haystack or not service:
+            continue
+
+        # Try matching against each CVE rule
+        for rule in rules:
+            product = rule.get("_product_lower", "")
+            compiled = rule.get("_compiled")
+            
+            # First: product name must appear in service/fingerprint
+            if product not in service and product not in fingerprint:
+                continue
+            
+            # Second: version pattern must match the full haystack
+            if not compiled or not compiled.search(haystack):
+                continue
+
+            cve = (rule.get("cve") or "CVE-UNKNOWN").strip()
+            key = (host, port, cve)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            sev = (rule.get("severity") or "medium").strip().lower()
+            if sev not in {"critical", "high", "medium", "low", "info", "informative"}:
+                sev = "medium"
+            if sev == "info":
+                sev = "informative"
+
+            matches.append({
+                "host": host,
+                "port": port,
+                "service": service,
+                "version": version,
+                "fingerprint": fingerprint,
+                "product": product,
+                "cve": cve,
+                "severity": sev,
+                "title": (rule.get("title") or "Version-based CVE").strip(),
+                "reference": (rule.get("reference") or "").strip(),
+                "pattern": (rule.get("version_regex") or "").strip(),
+            })
+
+    if matches:
+        log.info(f"cve_matcher: found {len(matches)} version-based CVE candidates across {len(service_versions)} services")
+    
+    return matches
 
 
 async def run_httpx(hosts: list[str], output_file: str) -> list[dict]:
@@ -678,6 +929,18 @@ async def run_nuclei(
         log.info("nuclei: using %d templates across %d subdirs",
                  template_count, len([a for a in template_args if a != "-t"]))
 
+        # Cloudflare targets block nuclei's default "Go-http-client" UA and throttle
+        # high-rate scans. Use browser UA always; lower rate when CF is detected.
+        behind_cloudflare = detected_techs and "cloudflare" in detected_techs
+        nuclei_rate = "20" if behind_cloudflare else "100"
+        nuclei_bulk = "20" if behind_cloudflare else "50"
+        nuclei_conc = "10" if behind_cloudflare else "25"
+        nuclei_ua   = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+
         cmd = [
             "nuclei",
             "-l", input_file,
@@ -685,12 +948,13 @@ async def run_nuclei(
             "-jsonl-export", output_file,   # nuclei v3: JSONL file export
             "-j",                            # nuclei v3: JSONL to stdout too
             "-silent",
-            "-rate-limit", "150",
-            "-bulk-size", "50",
-            "-concurrency", "25",
+            "-rate-limit", nuclei_rate,
+            "-bulk-size", nuclei_bulk,
+            "-concurrency", nuclei_conc,
             "-timeout", "10",
             "-retries", "1",
             "-nc",                           # no color codes in output
+            "-H", f"User-Agent: {nuclei_ua}",
             # Note: interactsh ENABLED intentionally — needed for blind SSRF/XSS/XXE detection
         ] + template_args + _h1_header_args()
 
@@ -746,12 +1010,13 @@ async def run_nuclei(
                         "-jsonl-export", cve_out,
                         "-j",
                         "-silent",
-                        "-rate-limit", "100",
-                        "-bulk-size", "30",
-                        "-concurrency", "15",
+                        "-rate-limit", "15" if behind_cloudflare else "80",
+                        "-bulk-size", "20" if behind_cloudflare else "30",
+                        "-concurrency", "8"  if behind_cloudflare else "15",
                         "-timeout", "10",
                         "-retries", "1",
                         "-nc",
+                        "-H", f"User-Agent: {nuclei_ua}",
                     ] + _h1_header_args()
                     log.info("nuclei-cve: running with tags=%s", ",".join(cve_tags))
                     await _run_command(cve_cmd, timeout_s=90)
@@ -787,18 +1052,9 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
     """
     # Try wordlist locations in priority order.
     # /wordlists/ is populated at Docker build time from SecLists.
-    if not wordlist or not os.path.exists(wordlist):
-        for candidate in [
-            "/wordlists/web-combined.txt",          # our curated merge (common + api endpoints)
-            "/wordlists/common.txt",                 # SecLists common
-            "/usr/share/seclists/Discovery/Web-Content/common.txt",
-            "/usr/share/wordlists/dirb/common.txt",
-        ]:
-            if os.path.exists(candidate):
-                wordlist = candidate
-                break
-        else:
-            return []  # No wordlist available — Docker image not rebuilt yet
+    wordlist = resolve_ffuf_wordlist(wordlist)
+    if not wordlist:
+        return []  # No wordlist available — Docker image not rebuilt yet
 
     cmd = [
         "ffuf",
@@ -822,6 +1078,22 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
         except (json.JSONDecodeError, KeyError):
             return []
     return []
+
+
+def resolve_ffuf_wordlist(wordlist: str) -> str:
+    """Return an existing ffuf wordlist path or empty string if unavailable."""
+    if wordlist and os.path.exists(wordlist):
+        return wordlist
+
+    for candidate in [
+        "/wordlists/web-combined.txt",          # our curated merge (common + api endpoints)
+        "/wordlists/common.txt",                 # SecLists common
+        "/usr/share/seclists/Discovery/Web-Content/common.txt",
+        "/usr/share/wordlists/dirb/common.txt",
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+    return ""
 
 
 async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict]:
@@ -1064,6 +1336,22 @@ async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
                 break  # one finding per URL per pattern type is enough
 
     await asyncio.gather(*[_scan_one(u) for u in urls_to_scan])
+
+    # Deduplicate by (secret_type, match prefix) — the same key embedded in 100s of
+    # JS bundle files should be one finding, not 100 separate AI evaluations.
+    seen_key_values: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for fnd in findings:
+        key = (fnd["secret_type"], fnd["match"][:50])
+        if key not in seen_key_values:
+            seen_key_values.add(key)
+            deduped.append(fnd)
+    if len(deduped) < len(findings):
+        log.info(
+            "js_scanner: collapsed %d → %d unique findings after dedup",
+            len(findings), len(deduped),
+        )
+    findings = deduped
 
     if findings:
         with open(output_file, "w") as f:
@@ -1410,6 +1698,356 @@ async def run_subdomain_takeover(subdomains: list[str], output_file: str) -> lis
     return findings
 
 
+# ── Swagger / OpenAPI Discovery ──────────────────────────────────────────────
+
+_SWAGGER_PATHS = [
+    "/swagger.json", "/swagger-ui.html",
+    "/openapi.json", "/openapi.yaml",
+    "/api-docs", "/api-docs.json",
+    "/v2/api-docs", "/v3/api-docs",
+    "/api/swagger.json", "/api/openapi.json",
+    "/docs", "/redoc",
+    "/_api/swagger.json",
+    "/api/v1/swagger.json", "/api/v2/swagger.json",
+    "/api/v1/openapi.json", "/api/v2/openapi.json",
+]
+
+
+def _probe_swagger_sync(base_url: str) -> Optional[dict]:
+    """Probe a single base URL for an exposed Swagger/OpenAPI spec."""
+    for path in _SWAGGER_PATHS:
+        url = base_url.rstrip("/") + path
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/yaml, */*"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status != 200:
+                    continue
+                raw = resp.read(524288).decode("utf-8", errors="replace")
+                # Must contain swagger/openapi markers
+                if not any(kw in raw[:1000] for kw in (
+                    '"swagger"', '"openapi"', 'swagger:', 'openapi:', '"paths"',
+                )):
+                    continue
+                # Parse paths from JSON spec
+                api_paths: list[str] = []
+                try:
+                    spec = json.loads(raw)
+                    api_paths = list(spec.get("paths", {}).keys())
+                except json.JSONDecodeError:
+                    pass  # YAML spec — paths not extracted but finding still reported
+                return {
+                    "base_url": base_url,
+                    "spec_url": url,
+                    "endpoints_count": len(api_paths),
+                    "sample_paths": api_paths[:30],
+                    "severity": "medium",
+                    "impact": (
+                        f"API specification exposed at {url} reveals {len(api_paths)} endpoint(s). "
+                        "Attackers can enumerate all API routes, parameters, and authentication "
+                        "requirements without any prior knowledge of the API surface."
+                    ),
+                }
+        except Exception:
+            continue
+    return None
+
+
+async def run_swagger_discovery(live_urls: list[str], output_file: str) -> list[dict]:
+    """
+    Probe live hosts for exposed Swagger/OpenAPI specifications.
+    API-like subdomains (api.*, backend.*) are checked first.
+    Caps at 30 unique base hosts.
+    """
+    import logging
+    from urllib.parse import urlparse as _up
+    log = logging.getLogger("tool_runner")
+
+    if not live_urls:
+        return []
+
+    # Unique base URLs scored by API likelihood
+    seen: dict[str, int] = {}
+    for u in live_urls:
+        try:
+            p = _up(u)
+            base = f"{p.scheme}://{p.netloc}"
+        except Exception:
+            continue
+        if base not in seen:
+            score = 10 if any(kw in (p.hostname or "") for kw in ("api", "backend", "service", "gateway")) else 0
+            seen[base] = score
+
+    base_urls = sorted(seen, key=lambda b: seen[b], reverse=True)[:30]
+
+    findings: list[dict] = []
+    semaphore = asyncio.Semaphore(10)
+    loop = asyncio.get_event_loop()
+
+    async def _check_one(base_url: str):
+        async with semaphore:
+            result = await loop.run_in_executor(None, _probe_swagger_sync, base_url)
+        if result:
+            findings.append(result)
+
+    await asyncio.gather(*[_check_one(b) for b in base_urls])
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("swagger_discovery: %d specs found from %d hosts", len(findings), len(base_urls))
+    return findings
+
+
+# ── S3 Bucket Enumeration ─────────────────────────────────────────────────────
+
+_S3_BUCKET_SUFFIXES = [
+    "", "-backup", "-backups", "-dev", "-development",
+    "-staging", "-stage", "-prod", "-production",
+    "-assets", "-asset", "-static", "-media", "-uploads",
+    "-files", "-data", "-logs", "-log", "-archive",
+    "-internal", "-private", "-public", "-storage",
+    "-cdn", "-email", "-export", "-tmp", "-temp",
+    "-test", "-images", "-img", "-docs", "-reports",
+    "backup", "assets", "static", "media", "data", "logs",
+]
+
+
+def _check_s3_bucket_sync(bucket: str) -> Optional[dict]:
+    """Check a single S3 bucket for public access."""
+    for url in (
+        f"https://{bucket}.s3.amazonaws.com/",
+        f"https://s3.amazonaws.com/{bucket}/",
+    ):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    raw = resp.read(4096).decode("utf-8", errors="replace")
+                    is_listing = "<ListBucketResult" in raw
+                    return {
+                        "bucket": bucket,
+                        "url": url,
+                        "publicly_listed": is_listing,
+                        "severity": "critical" if is_listing else "high",
+                        "impact": (
+                            f"S3 bucket '{bucket}' is publicly accessible. "
+                            + ("Directory listing enabled — all objects are enumerable."
+                               if is_listing else "Bucket contents may be readable.")
+                        ),
+                    }
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                pass  # Bucket exists but private — not a finding
+        except Exception:
+            pass
+    return None
+
+
+async def run_s3_enum(domains: list[str], output_file: str) -> list[dict]:
+    """
+    Enumerate S3 buckets by generating company name variants from target domains.
+    Only reports actually public buckets (HTTP 200). Private (403) buckets are skipped.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not domains:
+        return []
+
+    # Extract company identifiers from apex domains
+    company_names: set[str] = set()
+    for d in domains:
+        base = d.lstrip("*.")
+        name = base.split(".")[0].lower()
+        company_names.add(name)
+        company_names.add(name.replace("-", ""))
+        company_names.add(name.replace("_", ""))
+
+    bucket_to_scope_url: dict[str, str] = {}
+    for domain in domains:
+        scope_url = f"https://{domain.lstrip('*.')}"
+        base = domain.lstrip("*.")
+        name = base.split(".")[0].lower()
+        names = [name, name.replace("-", ""), name.replace("_", "")]
+        for derived_name in names:
+            if not derived_name:
+                continue
+            for suffix in _S3_BUCKET_SUFFIXES:
+                candidate = f"{derived_name}{suffix}"
+                if 3 <= len(candidate) <= 63 and candidate not in bucket_to_scope_url:
+                    # Keep first seen scope URL for deterministic attribution.
+                    bucket_to_scope_url[candidate] = scope_url
+
+    bucket_names = list(bucket_to_scope_url.keys())
+
+    findings: list[dict] = []
+    semaphore = asyncio.Semaphore(20)
+    loop = asyncio.get_event_loop()
+
+    async def _check_one(bucket: str):
+        async with semaphore:
+            result = await loop.run_in_executor(None, _check_s3_bucket_sync, bucket)
+        if result:
+            result["scope_url"] = bucket_to_scope_url.get(bucket, "")
+            findings.append(result)
+
+    await asyncio.gather(*[_check_one(b) for b in bucket_names])
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("s3_enum: %d public buckets found from %d candidates", len(findings), len(bucket_names))
+    return findings
+
+
+# ── Email Security Scanner ────────────────────────────────────────────────────
+
+def _check_email_security_sync(domain: str) -> dict:
+    """
+    Check SPF, DMARC, and DKIM for a domain via DNS lookups.
+    Returns a finding dict if misconfiguration is found, else empty dict.
+
+    Common H1 findings:
+    - Missing DMARC → attacker can send spoofed emails from domain (phishing)
+    - DMARC p=none → policy exists but not enforced (useless)
+    - Missing SPF → no sender restriction
+    - SPF +all → allows any server to send (critical misconfiguration)
+    """
+    import dns.resolver
+    import dns.exception
+
+    issues: list[dict] = []
+
+    def _query_txt(name: str) -> list[str]:
+        try:
+            answers = dns.resolver.resolve(name, "TXT", lifetime=8)
+            return [b.decode("utf-8", errors="replace") for rdata in answers for b in rdata.strings]
+        except (dns.exception.DNSException, Exception):
+            return []
+
+    # ── SPF check ───────────────────────────────────────────────────────────
+    spf_records = [r for r in _query_txt(domain) if r.lower().startswith("v=spf1")]
+    if not spf_records:
+        issues.append({
+            "check": "SPF",
+            "severity": "medium",
+            "detail": f"No SPF record found for {domain}. Anyone can send email appearing to come from @{domain}.",
+            "impact": "Email spoofing — attacker can send phishing emails from @{domain} with no SPF validation failure.".format(domain=domain),
+        })
+    else:
+        spf = spf_records[0].lower()
+        if "+all" in spf or spf.endswith(" all") and "~all" not in spf and "-all" not in spf and "?all" not in spf:
+            # Plain 'all' without qualifier = +all (pass all)
+            issues.append({
+                "check": "SPF +all",
+                "severity": "high",
+                "detail": f"SPF record uses '+all' or unqualified 'all': {spf_records[0]}",
+                "impact": f"Any mail server on the internet is permitted to send email as @{domain}.",
+            })
+
+    # ── DMARC check ─────────────────────────────────────────────────────────
+    dmarc_records = _query_txt(f"_dmarc.{domain}")
+    dmarc_txt = next((r for r in dmarc_records if r.lower().startswith("v=dmarc1")), None)
+
+    if not dmarc_txt:
+        issues.append({
+            "check": "DMARC missing",
+            "severity": "medium",
+            "detail": f"No DMARC record found at _dmarc.{domain}.",
+            "impact": (
+                f"Without DMARC, spoofed emails from @{domain} are not rejected by receiving mail servers. "
+                "Attackers can impersonate the domain in phishing campaigns with no enforcement."
+            ),
+        })
+    else:
+        dmarc_lower = dmarc_txt.lower()
+        # Extract p= policy
+        import re as _re
+        p_match = _re.search(r'\bp=(\w+)', dmarc_lower)
+        policy = p_match.group(1) if p_match else "none"
+        if policy == "none":
+            issues.append({
+                "check": "DMARC p=none",
+                "severity": "medium",
+                "detail": f"DMARC record exists but policy is p=none (monitor only): {dmarc_txt}",
+                "impact": (
+                    f"DMARC p=none does not prevent spoofed emails from being delivered. "
+                    f"Attackers can still send phishing emails as @{domain} and they will be delivered."
+                ),
+            })
+        # Check for missing rua (reporting address) — won't find violations
+        if "rua=" not in dmarc_lower:
+            issues.append({
+                "check": "DMARC no reporting",
+                "severity": "informational",
+                "detail": f"DMARC record has no rua= reporting address: {dmarc_txt}",
+                "impact": "No visibility into spoofing attempts against the domain.",
+            })
+
+    if not issues:
+        return {}
+
+    # Determine overall severity (highest among issues)
+    sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "informational": 0}
+    top_issue = max(issues, key=lambda i: sev_order.get(i["severity"], 0))
+    checks_summary = ", ".join(i["check"] for i in issues)
+
+    return {
+        "domain": domain,
+        "issues": issues,
+        "severity": top_issue["severity"],
+        "checks_failed": checks_summary,
+        "impact": top_issue["impact"],
+    }
+
+
+async def run_email_security(domains: list[str], output_file: str) -> list[dict]:
+    """
+    Check SPF/DMARC email security for target domains.
+    Pure DNS — no active scanning, no rate limit concerns.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not domains:
+        return []
+
+    # Deduplicate to apex domains only
+    seen: set[str] = set()
+    apex_domains: list[str] = []
+    for d in domains:
+        apex = d.lstrip("*.")
+        # Strip subdomains to get the apex (last two labels)
+        parts = apex.split(".")
+        apex2 = ".".join(parts[-2:]) if len(parts) >= 2 else apex
+        if apex2 not in seen:
+            seen.add(apex2)
+            apex_domains.append(apex2)
+
+    loop = asyncio.get_event_loop()
+    findings: list[dict] = []
+
+    for domain in apex_domains[:10]:  # cap at 10 apex domains
+        result = await loop.run_in_executor(None, _check_email_security_sync, domain)
+        if result:
+            findings.append(result)
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("email_security: %d domains with issues from %d checked", len(findings), len(apex_domains))
+    return findings
+
+
 # ── GitHub Dorking ────────────────────────────────────────────────────────────
 
 # Search queries — prioritised by signal quality.
@@ -1608,3 +2246,381 @@ async def run_github_dork(domains: list[str], output_file: str,
     log.info("github_dork: %d secrets found across %d domains (%d org queries)",
              len(unique_findings), len(apex_domains), len(orgs))
     return unique_findings
+
+
+# ── Evidence capture ─────────────────────────────────────────────────────────
+
+# Known API key validators: maps secret_type (lowercase, normalized) → validation spec
+_API_KEY_VALIDATORS: dict[str, dict] = {
+    "google-maps-api-key": {
+        "url": "https://maps.googleapis.com/maps/api/geocode/json",
+        "method": "GET",
+        "params": {"address": "London", "key": None},  # key injected at runtime
+        "key_param": "key",
+        "check": "json_field",
+        "field": "status",
+        "active_values": ["OK", "ZERO_RESULTS"],
+        "inactive_values": ["REQUEST_DENIED"],
+    },
+    "google-api-key": {
+        "url": "https://maps.googleapis.com/maps/api/geocode/json",
+        "method": "GET",
+        "params": {"address": "London", "key": None},
+        "key_param": "key",
+        "check": "json_field",
+        "field": "status",
+        "active_values": ["OK", "ZERO_RESULTS"],
+        "inactive_values": ["REQUEST_DENIED"],
+    },
+    "firebase-api-key": {
+        "url": "https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig",
+        "method": "GET",
+        "params": {"key": None},
+        "key_param": "key",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "github-token": {
+        "url": "https://api.github.com/user",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "token {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "github-access-token": {
+        "url": "https://api.github.com/user",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "token {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "stripe-secret-key": {
+        "url": "https://api.stripe.com/v1/balance",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "Bearer {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "slack-token": {
+        "url": "https://slack.com/api/auth.test",
+        "method": "GET",
+        "params": {"token": None},
+        "key_param": "token",
+        "check": "json_field",
+        "field": "ok",
+        "active_values": [True],
+    },
+    "sendgrid-api-key": {
+        "url": "https://api.sendgrid.com/v3/user/profile",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "Bearer {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "mailchimp-api-key": {
+        "url": "https://login.mailchimp.com/oauth2/metadata",
+        "method": "GET",
+        "header_key": "Authorization",
+        "header_value_tpl": "OAuth {key}",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "twilio-account-sid": {
+        "url": "https://api.twilio.com/2010-04-01/Accounts.json",
+        "method": "GET",
+        "check": "status_code",
+        "active_status": 200,
+    },
+    "aws-access-key-id": {
+        "url": "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        "method": "GET",
+        "check": "status_code",
+        "active_status": 200,
+    },
+}
+
+# Normalize secret_type aliases to validator keys
+_SECRET_TYPE_ALIASES: dict[str, str] = {
+    "google maps api key": "google-maps-api-key",
+    "google_maps_api_key": "google-maps-api-key",
+    "googlemapsapikey": "google-maps-api-key",
+    "google api key": "google-api-key",
+    "google_api_key": "google-api-key",
+    "github personal access token": "github-token",
+    "github_pat": "github-token",
+    "ghp_": "github-token",
+    "gho_": "github-access-token",
+    "stripe secret key": "stripe-secret-key",
+    "stripe_secret_key": "stripe-secret-key",
+    "sk_live_": "stripe-secret-key",
+}
+
+
+def _infer_secret_type_from_value(key_value: str) -> Optional[str]:
+    """Infer validator key from the key/token shape when secret_type is generic."""
+    if not key_value:
+        return None
+
+    key = key_value.strip()
+
+    # Google API/Firebase keys (both start with AIza)
+    if re.match(r"^AIza[0-9A-Za-z\-_]{35}$", key):
+        return "google-api-key"
+
+    # GitHub tokens
+    if key.startswith("ghp_"):
+        return "github-token"
+    if key.startswith("gho_"):
+        return "github-access-token"
+
+    # Stripe secret keys
+    if key.startswith("sk_live_") or key.startswith("sk_test_"):
+        return "stripe-secret-key"
+
+    return None
+
+
+def _normalize_secret_type(secret_type: str) -> str:
+    """Normalize secret_type string to a validator key."""
+    normalized = secret_type.lower().strip().replace(" ", "-")
+    # Check aliases
+    alias = _SECRET_TYPE_ALIASES.get(secret_type.lower().strip())
+    if alias:
+        return alias
+    return normalized
+
+
+async def validate_api_key(secret_type: str, key_value: str) -> dict:
+    """
+    Validate a discovered API key against the respective service API.
+    Returns dict: {validated, status, status_code, response_snippet, curl_cmd}
+    Does NOT raise — always returns a result dict.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    result: dict = {
+        "validated": False,
+        "status": "unknown",
+        "status_code": None,
+        "response_snippet": None,
+        "curl_cmd": None,
+        "error": None,
+    }
+
+    norm = _normalize_secret_type(secret_type)
+    validator = _API_KEY_VALIDATORS.get(norm)
+
+    # If detector returned a generic label (e.g. "API Key"), infer type from key value.
+    if not validator:
+        inferred = _infer_secret_type_from_value(key_value)
+        if inferred:
+            validator = _API_KEY_VALIDATORS.get(inferred)
+            norm = inferred
+
+    if not validator:
+        result["status"] = "no_validator"
+        return result
+
+    try:
+        url = validator["url"]
+        method = validator.get("method", "GET")
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; security-research)"}
+        params: dict = {}
+
+        # Inject API key into params
+        if "params" in validator and "key_param" in validator:
+            params = dict(validator["params"])
+            params[validator["key_param"]] = key_value
+            # Build curl for evidence
+            param_str = "&".join(f"{k}={v}" for k, v in params.items())
+            result["curl_cmd"] = f'curl -s "{url}?{param_str}" | python3 -m json.tool'
+        elif "header_key" in validator:
+            header_val = validator["header_value_tpl"].replace("{key}", key_value)
+            headers[validator["header_key"]] = header_val
+            # Build curl
+            result["curl_cmd"] = f'curl -s -H "{validator["header_key"]}: {header_val}" "{url}"'
+        else:
+            result["curl_cmd"] = f'curl -s "{url}"'
+
+        async with _httpx.AsyncClient(timeout=12, verify=False) as client:
+            if method == "GET":
+                resp = await client.get(url, params=params, headers=headers)
+            else:
+                resp = await client.post(url, params=params, headers=headers)
+
+            result["status_code"] = resp.status_code
+
+            check = validator.get("check", "status_code")
+            if check == "status_code":
+                active = resp.status_code == validator.get("active_status", 200)
+                result["validated"] = active
+                result["status"] = "active" if active else "inactive"
+                result["response_snippet"] = resp.text[:400]
+
+            elif check == "json_field":
+                try:
+                    data = resp.json()
+                    field_val = data.get(validator["field"])
+                    active_vals = validator.get("active_values", [])
+                    inactive_vals = validator.get("inactive_values", [])
+                    if field_val in active_vals:
+                        result["validated"] = True
+                        result["status"] = "active"
+                    elif field_val in inactive_vals:
+                        result["validated"] = False
+                        result["status"] = "restricted"
+                    else:
+                        result["status"] = f"unknown_response:{field_val}"
+                    result["response_snippet"] = json.dumps(data, indent=2)[:600]
+                except Exception:
+                    result["response_snippet"] = resp.text[:400]
+
+    except Exception as e:
+        result["error"] = str(e)[:120]
+        log.debug("validate_api_key(%s): %s", secret_type, e)
+
+    return result
+
+
+async def capture_http_evidence(js_url: str, search_term: str) -> dict:
+    """
+    Fetch a JS/HTML URL and extract the lines containing the secret.
+    Returns dict: {url, status_code, content_type, context_lines, request_line}
+    Does NOT raise.
+    """
+    result: dict = {
+        "url": js_url,
+        "status_code": None,
+        "content_type": None,
+        "context_lines": [],
+        "request_line": f"GET {js_url} HTTP/1.1",
+        "error": None,
+    }
+
+    try:
+        async with _httpx.AsyncClient(
+            timeout=15,
+            verify=False,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; security-research)"},
+        ) as client:
+            resp = await client.get(js_url)
+            result["status_code"] = resp.status_code
+            result["content_type"] = resp.headers.get("content-type", "")
+
+            # Find lines containing the secret (use first 20 chars of match)
+            search = search_term[:20] if len(search_term) > 20 else search_term
+            lines = resp.text.splitlines()
+            for i, line in enumerate(lines):
+                if search in line:
+                    start = max(0, i - 1)
+                    end = min(len(lines), i + 2)
+                    result["context_lines"] = [ln[:300] for ln in lines[start:end]]
+                    break
+
+    except Exception as e:
+        result["error"] = str(e)[:120]
+
+    return result
+
+
+async def capture_page_screenshot(url: str, screenshot_file: str) -> dict:
+    """
+    Best-effort full-page screenshot capture for evidence.
+    Returns dict with path/status and never raises.
+    """
+    result: dict = {
+        "saved": False,
+        "path": screenshot_file,
+        "error": None,
+    }
+
+    if not screenshot_file:
+        result["error"] = "no_output_path"
+        return result
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        result["error"] = f"playwright_unavailable:{type(e).__name__}"
+        return result
+
+    try:
+        Path(screenshot_file).parent.mkdir(parents=True, exist_ok=True)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(viewport={"width": 1440, "height": 1024})
+
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                # Still attempt screenshot even if networkidle waits out.
+                pass
+
+            await page.screenshot(path=screenshot_file, full_page=True)
+            await browser.close()
+
+        result["saved"] = os.path.exists(screenshot_file)
+        if not result["saved"]:
+            result["error"] = "screenshot_not_created"
+
+    except Exception as e:
+        result["error"] = f"screenshot_failed:{type(e).__name__}:{str(e)[:120]}"
+
+    return result
+
+
+async def capture_finding_evidence(
+    raw_output_dict: dict,
+    output_file: str,
+    screenshot_file: Optional[str] = None,
+) -> dict:
+    """
+    Given a raw finding dict (from raw_findings), capture HTTP evidence and
+    validate any API keys. Returns enriched evidence dict.
+    Saves to output_file if provided.
+    """
+    source = raw_output_dict.get("_source", "")
+    evidence: dict = {
+        "source": source,
+        "http_fetch": None,
+        "key_validation": None,
+        "screenshot": None,
+    }
+
+    if source == "js_scanner":
+        js_url = raw_output_dict.get("matched-at", "")
+        secret_type = raw_output_dict.get("_secret_type", "")
+        extracted = raw_output_dict.get("extracted-results", [])
+        match_val = extracted[0] if extracted else raw_output_dict.get("_match", "")
+
+        # Capture the JS file content showing the secret in context
+        if js_url and match_val:
+            evidence["http_fetch"] = await capture_http_evidence(js_url, match_val)
+
+        # Capture visual evidence as PNG (best-effort; never blocks finding flow).
+        if js_url and screenshot_file:
+            evidence["screenshot"] = await capture_page_screenshot(js_url, screenshot_file)
+
+        # Validate the API key if we know how
+        if secret_type and match_val:
+            evidence["key_validation"] = await validate_api_key(secret_type, match_val)
+
+    if output_file:
+        try:
+            import aiofiles
+            async with aiofiles.open(output_file, "w", encoding="utf-8") as f:
+                await f.write(json.dumps(evidence, indent=2))
+        except Exception:
+            pass
+
+    return evidence
