@@ -10,6 +10,7 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./workspace:/app/workspace
+      - ./workspace:/workspace
     env_file:
       - .env
     environment:

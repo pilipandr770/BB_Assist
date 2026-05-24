@@ -7,6 +7,7 @@ from datetime import datetime
 import aiofiles
 from fastapi import APIRouter, HTTPException
 
+from backend import database
 from backend.config import settings
 from backend.models import ApiResponse, Program, ProgramCreate
 from backend.services import claude_service, scope_parser
@@ -99,6 +100,7 @@ async def create_program(body: ProgramCreate):
     )
 
     await _save_program(program)
+    await database.save_program(program.id, program.name, program.raw_text)
 
     return ApiResponse(success=True, data=json.loads(program.model_dump_json()))
 

@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.routers import programs, scans, reports
+from backend import database
+from backend.routers import programs, scans, reports, scorer, history
 from backend.services import cve_updater
 
 
@@ -86,6 +87,7 @@ async def _mark_zombie_scans():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: kill orphan tool processes and mark zombie scans as error
+    await database.init_db()
     _kill_child_processes()
     await _mark_zombie_scans()
     cve_refresh_task = asyncio.create_task(cve_updater.periodic_cve_csv_refresh_loop())
@@ -117,6 +119,8 @@ app.add_middleware(
 app.include_router(programs.router, prefix="/api/programs", tags=["programs"])
 app.include_router(scans.router, prefix="/api/scans", tags=["scans"])
 app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
+app.include_router(scorer.router, prefix="/api/scorer", tags=["scorer"])
+app.include_router(history.router, prefix="/api/history", tags=["history"])
 
 
 @app.get("/")

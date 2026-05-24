@@ -10,6 +10,9 @@ export default function PlanReview() {
   const [scope, setScope] = useState(null)
   const [phase, setPhase] = useState('generating') // generating | review | starting
   const [error, setError] = useState(null)
+  const [sessionCookies, setSessionCookies] = useState('')
+  const [authHeader, setAuthHeader] = useState('')
+  const [showAuth, setShowAuth] = useState(false)
   const calledRef = useRef(false)
 
   // On mount: generate plan (POST), then fetch it (GET)
@@ -52,6 +55,8 @@ export default function PlanReview() {
       const res = await axios.post('/api/scans/start', {
         program_id: programId,
         approved_plan: plan,
+        session_cookies: sessionCookies,
+        auth_header: authHeader,
       })
       navigate(`/programs/${programId}/scans/${res.data.data.id}`)
     } catch (e) {
@@ -132,6 +137,54 @@ export default function PlanReview() {
         }}
       />
 
+      <div style={{ ...S.card, marginTop: 14 }}>
+        <button
+          type="button"
+          onClick={() => setShowAuth(v => !v)}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: '#58a6ff',
+            fontWeight: 600,
+            padding: 0,
+          }}
+        >
+          {showAuth ? '▼' : '▶'} Authentication (optional)
+        </button>
+
+        {showAuth && (
+          <div style={{ marginTop: 12 }}>
+            <label style={S.label}>Session Cookie</label>
+            <input
+              value={sessionCookies}
+              onChange={e => setSessionCookies(e.target.value)}
+              placeholder="sessionid=abc123; csrftoken=xyz"
+              style={S.input}
+            />
+
+            <label style={{ ...S.label, marginTop: 12 }}>Authorization Header</label>
+            <input
+              value={authHeader}
+              onChange={e => setAuthHeader(e.target.value)}
+              placeholder="Bearer eyJhbGci..."
+              style={S.input}
+            />
+
+            <div style={{
+              marginTop: 10,
+              fontSize: 12,
+              color: '#f0883e',
+              background: '#f0883e22',
+              border: '1px solid #f0883e',
+              borderRadius: 6,
+              padding: '8px 10px',
+            }}>
+              These are passed directly to scanning tools. Never use real production credentials.
+            </div>
+          </div>
+        )}
+      </div>
+
       <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
         <button
           onClick={handleApprove}
@@ -206,5 +259,15 @@ const S = {
     padding: '9px 16px', background: 'transparent',
     color: '#8b949e', border: '1px solid #30363d',
     borderRadius: 6, fontSize: 14,
+  },
+  input: {
+    width: '100%',
+    padding: '9px 12px',
+    background: '#0d1117',
+    border: '1px solid #30363d',
+    borderRadius: 6,
+    color: '#c9d1d9',
+    fontSize: 13,
+    outline: 'none',
   },
 }

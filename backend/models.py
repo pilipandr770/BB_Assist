@@ -53,6 +53,8 @@ class Program(BaseModel):
 class ScanCreate(BaseModel):
     program_id: str
     approved_plan: str  # user-approved plan (may differ from generated)
+    session_cookies: str = ""   # "name=value; name2=value2"
+    auth_header: str = ""       # "Bearer eyJ..."
 
 
 class ScanJob(BaseModel):
@@ -63,6 +65,8 @@ class ScanJob(BaseModel):
     finished_at: Optional[datetime] = None
     findings_count: int = 0
     reports_count: int = 0
+    session_cookies: str = ""
+    auth_header: str = ""
 
 
 # --- Finding ---
@@ -119,3 +123,36 @@ class ApiResponse(BaseModel):
     success: bool
     data: Optional[dict] = None
     error: Optional[str] = None
+
+
+# --- History / DB models ---
+
+class HistoryProgram(BaseModel):
+    id: str
+    name: str
+    created_at: Optional[str] = None
+    scan_count: int = 0
+    total_findings: int = 0
+    total_reports: int = 0
+    last_scan_at: Optional[str] = None
+
+
+class HistoryScan(BaseModel):
+    id: str
+    program_id: str
+    status: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    findings_count: int = 0
+    reports_count: int = 0
+
+
+class HistoryFinding(BaseModel):
+    id: str
+    scan_id: str
+    title: str
+    severity: str
+    vuln_type: str
+    target: str
+    passed_filter: int = 0
+    created_at: Optional[str] = None

@@ -32,17 +32,24 @@ _ARJUN_PATH_RE = re.compile(
 import aiofiles
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from backend import database
 from backend.config import settings
 from backend.models import ApiResponse, Finding, ScanCreate, ScanJob, ScanStatus, Severity
 # settings is used for: workspace_dir, github_token, redis_url
 from backend.services import finding_filter, passive_recon, report_generator, tool_runner
+from backend.services import telegram_notifier
 from backend.services.scope_parser import is_in_scope
 
 router = APIRouter()
 
 WORKSPACE = settings.workspace_dir
+
+
+class RerunPhaseRequest(BaseModel):
+    phase: str
 
 _PLATFORM_SCOPE_DOMAINS = {
     "hackerone.com", "bugcrowd.com", "intigriti.com", "yeswehack.com", "huntr.com",
@@ -111,6 +118,168 @@ async def _get_redis():
         return r
     except Exception:
         return None
+
+
+def _phase_file(path: str) -> list[str]:
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [x.strip() for x in f if x.strip()]
+
+
+def _discover_program_id_by_scan(scan_id: str) -> str | None:
+    if not os.path.exists(WORKSPACE):
+        return None
+    for entry in os.scandir(WORKSPACE):
+        if not entry.is_dir():
+            continue
+        p = os.path.join(entry.path, "scans", scan_id, "job.json")
+        if os.path.exists(p):
+            return entry.name
+    return None
+
+
+async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> None:
+    redis = await _get_redis()
+    scan_dir = _scan_dir(program_id, scan_id)
+    recon_dir = os.path.join(WORKSPACE, program_id, "recon")
+    rerun_job = await _load_job(program_id, scan_id)
+
+    try:
+        await _push_event(redis, scan_id, "phase_start", {"phase": phase})
+
+        httpx_path = os.path.join(recon_dir, "httpx.jsonl")
+        all_urls_path = os.path.join(recon_dir, "all_urls.txt")
+        subfinder_path = os.path.join(recon_dir, "subfinder.txt")
+        nuclei_out = os.path.join(scan_dir, "nuclei_cve.jsonl")
+
+        live_urls: list[str] = []
+        if os.path.exists(httpx_path):
+            try:
+                import aiofiles as _af
+                async with _af.open(httpx_path, encoding="utf-8") as _f:
+                    async for _line in _f:
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _d = json.loads(_line)
+                            _u = _d.get("url")
+                            if _u:
+                                live_urls.append(_u)
+                        except Exception:
+                            continue
+            except Exception:
+                live_urls = []
+
+        if phase == "passive_recon":
+            program = await _load_scope_and_program(program_id)
+            domains = [d.lstrip("*.") for d in (program.scope.in_scope_domains or []) if d]
+            all_subs = set()
+            all_urls = set()
+            for domain in domains[:5]:
+                subs, urls = await passive_recon.run_all_passive(domain)
+                all_subs.update(subs)
+                all_urls.update(urls)
+            await _push_event(redis, scan_id, "tool_done", {
+                "tool": "passive_recon_rerun",
+                "subdomains": len(all_subs),
+                "urls": len(all_urls),
+            })
+
+        elif phase == "nuclei":
+            all_urls = _phase_file(all_urls_path)
+            targets = _select_nuclei_targets(all_urls, live_urls, max_urls=500)
+            await _push_event(redis, scan_id, "tool_start", {"tool": "nuclei_rerun", "detail": f"{len(targets)} targets"})
+            findings = await tool_runner.run_nuclei(
+                targets,
+                nuclei_out,
+                scope=(await _load_scope_and_program(program_id)).scope,
+                session_cookies=rerun_job.session_cookies,
+                auth_header=rerun_job.auth_header,
+            )
+            await _push_event(redis, scan_id, "tool_done", {"tool": "nuclei_rerun", "count": len(findings)})
+
+        elif phase == "js_scan":
+            all_urls = _phase_file(all_urls_path)
+            js_urls = [u for u in all_urls if u.lower().endswith(".js")]
+            js_out = os.path.join(scan_dir, "js_scan_rerun.jsonl")
+            await _push_event(redis, scan_id, "tool_start", {"tool": "js_scan_rerun", "detail": f"{len(js_urls)} js files"})
+            js_findings = await tool_runner.run_js_scanner(js_urls[:200], js_out)
+            await _push_event(redis, scan_id, "tool_done", {"tool": "js_scan_rerun", "count": len(js_findings)})
+
+        elif phase == "ffuf":
+            ffuf_targets = _select_ffuf_targets(live_urls, max_hosts=5)
+            total = 0
+            for i, host_url in enumerate(ffuf_targets, 1):
+                ffuf_out = os.path.join(scan_dir, f"ffuf_rerun_{i}.jsonl")
+                await _push_event(redis, scan_id, "tool_start", {"tool": "ffuf_rerun", "detail": host_url})
+                results = await tool_runner.run_ffuf(
+                    host_url,
+                    "",
+                    ffuf_out,
+                    session_cookies=rerun_job.session_cookies,
+                    auth_header=rerun_job.auth_header,
+                )
+                total += len(results)
+            await _push_event(redis, scan_id, "tool_done", {"tool": "ffuf_rerun", "count": total})
+
+        elif phase == "cors":
+            cors_out = os.path.join(scan_dir, "cors_rerun.jsonl")
+            findings = await tool_runner.run_cors_checker(live_urls[:60], cors_out)
+            await _push_event(redis, scan_id, "tool_done", {"tool": "cors_rerun", "count": len(findings)})
+
+        elif phase == "takeover":
+            subs = _phase_file(subfinder_path)
+            takeover_out = os.path.join(scan_dir, "takeover_rerun.jsonl")
+            findings = await tool_runner.run_subdomain_takeover(subs[:200], takeover_out)
+            await _push_event(redis, scan_id, "tool_done", {"tool": "takeover_rerun", "count": len(findings)})
+
+        elif phase == "sqli":
+            candidates = []
+            if os.path.exists(nuclei_out):
+                import aiofiles as _af
+                async with _af.open(nuclei_out, encoding="utf-8") as _f:
+                    async for _line in _f:
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _d = json.loads(_line)
+                        except Exception:
+                            continue
+                        tags = ",".join((_d.get("info", {}) or {}).get("tags", [])).lower()
+                        tid = str(_d.get("template-id", "")).lower()
+                        if "sqli" in tags or "sql" in tid:
+                            _url = _d.get("matched-at") or _d.get("host")
+                            if _url:
+                                candidates.append(_url)
+            confirmed = 0
+            for url in list(dict.fromkeys(candidates))[:5]:
+                res = await tool_runner.run_sqlmap(url, scan_dir)
+                confirmed += len(res)
+            await _push_event(redis, scan_id, "tool_done", {
+                "tool": "sqli_rerun",
+                "count": confirmed,
+                "candidates": len(candidates),
+            })
+        else:
+            raise ValueError(f"Unknown phase: {phase}")
+
+        await _push_event(redis, scan_id, "phase_done", {"phase": phase, "rerun": True})
+
+        job = await _load_job(program_id, scan_id)
+        await _push_event(redis, scan_id, "scan_done", {
+            "approved": job.findings_count,
+            "rejected": 0,
+            "reports": job.reports_count,
+        })
+
+    except Exception as e:
+        await _push_event(redis, scan_id, "scan_error", {"error": f"rerun failed: {e}"})
+    finally:
+        if redis:
+            await redis.aclose()
 
 
 # ── scan orchestration ────────────────────────────────────────────────────────
@@ -301,6 +470,11 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
         job.status = ScanStatus.running
         job.started_at = datetime.utcnow()
         await _save_job(job, program_id)
+        await database.update_scan_status(
+            job.id,
+            status=ScanStatus.running.value,
+            started_at=job.started_at.isoformat() if job.started_at else None,
+        )
 
         # ── Delta scanning: load baseline from previous scan ─────────────────
         # Comparing current scan against the previous one lets us highlight NEW
@@ -495,7 +669,12 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
 
         await _push_event(redis, scan_id, "tool_start", {"tool": "httpx", "detail": f"{len(httpx_targets)} hosts"})
         httpx_out = os.path.join(recon_dir, "httpx.jsonl")
-        http_results = await tool_runner.run_httpx(httpx_targets, httpx_out)
+        http_results = await tool_runner.run_httpx(
+            httpx_targets,
+            httpx_out,
+            session_cookies=job.session_cookies,
+            auth_header=job.auth_header,
+        )
         live_urls = [r.get("url", "") for r in http_results if r.get("url")]
         await _push_event(redis, scan_id, "tool_done", {"tool": "httpx", "count": len(live_urls)})
 
@@ -532,7 +711,12 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
                 "tool": "httpx-gen-fallback",
                 "detail": f"probing {len(generated)} generated domain URLs",
             })
-            _gen_results = await tool_runner.run_httpx(generated, _gen_httpx_out)
+            _gen_results = await tool_runner.run_httpx(
+                generated,
+                _gen_httpx_out,
+                session_cookies=job.session_cookies,
+                auth_header=job.auth_header,
+            )
             _gen_live = [r.get("url", "") for r in _gen_results if r.get("url")]
             if _gen_live:
                 live_urls = _gen_live
@@ -692,7 +876,12 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
             katana_urls = live_urls[:50] if live_urls else []
             await _push_event(redis, scan_id, "tool_start", {"tool": "katana", "detail": f"{len(katana_urls)} URLs"})
             katana_out = os.path.join(recon_dir, "katana.txt")
-            crawled_urls = await tool_runner.run_katana(katana_urls, katana_out)
+            crawled_urls = await tool_runner.run_katana(
+                katana_urls,
+                katana_out,
+                session_cookies=job.session_cookies,
+                auth_header=job.auth_header,
+            )
             await _push_event(redis, scan_id, "tool_done", {"tool": "katana", "count": len(crawled_urls)})
         else:
             crawled_urls = []
@@ -809,7 +998,13 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
                     "tool": "ffuf", "detail": host_url,
                 })
                 ffuf_out = os.path.join(scan_dir, f"ffuf_{len(ffuf_found_urls)}.json")
-                results = await tool_runner.run_ffuf(host_url, "", ffuf_out)
+                results = await tool_runner.run_ffuf(
+                    host_url,
+                    "",
+                    ffuf_out,
+                    session_cookies=job.session_cookies,
+                    auth_header=job.auth_header,
+                )
                 found = [f"{host_url.rstrip('/')}/{r['input']['FUZZ']}" for r in results if r.get("status") != 403]
                 fbd_403 = [f"{host_url.rstrip('/')}/{r['input']['FUZZ']}" for r in results if r.get("status") == 403]
                 ffuf_found_urls.extend(found)
@@ -1135,7 +1330,12 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
             ticker = asyncio.create_task(_nuclei_progress_ticker())
             try:
                 raw_findings = await tool_runner.run_nuclei(
-                    nuclei_urls, nuclei_out, scope, detected_techs=detected_techs
+                    nuclei_urls,
+                    nuclei_out,
+                    scope,
+                    detected_techs=detected_techs,
+                    session_cookies=job.session_cookies,
+                    auth_header=job.auth_header,
                 )
             finally:
                 ticker.cancel()
@@ -1500,6 +1700,24 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
                         "reason": reason,
                     })
 
+                    await database.save_finding(
+                        finding_id=finding.id,
+                        scan_id=scan_id,
+                        title=finding.title,
+                        severity=finding.severity.value,
+                        vuln_type=finding.vuln_type,
+                        target=finding.url,
+                        passed_filter=1,
+                    )
+
+                    if finding.severity in (Severity.critical, Severity.high):
+                        await telegram_notifier.send_critical_finding(
+                            program_name=program.name,
+                            title=finding.title,
+                            severity=finding.severity.value,
+                            target=finding.url,
+                        )
+
                     # Phase 5: Generate report for this finding
                     try:
                         report = await report_generator.generate(finding, scope)
@@ -1558,6 +1776,24 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
         job.status = ScanStatus.done
         job.finished_at = datetime.utcnow()
         await _save_job(job, program_id)
+        await database.update_scan_status(
+            job.id,
+            status=ScanStatus.done.value,
+            finished_at=job.finished_at.isoformat() if job.finished_at else None,
+            findings_count=job.findings_count,
+            reports_count=job.reports_count,
+        )
+
+        if job.started_at and job.finished_at:
+            duration_min = int((job.finished_at - job.started_at).total_seconds() // 60)
+        else:
+            duration_min = 0
+        await telegram_notifier.send_scan_done(
+            program_name=program.name,
+            findings=job.findings_count,
+            reports=job.reports_count,
+            duration_min=duration_min,
+        )
 
         await _push_event(redis, scan_id, "scan_done", {
             "approved": approved_count,
@@ -1575,6 +1811,13 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
         job.status = ScanStatus.failed
         job.finished_at = datetime.utcnow()
         await _save_job(job, program_id)
+        await database.update_scan_status(
+            job.id,
+            status=ScanStatus.failed.value,
+            finished_at=job.finished_at.isoformat() if job.finished_at else None,
+            findings_count=job.findings_count,
+            reports_count=job.reports_count,
+        )
         await _push_event(redis, scan_id, "scan_error", {"error": str(e)})
         # Expire failed scan events after 24 h
         if redis:
@@ -1644,9 +1887,20 @@ async def start_scan(body: ScanCreate):
         id=str(uuid.uuid4()),
         program_id=body.program_id,
         status=ScanStatus.pending,
+        session_cookies=(body.session_cookies or "").strip(),
+        auth_header=(body.auth_header or "").strip(),
     )
 
     await _save_job(job, body.program_id)
+    await database.save_scan(
+        scan_id=job.id,
+        program_id=job.program_id,
+        status=job.status.value,
+        started_at=job.started_at.isoformat() if job.started_at else None,
+        finished_at=job.finished_at.isoformat() if job.finished_at else None,
+        findings_count=job.findings_count,
+        reports_count=job.reports_count,
+    )
 
     # Launch scan as a free asyncio task (not a FastAPI BackgroundTask) so it
     # survives across uvicorn hot-reloads and doesn't block shutdown.
@@ -1765,3 +2019,18 @@ async def get_findings(program_id: str, scan_id: str):
 
     findings.sort(key=lambda f: f.get("created_at", ""), reverse=True)
     return ApiResponse(success=True, data={"findings": findings})
+
+
+@router.post("/{scan_id}/rerun-phase", response_model=ApiResponse)
+async def rerun_phase(scan_id: str, body: RerunPhaseRequest):
+    allowed = {"nuclei", "js_scan", "ffuf", "passive_recon", "cors", "takeover", "sqli"}
+    phase = (body.phase or "").strip().lower()
+    if phase not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported phase '{phase}'")
+
+    program_id = _discover_program_id_by_scan(scan_id)
+    if not program_id:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    asyncio.create_task(_rerun_phase_pipeline(program_id, scan_id, phase))
+    return ApiResponse(success=True, data={"scan_id": scan_id, "program_id": program_id, "phase": phase})

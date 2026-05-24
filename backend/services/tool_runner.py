@@ -280,6 +280,16 @@ def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:
     return ["-H", f"X-HackerOne-Researcher: {username}"]
 
 
+def _auth_header_args(session_cookies: str = "", auth_header: str = "") -> list[str]:
+    """Return CLI header args for optional authenticated scanning."""
+    args: list[str] = []
+    if session_cookies:
+        args += ["-H", f"Cookie: {session_cookies}"]
+    if auth_header:
+        args += ["-H", f"Authorization: {auth_header}"]
+    return args
+
+
 async def _get_redis() -> Optional[aioredis.Redis]:
     """Return async Redis client, or None if Redis is unavailable."""
     try:
@@ -683,7 +693,12 @@ def match_service_versions_to_cves(
     return matches
 
 
-async def run_httpx(hosts: list[str], output_file: str) -> list[dict]:
+async def run_httpx(
+    hosts: list[str],
+    output_file: str,
+    session_cookies: str = "",
+    auth_header: str = "",
+) -> list[dict]:
     """
     Probe live HTTP hosts and gather info.
 
@@ -725,7 +740,7 @@ async def run_httpx(hosts: list[str], output_file: str) -> list[dict]:
         # Two flag sets to try in order — handles @latest version differences.
         # Set A: modern short aliases (httpx ≥ 1.3)
         # Set B: legacy long flags (httpx ≤ 1.2) — fallback if A gives 0 results
-        _hdr = _h1_header_args()
+        _hdr = _h1_header_args() + _auth_header_args(session_cookies, auth_header)
         cmd_sets = [
             [  # Set A — modern short flags (v1.3+)
                 _HTTPX_BIN, "-l", input_file, "-json", "-o", output_file,
@@ -823,7 +838,12 @@ async def run_gau(domain: str, output_file: str) -> list[str]:
     return []
 
 
-async def run_katana(urls: list[str], output_file: str) -> list[str]:
+async def run_katana(
+    urls: list[str],
+    output_file: str,
+    session_cookies: str = "",
+    auth_header: str = "",
+) -> list[str]:
     """
     Web crawl target URLs for endpoint discovery.
     Hard caps: 10 min wall time (-crawl-duration), 50k results (post-filter).
@@ -842,7 +862,7 @@ async def run_katana(urls: list[str], output_file: str) -> list[str]:
             "-rate-limit", "50",
             "-timeout", "10",
             "-crawl-duration", "8m", # hard stop at 8 min regardless of depth
-        ] + _h1_header_args()
+        ] + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
         await _run_command(cmd, timeout_s=510)  # no stream_key — output read from file
 
         if os.path.exists(output_file):
@@ -860,6 +880,8 @@ async def run_nuclei(
     scope: Scope,
     tags: str = NUCLEI_TAGS_RUN,
     detected_techs: set[str] | None = None,
+    session_cookies: str = "",
+    auth_header: str = "",
 ) -> list[dict]:
     """
     Run nuclei vulnerability scanner with curated templates.
@@ -956,7 +978,7 @@ async def run_nuclei(
             "-nc",                           # no color codes in output
             "-H", f"User-Agent: {nuclei_ua}",
             # Note: interactsh ENABLED intentionally — needed for blind SSRF/XSS/XXE detection
-        ] + template_args + _h1_header_args()
+        ] + template_args + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
 
         MAX_NUCLEI_RUNTIME = 900  # 15 minutes hard cap — use partial results after
         rc, stdout, stderr = await _run_command(
@@ -1017,7 +1039,7 @@ async def run_nuclei(
                         "-retries", "1",
                         "-nc",
                         "-H", f"User-Agent: {nuclei_ua}",
-                    ] + _h1_header_args()
+                    ] + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
                     log.info("nuclei-cve: running with tags=%s", ",".join(cve_tags))
                     await _run_command(cve_cmd, timeout_s=90)
 
@@ -1044,7 +1066,13 @@ async def run_nuclei(
         os.unlink(input_file)
 
 
-async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
+async def run_ffuf(
+    url: str,
+    wordlist: str,
+    output_file: str,
+    session_cookies: str = "",
+    auth_header: str = "",
+) -> list[dict]:
     """
     Directory/endpoint fuzzing with ffuf.
     Returns all results (200/201/301/302/403) so callers can extract 403s
@@ -1067,7 +1095,7 @@ async def run_ffuf(url: str, wordlist: str, output_file: str) -> list[dict]:
         "-rate", "30",     # CDN-friendly
         "-timeout", "10",
         "-silent",
-    ] + _h1_header_args()
+    ] + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
     await _run_command(cmd, stream_key=f"tool:ffuf:{output_file}", timeout_s=180)
 
     if os.path.exists(output_file):

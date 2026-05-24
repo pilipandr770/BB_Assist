@@ -58,6 +58,8 @@ export default function ScanProgress() {
   const [done, setDone] = useState(false)
   const [failed, setFailed] = useState(false)
   const [reportIds, setReportIds] = useState([]) // track generated report IDs for navigation
+  const [rerunPhase, setRerunPhase] = useState('nuclei')
+  const [rerunning, setRerunning] = useState(false)
   const bottomRef = useRef(null)
   const esRef = useRef(null)
 
@@ -105,6 +107,20 @@ export default function ScanProgress() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [lines])
+
+  async function handleRerunPhase() {
+    setRerunning(true)
+    try {
+      await fetch(`/api/scans/${scanId}/rerun-phase`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phase: rerunPhase }),
+      })
+      window.location.reload()
+    } finally {
+      setRerunning(false)
+    }
+  }
 
   function handleEvent(type, data, addLine, es, setReportIds) {
     const color = EVENT_COLORS[type]
@@ -313,6 +329,45 @@ export default function ScanProgress() {
           >
             ← New program
           </button>
+
+          {done && (
+            <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <select
+                value={rerunPhase}
+                onChange={(e) => setRerunPhase(e.target.value)}
+                style={{
+                  background: '#161b22',
+                  color: '#c9d1d9',
+                  border: '1px solid #30363d',
+                  borderRadius: 6,
+                  padding: '8px 10px',
+                }}
+              >
+                <option value="nuclei">Re-run nuclei</option>
+                <option value="js_scan">Re-run JS scan</option>
+                <option value="ffuf">Re-run FFUF</option>
+                <option value="cors">Re-run CORS check</option>
+                <option value="takeover">Re-run subdomain takeover</option>
+                <option value="sqli">Re-run SQLi validation</option>
+                <option value="passive_recon">Re-run passive recon</option>
+              </select>
+              <button
+                onClick={handleRerunPhase}
+                disabled={rerunning}
+                style={{
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  border: '1px solid #30363d',
+                  background: '#0d1117',
+                  color: '#58a6ff',
+                  fontWeight: 600,
+                  opacity: rerunning ? 0.7 : 1,
+                }}
+              >
+                {rerunning ? 'Starting phase...' : 'Re-run phase'}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import axios from 'axios'
 
@@ -24,6 +24,19 @@ export default function ProgramInput() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const navigate = useNavigate()
+
+  useEffect(() => {
+    const prefillName = localStorage.getItem('bb_prefill_program_name')
+    const prefillScope = localStorage.getItem('bb_prefill_program_scope')
+    if (prefillName) {
+      setName(prefillName)
+      localStorage.removeItem('bb_prefill_program_name')
+    }
+    if (prefillScope) {
+      setRawText(prefillScope)
+      localStorage.removeItem('bb_prefill_program_scope')
+    }
+  }, [])
 
   async function handleSubmit(e) {
     e.preventDefault()

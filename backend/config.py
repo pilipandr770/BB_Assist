@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # Hard cap to keep generated CSV bounded and scan-time matching fast.
     cve_cvelist_max_rows: int = 20000
 
+    # Telegram notifications (optional)
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     class Config:
         env_file = ".env"
 
