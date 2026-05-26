@@ -1692,7 +1692,11 @@ def _check_takeover_sync(subdomain: str) -> Optional[dict]:
     return None
 
 
-async def run_subdomain_takeover(subdomains: list[str], output_file: str) -> list[dict]:
+async def run_subdomain_takeover(
+    subdomains: list[str],
+    output_file: str,
+    per_subdomain_timeout_s: int = 20,
+) -> list[dict]:
     """
     Check subdomains for potential takeover.
     Caps at 200 subdomains, 15 concurrent.
@@ -1710,11 +1714,18 @@ async def run_subdomain_takeover(subdomains: list[str], output_file: str) -> lis
 
     async def _check_one(sub: str):
         async with semaphore:
-            result = await loop.run_in_executor(None, _check_takeover_sync, sub)
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, _check_takeover_sync, sub),
+                    timeout=per_subdomain_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                log.warning("subdomain_takeover timeout for %s", sub)
+                return
         if result:
             findings.append(result)
 
-    await asyncio.gather(*[_check_one(s) for s in targets])
+    await asyncio.gather(*[_check_one(s) for s in targets], return_exceptions=True)
 
     if findings:
         with open(output_file, "w") as f:

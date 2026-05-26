@@ -46,6 +46,7 @@ from backend.services.scope_parser import is_in_scope
 router = APIRouter()
 
 WORKSPACE = settings.workspace_dir
+TAKEOVER_PHASE_TIMEOUT_S = 420
 
 
 class RerunPhaseRequest(BaseModel):
@@ -232,8 +233,23 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
         elif phase == "takeover":
             subs = _phase_file(subfinder_path)
             takeover_out = os.path.join(scan_dir, "takeover_rerun.jsonl")
-            findings = await tool_runner.run_subdomain_takeover(subs[:200], takeover_out)
-            await _push_event(redis, scan_id, "tool_done", {"tool": "takeover_rerun", "count": len(findings)})
+            try:
+                findings = await asyncio.wait_for(
+                    tool_runner.run_subdomain_takeover(subs[:200], takeover_out),
+                    timeout=TAKEOVER_PHASE_TIMEOUT_S,
+                )
+                await _push_event(redis, scan_id, "tool_done", {"tool": "takeover_rerun", "count": len(findings)})
+            except asyncio.TimeoutError:
+                await _push_event(redis, scan_id, "tool_error", {
+                    "tool": "takeover_rerun",
+                    "error": f"timeout after {TAKEOVER_PHASE_TIMEOUT_S}s",
+                })
+                await _push_event(redis, scan_id, "phase_done", {
+                    "phase": phase,
+                    "rerun": True,
+                    "timeout": True,
+                })
+                return
 
         elif phase == "sqli":
             candidates = []
@@ -1228,9 +1244,17 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
             "detail": f"{min(len(list(all_subdomains)), 200)} subdomains",
         })
         takeover_out = os.path.join(scan_dir, "takeovers.jsonl")
-        takeover_findings = await tool_runner.run_subdomain_takeover(
-            list(all_subdomains), takeover_out
-        )
+        try:
+            takeover_findings = await asyncio.wait_for(
+                tool_runner.run_subdomain_takeover(list(all_subdomains), takeover_out),
+                timeout=TAKEOVER_PHASE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            takeover_findings = []
+            await _push_event(redis, scan_id, "tool_error", {
+                "tool": "subdomain_takeover",
+                "error": f"timeout after {TAKEOVER_PHASE_TIMEOUT_S}s",
+            })
         await _push_event(redis, scan_id, "tool_done", {
             "tool": "subdomain_takeover", "count": len(takeover_findings),
         })
@@ -1941,6 +1965,24 @@ async def stream_scan(program_id: str, scan_id: str, request: Request):
 
                     # Check if scan is done
                     if last_event_type in ("scan_done", "scan_error"):
+                        try:
+                            terminal_job = await _load_job(program_id, scan_id)
+                            if terminal_job.status not in (ScanStatus.done, ScanStatus.failed):
+                                terminal_job.status = (
+                                    ScanStatus.done if last_event_type == "scan_done" else ScanStatus.failed
+                                )
+                                terminal_job.finished_at = terminal_job.finished_at or datetime.utcnow()
+                                await _save_job(terminal_job, program_id)
+                                await database.update_scan_status(
+                                    terminal_job.id,
+                                    status=terminal_job.status.value,
+                                    finished_at=terminal_job.finished_at.isoformat() if terminal_job.finished_at else None,
+                                    findings_count=terminal_job.findings_count,
+                                    reports_count=terminal_job.reports_count,
+                                )
+                        except Exception:
+                            pass
+
                         if redis:
                             await redis.aclose()
                         return
@@ -1954,17 +1996,42 @@ async def stream_scan(program_id: str, scan_id: str, request: Request):
                     # was NOT a terminal event, check if the scan was interrupted
                     # (e.g. by a server restart mid-nuclei-run).
                     # Compare the timestamp of the last Redis event against now.
-                    if idle_ticks == 30 and last_event_type not in ("scan_done", "scan_error", ""):
+                    if idle_ticks == 30:
                         try:
                             last_raw = await redis.lindex(f"scan:{scan_id}:events", -1)
                             if last_raw:
-                                last_ts_str = json.loads(last_raw).get("ts", "")
+                                last_parsed = json.loads(last_raw)
+                                last_type = last_parsed.get("type", "")
+
+                                # If last stored event is terminal, close immediately
+                                # even when client reconnected with cursor past the end.
+                                if last_type in ("scan_done", "scan_error"):
+                                    await redis.aclose()
+                                    return
+
+                                last_ts_str = last_parsed.get("ts", "")
                                 if last_ts_str:
                                     from datetime import timezone
                                     last_ts = datetime.fromisoformat(last_ts_str)
                                     age_s = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds()
                                     if age_s > 60:
                                         # Last event is >60s old and nothing new → zombie
+                                        try:
+                                            stale_job = await _load_job(program_id, scan_id)
+                                            if stale_job.status not in (ScanStatus.done, ScanStatus.failed):
+                                                stale_job.status = ScanStatus.failed
+                                                stale_job.finished_at = datetime.utcnow()
+                                                await _save_job(stale_job, program_id)
+                                                await database.update_scan_status(
+                                                    stale_job.id,
+                                                    status=ScanStatus.failed.value,
+                                                    finished_at=stale_job.finished_at.isoformat() if stale_job.finished_at else None,
+                                                    findings_count=stale_job.findings_count,
+                                                    reports_count=stale_job.reports_count,
+                                                )
+                                        except Exception:
+                                            pass
+
                                         await _push_event(redis, scan_id, "scan_error", {
                                             "error": "Scan was interrupted (server restart or crash). "
                                                      "Please start a new scan."
