@@ -2663,3 +2663,715 @@ async def capture_finding_evidence(
             pass
 
     return evidence
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IP / CIDR pipeline
+# masscan → nmap -sV → httpx (non-standard ports) → nuclei (network tags)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_masscan(
+    targets: list[str],
+    output_file: str,
+    rate: int = 1000,
+    ports: str = "1-65535",
+) -> list[dict]:
+    """
+    Fast port discovery with masscan.
+    targets: list of IPs or CIDR ranges (e.g. ["1.2.3.0/24", "10.0.0.1"])
+    Returns list of {ip, port, proto} dicts.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not targets:
+        return []
+
+    target_file = output_file + ".targets"
+    with open(target_file, "w") as tf:
+        tf.write("\n".join(targets) + "\n")
+
+    args = [
+        "masscan",
+        "-iL", target_file,
+        "-p", ports,
+        "--rate", str(rate),
+        "--output-format", "json",
+        "--output-filename", output_file,
+        "--wait", "3",
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        if proc.returncode not in (0, 1):  # masscan exits 1 on partial results
+            log.warning("masscan exited %d: %s", proc.returncode, stderr.decode()[:200])
+    except asyncio.TimeoutError:
+        log.error("masscan timed out after 600s")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception as exc:
+        log.error("masscan error: %s", exc)
+    finally:
+        try:
+            os.unlink(target_file)
+        except Exception:
+            pass
+
+    results: list[dict] = []
+    if os.path.exists(output_file):
+        try:
+            with open(output_file) as f:
+                raw = f.read().strip().lstrip("[").rstrip("]").rstrip(",")
+                # masscan JSON may be missing outer brackets on partial runs
+                if raw:
+                    for line in raw.splitlines():
+                        line = line.strip().rstrip(",")
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            ip = obj.get("ip", "")
+                            for p in obj.get("ports", []):
+                                results.append({
+                                    "ip": ip,
+                                    "port": p.get("port"),
+                                    "proto": p.get("proto", "tcp"),
+                                    "status": p.get("status", "open"),
+                                })
+                        except json.JSONDecodeError:
+                            pass
+        except Exception as exc:
+            log.error("masscan output parse error: %s", exc)
+
+    log.info("masscan: %d open ports found across %d targets", len(results), len(targets))
+    return results
+
+
+async def run_ip_scan(
+    targets: list[str],
+    output_dir: str,
+    nuclei_extra_tags: list[str] | None = None,
+    session_cookies: str = "",
+    auth_header: str = "",
+) -> dict:
+    """
+    Full IP/CIDR pipeline:
+      masscan → nmap -sV (on open ports) → httpx (HTTP on non-standard ports)
+      → nuclei (network, exposed-panel, default-creds tags)
+
+    targets: IPs or CIDR strings
+    Returns dict with keys: open_ports, services, http_urls, nuclei_findings
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Step 1: masscan ───────────────────────────────────────────────────────
+    masscan_out = os.path.join(output_dir, "masscan.json")
+    open_ports = await run_masscan(targets, masscan_out, rate=1000)
+
+    if not open_ports:
+        return {"open_ports": [], "services": [], "http_urls": [], "nuclei_findings": []}
+
+    # Build ip:port list for nmap
+    ip_port_pairs = list({f"{r['ip']}:{r['port']}" for r in open_ports if r.get("port")})
+
+    # ── Step 2: nmap -sV on discovered ports ──────────────────────────────────
+    services: list[str] = []
+    nmap_out = os.path.join(output_dir, "nmap_services.gnmap")
+    if ip_port_pairs:
+        # Build nmap target + portlist
+        ips = list({p.split(":")[0] for p in ip_port_pairs})
+        ports_arg = ",".join({p.split(":")[1] for p in ip_port_pairs})
+        nmap_args = [
+            "nmap", "-sV", "--open",
+            "-p", ports_arg,
+            "-oG", nmap_out,
+            "--host-timeout", "30s",
+            "--max-retries", "1",
+        ] + ips[:100]  # cap to avoid huge scans
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *nmap_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            log.error("nmap -sV timed out (IP scan)")
+        except Exception as exc:
+            log.error("nmap -sV error: %s", exc)
+
+        # Parse gnmap for service banners
+        if os.path.exists(nmap_out):
+            with open(nmap_out) as f:
+                for line in f:
+                    if "/open/" in line:
+                        services.append(line.strip())
+
+    # ── Step 3: httpx — detect HTTP on all discovered ports ───────────────────
+    http_urls: list[str] = []
+    httpx_targets = [f"http://{pair}" for pair in ip_port_pairs] + \
+                    [f"https://{pair}" for pair in ip_port_pairs]
+    httpx_out = os.path.join(output_dir, "httpx_ip.jsonl")
+    if httpx_targets:
+        extra_headers = []
+        if session_cookies:
+            extra_headers += ["-H", f"Cookie: {session_cookies}"]
+        if auth_header:
+            extra_headers += ["-H", f"Authorization: {auth_header}"]
+        args = [
+            "httpx",
+            "-l", "-",  # read from stdin
+            "-silent", "-json",
+            "-o", httpx_out,
+            "-timeout", "10",
+            "-follow-redirects",
+            "-title", "-status-code", "-tech-detect",
+        ] + extra_headers
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdin_data = "\n".join(httpx_targets).encode()
+            await asyncio.wait_for(proc.communicate(input=stdin_data), timeout=120)
+        except asyncio.TimeoutError:
+            log.error("httpx (IP scan) timed out")
+        except Exception as exc:
+            log.error("httpx (IP scan) error: %s", exc)
+
+        if os.path.exists(httpx_out):
+            with open(httpx_out) as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        url = obj.get("url", "")
+                        if url:
+                            http_urls.append(url)
+                    except json.JSONDecodeError:
+                        pass
+
+    # ── Step 4: nuclei — network / panel / default-creds checks ──────────────
+    nuclei_findings: list[dict] = []
+    if http_urls:
+        tags = ["network", "exposed-panel", "default-creds"] + (nuclei_extra_tags or [])
+        nuclei_out = os.path.join(output_dir, "nuclei_ip.jsonl")
+        target_file = nuclei_out + ".targets"
+        with open(target_file, "w") as tf:
+            tf.write("\n".join(http_urls) + "\n")
+        nargs = [
+            "nuclei",
+            "-l", target_file,
+            "-tags", ",".join(tags),
+            "-json-export", nuclei_out,
+            "-silent",
+            "-timeout", "10",
+            "-retries", "1",
+            "-no-interactsh",
+        ]
+        if auth_header:
+            nargs += ["-H", f"Authorization: {auth_header}"]
+        if session_cookies:
+            nargs += ["-H", f"Cookie: {session_cookies}"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *nargs,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            log.error("nuclei (IP scan) timed out")
+        except Exception as exc:
+            log.error("nuclei (IP scan) error: %s", exc)
+        finally:
+            try:
+                os.unlink(target_file)
+            except Exception:
+                pass
+
+        if os.path.exists(nuclei_out):
+            with open(nuclei_out) as f:
+                for line in f:
+                    try:
+                        nuclei_findings.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+    log.info(
+        "run_ip_scan: %d open ports, %d services, %d http urls, %d nuclei findings",
+        len(open_ports), len(services), len(http_urls), len(nuclei_findings),
+    )
+    return {
+        "open_ports": open_ports,
+        "services": services,
+        "http_urls": http_urls,
+        "nuclei_findings": nuclei_findings,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# puredns — wildcard-aware subdomain resolution
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_puredns(
+    domain: str,
+    output_file: str,
+    wordlist: str = "/wordlists/subdomains-1m.txt",
+) -> list[str]:
+    """
+    Brute-force subdomain discovery with puredns.
+    Uses public resolvers and handles wildcard filtering automatically.
+    Returns validated list of live subdomains.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    # puredns requires a resolvers list; use a known public set
+    resolvers_file = "/tmp/puredns_resolvers.txt"
+    _public_resolvers = [
+        "1.1.1.1", "8.8.8.8", "8.8.4.4", "9.9.9.9",
+        "208.67.222.222", "208.67.220.220", "1.0.0.1",
+        "149.112.112.112", "64.6.64.6", "64.6.65.6",
+    ]
+    with open(resolvers_file, "w") as rf:
+        rf.write("\n".join(_public_resolvers) + "\n")
+
+    args = [
+        "puredns", "bruteforce",
+        wordlist,
+        domain,
+        "-r", resolvers_file,
+        "--output", output_file,
+        "--write-wildcards", "/dev/null",
+        "--quiet",
+    ]
+
+    results: list[str] = []
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        if proc.returncode != 0:
+            log.warning("puredns exited %d: %s", proc.returncode, stderr.decode()[:200])
+    except asyncio.TimeoutError:
+        log.error("puredns timed out after 600s for domain: %s", domain)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception as exc:
+        log.error("puredns error: %s", exc)
+
+    if os.path.exists(output_file):
+        with open(output_file) as f:
+            results = [line.strip() for line in f if line.strip()]
+
+    log.info("puredns: %d subdomains found for %s", len(results), domain)
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API (OpenAPI / Swagger) pipeline
+# parse spec → ffuf endpoints → nuclei api tags → arjun params
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_api_scan(
+    spec_url: str,
+    output_dir: str,
+    base_url: str = "",
+    session_cookies: str = "",
+    auth_header: str = "",
+) -> dict:
+    """
+    Scan an API target using its OpenAPI/Swagger specification.
+      1. Fetch + parse OpenAPI spec (v2/v3)
+      2. ffuf on all discovered endpoints
+      3. nuclei with api, graphql, jwt, idor tags
+      4. arjun on interesting endpoints
+
+    spec_url: URL or local file path to openapi.json / swagger.yaml
+    base_url: override base URL (auto-detected from spec if empty)
+    Returns dict: {endpoints, ffuf_findings, nuclei_findings, arjun_params}
+    """
+    import logging
+    import yaml as _yaml
+    log = logging.getLogger("tool_runner")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Step 1: Fetch and parse spec ──────────────────────────────────────────
+    spec_data: dict = {}
+    if spec_url.startswith("http://") or spec_url.startswith("https://"):
+        try:
+            headers = {}
+            if auth_header:
+                headers["Authorization"] = auth_header
+            if session_cookies:
+                headers["Cookie"] = session_cookies
+            async with _httpx.AsyncClient(timeout=30, verify=False) as client:
+                resp = await client.get(spec_url, headers=headers)
+                resp.raise_for_status()
+                content = resp.text
+        except Exception as exc:
+            log.error("api_scan: failed to fetch spec from %s: %s", spec_url, exc)
+            return {"endpoints": [], "ffuf_findings": [], "nuclei_findings": [], "arjun_params": {}}
+    else:
+        # Local file
+        try:
+            with open(spec_url, encoding="utf-8") as f:
+                content = f.read()
+        except Exception as exc:
+            log.error("api_scan: failed to read spec file %s: %s", spec_url, exc)
+            return {"endpoints": [], "ffuf_findings": [], "nuclei_findings": [], "arjun_params": {}}
+
+    try:
+        spec_data = json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            spec_data = _yaml.safe_load(content)
+        except Exception as exc:
+            log.error("api_scan: failed to parse spec: %s", exc)
+            return {"endpoints": [], "ffuf_findings": [], "nuclei_findings": [], "arjun_params": {}}
+
+    # Extract base URL
+    if not base_url:
+        # OpenAPI v3
+        servers = spec_data.get("servers", [])
+        if servers:
+            base_url = servers[0].get("url", "")
+        else:
+            # Swagger v2
+            scheme = (spec_data.get("schemes") or ["https"])[0]
+            host = spec_data.get("host", "")
+            base_path = spec_data.get("basePath", "/")
+            if host:
+                base_url = f"{scheme}://{host}{base_path}".rstrip("/")
+
+    endpoints: list[str] = []
+    endpoints_with_methods: list[dict] = []
+    paths = spec_data.get("paths", {})
+    for path, methods_obj in paths.items():
+        if not isinstance(methods_obj, dict):
+            continue
+        full_url = base_url.rstrip("/") + "/" + path.lstrip("/")
+        endpoints.append(full_url)
+        for method in methods_obj:
+            if method.lower() in ("get", "post", "put", "delete", "patch", "options"):
+                params = []
+                for p in (methods_obj[method].get("parameters") or []):
+                    if p.get("name"):
+                        params.append(p["name"])
+                endpoints_with_methods.append({
+                    "url": full_url,
+                    "method": method.upper(),
+                    "params": params,
+                })
+
+    log.info("api_scan: parsed %d endpoints from spec", len(endpoints))
+
+    # Save endpoints to file for nuclei
+    ep_file = os.path.join(output_dir, "api_endpoints.txt")
+    with open(ep_file, "w") as f:
+        f.write("\n".join(endpoints) + "\n")
+
+    # Build custom ffuf wordlist from endpoint paths
+    path_wordlist = os.path.join(output_dir, "api_paths.txt")
+    with open(path_wordlist, "w") as f:
+        for path in paths:
+            f.write(path.lstrip("/") + "\n")
+
+    # ── Step 2: ffuf on all endpoints ─────────────────────────────────────────
+    ffuf_findings: list[dict] = []
+    if base_url and paths:
+        ffuf_out = os.path.join(output_dir, "ffuf_api.json")
+        extra_headers = []
+        if auth_header:
+            extra_headers += ["-H", f"Authorization: {auth_header}"]
+        if session_cookies:
+            extra_headers += ["-H", f"Cookie: {session_cookies}"]
+        fargs = [
+            "ffuf",
+            "-u", base_url.rstrip("/") + "/FUZZ",
+            "-w", path_wordlist,
+            "-o", ffuf_out,
+            "-of", "json",
+            "-timeout", "10",
+            "-mc", "200,201,204,301,302,401,403,405",
+            "-t", "30",
+            "-silent",
+        ] + extra_headers
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *fargs,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=180)
+        except asyncio.TimeoutError:
+            log.error("api_scan: ffuf timed out")
+        except Exception as exc:
+            log.error("api_scan: ffuf error: %s", exc)
+
+        if os.path.exists(ffuf_out):
+            try:
+                with open(ffuf_out) as f:
+                    data = json.load(f)
+                ffuf_findings = data.get("results", [])
+            except Exception:
+                pass
+
+    # ── Step 3: nuclei — api, graphql, jwt, idor tags ─────────────────────────
+    nuclei_findings: list[dict] = []
+    if os.path.exists(ep_file) and endpoints:
+        nuclei_out = os.path.join(output_dir, "nuclei_api.jsonl")
+        extra_headers = []
+        if auth_header:
+            extra_headers += ["-H", f"Authorization: {auth_header}"]
+        if session_cookies:
+            extra_headers += ["-H", f"Cookie: {session_cookies}"]
+        nargs = [
+            "nuclei",
+            "-l", ep_file,
+            "-tags", "api,graphql,jwt,idor,swagger",
+            "-json-export", nuclei_out,
+            "-silent", "-no-interactsh",
+            "-timeout", "10",
+        ] + extra_headers
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *nargs,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            log.error("api_scan: nuclei timed out")
+        except Exception as exc:
+            log.error("api_scan: nuclei error: %s", exc)
+
+        if os.path.exists(nuclei_out):
+            with open(nuclei_out) as f:
+                for line in f:
+                    try:
+                        nuclei_findings.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+    # ── Step 4: arjun on first 10 GET endpoints ───────────────────────────────
+    arjun_params: dict[str, list[str]] = {}
+    get_endpoints = [e["url"] for e in endpoints_with_methods if e["method"] == "GET"][:10]
+    for ep_url in get_endpoints:
+        ep_out = os.path.join(output_dir, f"arjun_{abs(hash(ep_url)) % 100000}.json")
+        aargs = [
+            "arjun",
+            "-u", ep_url,
+            "--output-file", ep_out,
+            "-oJ",
+            "-t", "10",
+            "-q",
+        ]
+        if auth_header:
+            aargs += ["--headers", f"Authorization: {auth_header}"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *aargs,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+            if os.path.exists(ep_out):
+                with open(ep_out) as f:
+                    adata = json.load(f)
+                params_found = []
+                if isinstance(adata, dict):
+                    params_found = adata.get("params", []) or adata.get("parameters", [])
+                elif isinstance(adata, list):
+                    params_found = adata
+                if params_found:
+                    arjun_params[ep_url] = params_found
+        except asyncio.TimeoutError:
+            log.warning("api_scan: arjun timed out for %s", ep_url)
+        except Exception as exc:
+            log.warning("api_scan: arjun error for %s: %s", ep_url, exc)
+
+    log.info(
+        "run_api_scan: %d endpoints, %d ffuf, %d nuclei, %d arjun results",
+        len(endpoints), len(ffuf_findings), len(nuclei_findings), len(arjun_params),
+    )
+    return {
+        "endpoints": endpoints,
+        "ffuf_findings": ffuf_findings,
+        "nuclei_findings": nuclei_findings,
+        "arjun_params": arjun_params,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Source code pipeline
+# git clone → gitleaks → semgrep → trufflehog
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_source_scan(
+    repo_url: str,
+    output_dir: str,
+) -> dict:
+    """
+    SAST + secret detection pipeline for open-source BB targets:
+      1. git clone (shallow)
+      2. gitleaks — git history secrets
+      3. semgrep — SAST patterns (sqli, xss, path traversal, insecure-deserialisation)
+      4. trufflehog — entropy-based secret detection
+
+    repo_url: https://github.com/org/repo or local path
+    Returns dict: {gitleaks_findings, semgrep_findings, trufflehog_findings, clone_path}
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Step 1: Clone ─────────────────────────────────────────────────────────
+    clone_path = os.path.join(output_dir, "repo")
+    if not os.path.exists(clone_path):
+        clone_args = [
+            "git", "clone", "--depth", "100",
+            "--single-branch",
+            repo_url,
+            clone_path,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *clone_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            if proc.returncode != 0:
+                log.error("source_scan: git clone failed: %s", stderr.decode()[:300])
+                return {"gitleaks_findings": [], "semgrep_findings": [], "trufflehog_findings": [], "clone_path": ""}
+        except asyncio.TimeoutError:
+            log.error("source_scan: git clone timed out")
+            return {"gitleaks_findings": [], "semgrep_findings": [], "trufflehog_findings": [], "clone_path": ""}
+        except Exception as exc:
+            log.error("source_scan: git clone error: %s", exc)
+            return {"gitleaks_findings": [], "semgrep_findings": [], "trufflehog_findings": [], "clone_path": ""}
+
+    # ── Step 2: gitleaks ──────────────────────────────────────────────────────
+    gitleaks_findings: list[dict] = []
+    gitleaks_out = os.path.join(output_dir, "gitleaks.json")
+    gl_args = [
+        "gitleaks", "detect",
+        "--source", clone_path,
+        "--report-format", "json",
+        "--report-path", gitleaks_out,
+        "--no-banner", "-q",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *gl_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=300)
+        # gitleaks exits 1 when leaks found — that's expected
+    except asyncio.TimeoutError:
+        log.error("source_scan: gitleaks timed out")
+    except Exception as exc:
+        log.error("source_scan: gitleaks error: %s", exc)
+
+    if os.path.exists(gitleaks_out):
+        try:
+            with open(gitleaks_out) as f:
+                gitleaks_findings = json.load(f) or []
+        except Exception:
+            pass
+
+    # ── Step 3: semgrep SAST ──────────────────────────────────────────────────
+    semgrep_findings: list[dict] = []
+    semgrep_out = os.path.join(output_dir, "semgrep.json")
+    sg_args = [
+        "semgrep",
+        "--config", "p/owasp-top-ten",
+        "--config", "p/secrets",
+        "--json",
+        "--output", semgrep_out,
+        "--no-git-ignore",
+        "--quiet",
+        clone_path,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *sg_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=600)
+    except asyncio.TimeoutError:
+        log.error("source_scan: semgrep timed out")
+    except Exception as exc:
+        log.error("source_scan: semgrep error: %s", exc)
+
+    if os.path.exists(semgrep_out):
+        try:
+            with open(semgrep_out) as f:
+                sg_data = json.load(f)
+            semgrep_findings = sg_data.get("results", [])
+        except Exception:
+            pass
+
+    # ── Step 4: trufflehog ────────────────────────────────────────────────────
+    trufflehog_findings: list[dict] = []
+    trufflehog_out = os.path.join(output_dir, "trufflehog.json")
+    th_args = [
+        "trufflehog",
+        "filesystem",
+        clone_path,
+        "--json",
+        "--no-verification",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *th_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        # trufflehog outputs JSONL to stdout
+        for line in stdout.decode(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                trufflehog_findings.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        if trufflehog_findings:
+            with open(trufflehog_out, "w") as f:
+                json.dump(trufflehog_findings, f, indent=2)
+    except asyncio.TimeoutError:
+        log.error("source_scan: trufflehog timed out")
+    except Exception as exc:
+        log.error("source_scan: trufflehog error: %s", exc)
+
+    log.info(
+        "run_source_scan: %d gitleaks, %d semgrep, %d trufflehog findings",
+        len(gitleaks_findings), len(semgrep_findings), len(trufflehog_findings),
+    )
+    return {
+        "gitleaks_findings": gitleaks_findings,
+        "semgrep_findings": semgrep_findings,
+        "trufflehog_findings": trufflehog_findings,
+        "clone_path": clone_path,
+    }

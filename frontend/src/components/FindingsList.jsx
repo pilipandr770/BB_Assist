@@ -106,6 +106,20 @@ export default function FindingsList() {
         </button>
       )}
 
+      {/* Manual finding button */}
+      <button
+        onClick={() => navigate(`/programs/${programId}/manual-finding`)}
+        style={{
+          marginTop: 8, marginLeft: Object.keys(reportsByFinding).length > 0 ? 8 : 0,
+          padding: '7px 16px',
+          background: '#58a6ff22', color: '#58a6ff',
+          border: '1px solid #58a6ff', borderRadius: 6,
+          fontSize: 13, fontWeight: 600,
+        }}
+      >
+        + Add Manual Finding
+      </button>
+
       {findings.length === 0 ? (
         <div style={{
           background: '#161b22', border: '1px solid #30363d',

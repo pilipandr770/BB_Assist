@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # Install system deps + Go
 RUN apt-get update && apt-get install -y \
-    curl wget git nmap unzip \
+    curl wget git nmap masscan unzip python3-pip \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libdbus-1-3 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
     libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
@@ -30,6 +30,8 @@ RUN mkdir -p /wordlists && \
       "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt" && \
     wget -q -O /wordlists/api-endpoints.txt \
       "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt" && \
+    wget -q -O /wordlists/subdomains-1m.txt \
+      "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt" && \
     cat /wordlists/common.txt /wordlists/api-endpoints.txt | sort -u > /wordlists/web-combined.txt && \
     wc -l /wordlists/*.txt | tail -1
 
@@ -45,7 +47,21 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     go install -v github.com/hahwul/dalfox/v2@latest && \
     go install -v github.com/tomnomnom/anew@latest && \
     go install -v github.com/tomnomnom/gf@latest && \
-    go install -v github.com/tomnomnom/qsreplace@latest
+    go install -v github.com/tomnomnom/qsreplace@latest && \
+    go install -v github.com/d3mondev/puredns/v2@latest && \
+    go install -v github.com/haccer/subjack@latest && \
+    go install -v github.com/zricethezav/gitleaks/v8/cmd/gitleaks@latest && \
+    go install -v github.com/infosec-au/altdns@latest 2>/dev/null || true
+
+# Install trufflehog (standalone binary)
+RUN wget -q -O /tmp/trufflehog.tar.gz \
+      "https://github.com/trufflesecurity/trufflehog/releases/latest/download/trufflehog_linux_amd64.tar.gz" && \
+    tar -C /usr/local/bin -xzf /tmp/trufflehog.tar.gz trufflehog && \
+    chmod +x /usr/local/bin/trufflehog && \
+    rm /tmp/trufflehog.tar.gz
+
+# Install semgrep (Python-based SAST)
+RUN pip3 install --no-cache-dir semgrep
 
 # Download nuclei templates to a known path
 RUN nuclei -update-templates -silent 2>/dev/null || true && \

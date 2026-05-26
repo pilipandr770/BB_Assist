@@ -538,6 +538,179 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
         ]
         do_nuclei = not any(kw in notes_lower for kw in _no_scan_keywords)
 
+        # ── Determine effective scan mode ─────────────────────────────────────
+        # Explicit scan_mode from request overrides program_type heuristic.
+        _scan_mode = (job.scan_mode or "auto").lower()
+        if _scan_mode == "auto":
+            if prog_type == "ip":
+                _scan_mode = "ip"
+            elif prog_type == "source_code" or job.repo_url:
+                _scan_mode = "source_code"
+            elif prog_type == "api" or job.api_spec_url:
+                _scan_mode = "api"
+            else:
+                _scan_mode = "web"
+
+        # ── IP/CIDR pipeline ──────────────────────────────────────────────────
+        if _scan_mode == "ip":
+            cidr_targets = list(scope.in_scope_cidrs or []) + [
+                d for d in (scope.in_scope_domains or [])
+                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', d)
+            ]
+            await _push_event(redis, scan_id, "phase_start", {
+                "phase": "ip_scan",
+                "targets": cidr_targets,
+            })
+            ip_out_dir = os.path.join(scan_dir, "ip_scan")
+            ip_results = await tool_runner.run_ip_scan(
+                targets=cidr_targets,
+                output_dir=ip_out_dir,
+                session_cookies=job.session_cookies,
+                auth_header=job.auth_header,
+            )
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "ip_scan",
+                "open_ports": len(ip_results["open_ports"]),
+                "http_urls": len(ip_results["http_urls"]),
+                "nuclei_findings": len(ip_results["nuclei_findings"]),
+            })
+            # Convert nuclei findings to standard Finding objects
+            all_findings_raw: list[dict] = []
+            for nf in ip_results["nuclei_findings"]:
+                _severity = nf.get("info", {}).get("severity", "informative").lower()
+                all_findings_raw.append({
+                    "tool": "nuclei_ip",
+                    "title": nf.get("info", {}).get("name", nf.get("template-id", "finding")),
+                    "url": nf.get("matched-at", nf.get("host", "")),
+                    "severity": _severity,
+                    "vuln_type": ",".join(nf.get("info", {}).get("tags", [])),
+                    "raw_output": json.dumps(nf),
+                })
+            # Services exposure as informational findings
+            for svc_line in ip_results["services"]:
+                all_findings_raw.append({
+                    "tool": "nmap_ip",
+                    "title": f"Open service: {svc_line[:120]}",
+                    "url": svc_line.split()[1] if len(svc_line.split()) > 1 else svc_line[:80],
+                    "severity": "informative",
+                    "vuln_type": "exposed-service",
+                    "raw_output": svc_line,
+                })
+            await _push_event(redis, scan_id, "scan_done", {
+                "total_findings": len(all_findings_raw),
+                "pipeline": "ip",
+            })
+            # Save findings and finish
+            await _persist_raw_findings(redis, scan_id, program_id, all_findings_raw, job, finding_dir)
+            return  # IP pipeline complete — skip web pipeline below
+
+        # ── Source code pipeline ──────────────────────────────────────────────
+        if _scan_mode == "source_code":
+            repo = job.repo_url or ""
+            if not repo:
+                await _push_event(redis, scan_id, "scan_error", {
+                    "error": "source_code scan requires repo_url"
+                })
+                return
+            await _push_event(redis, scan_id, "phase_start", {
+                "phase": "source_scan",
+                "repo_url": repo,
+            })
+            src_out_dir = os.path.join(scan_dir, "source_scan")
+            src_results = await tool_runner.run_source_scan(
+                repo_url=repo,
+                output_dir=src_out_dir,
+            )
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "source_scan",
+                "gitleaks": len(src_results["gitleaks_findings"]),
+                "semgrep": len(src_results["semgrep_findings"]),
+                "trufflehog": len(src_results["trufflehog_findings"]),
+            })
+            all_findings_raw = []
+            for lf in src_results["gitleaks_findings"]:
+                all_findings_raw.append({
+                    "tool": "gitleaks",
+                    "title": f"Secret exposed: {lf.get('RuleID', 'unknown')}",
+                    "url": lf.get("File", repo),
+                    "severity": "high",
+                    "vuln_type": "secret-exposure",
+                    "raw_output": json.dumps(lf),
+                })
+            for sf in src_results["semgrep_findings"]:
+                all_findings_raw.append({
+                    "tool": "semgrep",
+                    "title": sf.get("check_id", "semgrep-finding"),
+                    "url": sf.get("path", repo) + f":{sf.get('start', {}).get('line', '')}",
+                    "severity": sf.get("extra", {}).get("severity", "medium").lower(),
+                    "vuln_type": sf.get("check_id", "sast"),
+                    "raw_output": json.dumps(sf),
+                })
+            for tf in src_results["trufflehog_findings"]:
+                all_findings_raw.append({
+                    "tool": "trufflehog",
+                    "title": f"Secret: {tf.get('DetectorName', 'unknown')}",
+                    "url": tf.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {}).get("file", repo),
+                    "severity": "high",
+                    "vuln_type": "secret-exposure",
+                    "raw_output": json.dumps(tf),
+                })
+            await _push_event(redis, scan_id, "scan_done", {
+                "total_findings": len(all_findings_raw),
+                "pipeline": "source_code",
+            })
+            await _persist_raw_findings(redis, scan_id, program_id, all_findings_raw, job, finding_dir)
+            return  # source_code pipeline complete
+
+        # ── API (OpenAPI/Swagger) pipeline ─────────────────────────────────────
+        if _scan_mode == "api" and job.api_spec_url:
+            await _push_event(redis, scan_id, "phase_start", {
+                "phase": "api_scan",
+                "spec_url": job.api_spec_url,
+            })
+            api_out_dir = os.path.join(scan_dir, "api_scan")
+            api_results = await tool_runner.run_api_scan(
+                spec_url=job.api_spec_url,
+                output_dir=api_out_dir,
+                session_cookies=job.session_cookies,
+                auth_header=job.auth_header,
+            )
+            await _push_event(redis, scan_id, "phase_done", {
+                "phase": "api_scan",
+                "endpoints": len(api_results["endpoints"]),
+                "ffuf_findings": len(api_results["ffuf_findings"]),
+                "nuclei_findings": len(api_results["nuclei_findings"]),
+                "arjun_params": len(api_results["arjun_params"]),
+            })
+            all_findings_raw = []
+            for nf in api_results["nuclei_findings"]:
+                _severity = nf.get("info", {}).get("severity", "informative").lower()
+                all_findings_raw.append({
+                    "tool": "nuclei_api",
+                    "title": nf.get("info", {}).get("name", nf.get("template-id", "finding")),
+                    "url": nf.get("matched-at", ""),
+                    "severity": _severity,
+                    "vuln_type": ",".join(nf.get("info", {}).get("tags", [])),
+                    "raw_output": json.dumps(nf),
+                })
+            for ff in api_results["ffuf_findings"]:
+                _status = ff.get("status", 0)
+                all_findings_raw.append({
+                    "tool": "ffuf_api",
+                    "title": f"Accessible endpoint [{_status}]: {ff.get('url', '')}",
+                    "url": ff.get("url", ""),
+                    "severity": "informative",
+                    "vuln_type": "exposed-endpoint",
+                    "raw_output": json.dumps(ff),
+                })
+            await _push_event(redis, scan_id, "scan_done", {
+                "total_findings": len(all_findings_raw),
+                "pipeline": "api",
+            })
+            await _persist_raw_findings(redis, scan_id, program_id, all_findings_raw, job, finding_dir)
+            return  # API pipeline complete
+        # Fall through to regular web pipeline if scan_mode == "api" but no spec URL
+
         await _push_event(redis, scan_id, "pipeline_config", {
             "program_type": prog_type,
             "do_katana": do_katana,
@@ -1853,6 +2026,141 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
             await redis.aclose()
 
 
+async def _persist_raw_findings(
+    redis,
+    scan_id: str,
+    program_id: str,
+    raw_findings: list[dict],
+    job: ScanJob,
+    finding_dir: str,
+) -> None:
+    """
+    Run AI filter + report generation on a list of raw finding dicts
+    (from IP/API/source_code pipelines).
+    Each dict must have: tool, title, url, severity, vuln_type, raw_output.
+    Updates job.findings_count / job.reports_count and persists everything.
+    """
+    approved_count = 0
+    rejected_count = 0
+
+    program = await _load_scope_and_program(program_id)
+    scope = program.scope
+
+    for raw in raw_findings:
+        try:
+            try:
+                sev = Severity(raw.get("severity", "informative").lower())
+            except ValueError:
+                sev = Severity.informative
+
+            finding = Finding(
+                id=str(uuid.uuid4()),
+                scan_id=scan_id,
+                program_id=program_id,
+                tool=raw.get("tool", "unknown"),
+                title=raw.get("title", "Untitled"),
+                url=raw.get("url", ""),
+                severity=sev,
+                vuln_type=raw.get("vuln_type", "unknown"),
+                raw_output=raw.get("raw_output", ""),
+            )
+
+            passed, reason = await finding_filter.run_all_layers(
+                finding, scope, program.raw_text
+            )
+
+            if passed:
+                approved_count += 1
+                finding_path = os.path.join(finding_dir, "filtered", f"{finding.id}.json")
+                async with aiofiles.open(finding_path, "w") as f:
+                    await f.write(finding.model_dump_json(indent=2))
+
+                await _push_event(redis, scan_id, "finding_approved", {
+                    "id": finding.id,
+                    "title": finding.title,
+                    "severity": finding.severity,
+                    "reason": reason,
+                })
+                await database.save_finding(
+                    finding_id=finding.id,
+                    scan_id=scan_id,
+                    title=finding.title,
+                    severity=finding.severity.value,
+                    vuln_type=finding.vuln_type,
+                    target=finding.url,
+                    passed_filter=1,
+                )
+                if finding.severity in (Severity.critical, Severity.high):
+                    await telegram_notifier.send_critical_finding(
+                        program_name=program.name,
+                        title=finding.title,
+                        severity=finding.severity.value,
+                        target=finding.url,
+                    )
+                try:
+                    report = await report_generator.generate(finding, scope)
+                    job.reports_count += 1
+                    async with aiofiles.open(finding_path, "w") as f:
+                        await f.write(finding.model_dump_json(indent=2))
+                    await _push_event(redis, scan_id, "report_generated", {
+                        "finding_id": finding.id,
+                        "report_id": report.id,
+                        "title": report.title,
+                    })
+                except Exception as _rep_err:
+                    await _push_event(redis, scan_id, "report_error", {
+                        "finding_id": finding.id,
+                        "error": str(_rep_err),
+                    })
+            else:
+                rejected_count += 1
+                rej_path = os.path.join(finding_dir, "rejected", f"{finding.id}.json")
+                async with aiofiles.open(rej_path, "w") as f:
+                    await f.write(json.dumps({
+                        **json.loads(finding.model_dump_json()),
+                        "rejection_reason": reason,
+                    }, indent=2))
+                await _push_event(redis, scan_id, "finding_rejected", {
+                    "title": finding.title,
+                    "reason": reason,
+                })
+        except Exception as _fe:
+            rejected_count += 1
+            await _push_event(redis, scan_id, "finding_error", {
+                "error": str(_fe),
+                "raw_title": str(raw.get("title", ""))[:120],
+            })
+
+    job.findings_count += approved_count
+    job.status = ScanStatus.done
+    job.finished_at = datetime.utcnow()
+    await _save_job(job, program_id)
+    await database.update_scan_status(
+        job.id,
+        status=ScanStatus.done.value,
+        finished_at=job.finished_at.isoformat() if job.finished_at else None,
+        findings_count=job.findings_count,
+        reports_count=job.reports_count,
+    )
+    if job.started_at and job.finished_at:
+        duration_min = int((job.finished_at - job.started_at).total_seconds() // 60)
+    else:
+        duration_min = 0
+    await telegram_notifier.send_scan_done(
+        program_name=program.name,
+        findings=job.findings_count,
+        reports=job.reports_count,
+        duration_min=duration_min,
+    )
+    await _push_event(redis, scan_id, "scan_complete", {
+        "approved": approved_count,
+        "rejected": rejected_count,
+        "reports": job.reports_count,
+    })
+    if redis:
+        await redis.expire(f"scan:{scan_id}:events", 86400)
+
+
 def _nuclei_to_finding(raw: dict, job: ScanJob) -> Finding:
     """Convert nuclei JSON output line to Finding model."""
     info = raw.get("info", {})
@@ -1889,23 +2197,29 @@ async def start_scan(body: ScanCreate):
         raise HTTPException(status_code=404, detail=f"Program '{body.program_id}' not found")
 
     program = await _load_scope_and_program(body.program_id)
-    if not program.scope or not program.scope.in_scope_domains:
-        raise HTTPException(
-            status_code=400,
-            detail="Scope has no in-scope domains. Claude could not extract targets from the program text. "
-                   "Re-create the program with a complete HackerOne scope section that lists specific domains.",
-        )
+    _effective_mode = (body.scan_mode or "auto").lower()
+    _is_ip_mode = _effective_mode == "ip" or (program.scope and (program.scope.in_scope_cidrs or []))
+    _is_src_mode = _effective_mode == "source_code" or bool(body.repo_url)
 
-    in_scope_clean = [d.lstrip("*.").lower() for d in (program.scope.in_scope_domains or []) if d]
-    if in_scope_clean and all(_is_platform_scope_domain(d) for d in in_scope_clean):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Parsed scope only contains bug bounty platform domains (e.g., bugcrowd/hackerone), "
-                "which indicates scope extraction fallback failed. Re-create the program using the full "
-                "live scope table and verify in-scope domains before starting a scan."
-            ),
-        )
+    # For IP/source_code modes domains are not required
+    if not _is_ip_mode and not _is_src_mode:
+        if not program.scope or not program.scope.in_scope_domains:
+            raise HTTPException(
+                status_code=400,
+                detail="Scope has no in-scope domains. Claude could not extract targets from the program text. "
+                       "Re-create the program with a complete HackerOne scope section that lists specific domains.",
+            )
+
+        in_scope_clean = [d.lstrip("*.").lower() for d in (program.scope.in_scope_domains or []) if d]
+        if in_scope_clean and all(_is_platform_scope_domain(d) for d in in_scope_clean):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Parsed scope only contains bug bounty platform domains (e.g., bugcrowd/hackerone), "
+                    "which indicates scope extraction fallback failed. Re-create the program using the full "
+                    "live scope table and verify in-scope domains before starting a scan."
+                ),
+            )
 
     job = ScanJob(
         id=str(uuid.uuid4()),
@@ -1913,6 +2227,9 @@ async def start_scan(body: ScanCreate):
         status=ScanStatus.pending,
         session_cookies=(body.session_cookies or "").strip(),
         auth_header=(body.auth_header or "").strip(),
+        scan_mode=(body.scan_mode or "auto").strip(),
+        api_spec_url=(body.api_spec_url or "").strip(),
+        repo_url=(body.repo_url or "").strip(),
     )
 
     await _save_job(job, body.program_id)
@@ -2101,3 +2418,95 @@ async def rerun_phase(scan_id: str, body: RerunPhaseRequest):
 
     asyncio.create_task(_rerun_phase_pipeline(program_id, scan_id, phase))
     return ApiResponse(success=True, data={"scan_id": scan_id, "program_id": program_id, "phase": phase})
+
+
+class ManualFindingCreate(BaseModel):
+    program_id: str
+    scan_id: str = ""          # optional — links to existing scan
+    title: str
+    url: str
+    severity: str = "medium"
+    vuln_type: str = "manual"
+    description: str = ""
+    steps_to_reproduce: str = ""
+
+
+@router.post("/findings/manual", response_model=ApiResponse)
+async def add_manual_finding(body: ManualFindingCreate):
+    """
+    Add a manually discovered finding (e.g. logic bug found during manual testing).
+    Runs through the same AI filter and report generation as automated findings.
+    """
+    prog_file = os.path.join(WORKSPACE, body.program_id, "program.json")
+    if not os.path.exists(prog_file):
+        raise HTTPException(status_code=404, detail=f"Program '{body.program_id}' not found")
+
+    program = await _load_scope_and_program(body.program_id)
+    scope = program.scope
+
+    try:
+        sev = Severity(body.severity.lower())
+    except ValueError:
+        sev = Severity.medium
+
+    raw_output = json.dumps({
+        "title": body.title,
+        "description": body.description,
+        "steps_to_reproduce": body.steps_to_reproduce,
+        "_source": "manual",
+    })
+
+    finding = Finding(
+        id=str(uuid.uuid4()),
+        scan_id=body.scan_id or "manual",
+        program_id=body.program_id,
+        tool="manual",
+        title=body.title,
+        url=body.url,
+        severity=sev,
+        vuln_type=body.vuln_type,
+        raw_output=raw_output,
+    )
+
+    finding_dir = _finding_dir(body.program_id)
+    os.makedirs(os.path.join(finding_dir, "filtered"), exist_ok=True)
+
+    # Always approve manual findings (researcher already triaged)
+    finding_path = os.path.join(finding_dir, "filtered", f"{finding.id}.json")
+    async with aiofiles.open(finding_path, "w") as f:
+        await f.write(finding.model_dump_json(indent=2))
+
+    await database.save_finding(
+        finding_id=finding.id,
+        scan_id=finding.scan_id,
+        title=finding.title,
+        severity=finding.severity.value,
+        vuln_type=finding.vuln_type,
+        target=finding.url,
+        passed_filter=1,
+    )
+
+    # Generate report
+    report_data: dict = {}
+    try:
+        report = await report_generator.generate(finding, scope)
+        async with aiofiles.open(finding_path, "w") as f:
+            await f.write(finding.model_dump_json(indent=2))
+        report_data = {"report_id": report.id, "title": report.title}
+    except Exception as _rep_err:
+        report_data = {"error": str(_rep_err)}
+
+    if finding.severity in (Severity.critical, Severity.high):
+        await telegram_notifier.send_critical_finding(
+            program_name=program.name,
+            title=finding.title,
+            severity=finding.severity.value,
+            target=finding.url,
+        )
+
+    return ApiResponse(success=True, data={
+        "finding_id": finding.id,
+        "severity": finding.severity.value,
+        "report": report_data,
+    })
+

@@ -13,6 +13,10 @@ export default function PlanReview() {
   const [sessionCookies, setSessionCookies] = useState('')
   const [authHeader, setAuthHeader] = useState('')
   const [showAuth, setShowAuth] = useState(false)
+  const [scanMode, setScanMode] = useState('auto')
+  const [apiSpecUrl, setApiSpecUrl] = useState('')
+  const [repoUrl, setRepoUrl] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const calledRef = useRef(false)
 
   // On mount: generate plan (POST), then fetch it (GET)
@@ -57,6 +61,9 @@ export default function PlanReview() {
         approved_plan: plan,
         session_cookies: sessionCookies,
         auth_header: authHeader,
+        scan_mode: scanMode,
+        api_spec_url: apiSpecUrl,
+        repo_url: repoUrl,
       })
       navigate(`/programs/${programId}/scans/${res.data.data.id}`)
     } catch (e) {
@@ -185,15 +192,90 @@ export default function PlanReview() {
         )}
       </div>
 
+      {/* Advanced scan options */}
+      <div style={{ ...S.card, marginTop: 10 }}>
+        <button
+          type="button"
+          onClick={() => setShowAdvanced(v => !v)}
+          style={{ background: 'transparent', border: 'none', color: '#58a6ff', fontWeight: 600, padding: 0 }}
+        >
+          {showAdvanced ? '▼' : '▶'} Scan Mode & Advanced Options
+        </button>
+
+        {showAdvanced && (
+          <div style={{ marginTop: 12 }}>
+            <label style={S.label}>Scan Mode</label>
+            <select
+              value={scanMode}
+              onChange={e => setScanMode(e.target.value)}
+              style={{ ...S.input, marginTop: 6 }}
+            >
+              <option value="auto">Auto (detect from program type)</option>
+              <option value="web">Web (domain/subdomain pipeline)</option>
+              <option value="ip">IP / CIDR (masscan → nmap → httpx → nuclei)</option>
+              <option value="api">API (OpenAPI/Swagger spec)</option>
+              <option value="source_code">Source Code (gitleaks + semgrep + trufflehog)</option>
+            </select>
+
+            {scanMode === 'api' && (
+              <div style={{ marginTop: 12 }}>
+                <label style={S.label}>OpenAPI / Swagger Spec URL</label>
+                <input
+                  value={apiSpecUrl}
+                  onChange={e => setApiSpecUrl(e.target.value)}
+                  placeholder="https://api.example.com/openapi.json"
+                  style={{ ...S.input, marginTop: 6 }}
+                />
+              </div>
+            )}
+
+            {scanMode === 'source_code' && (
+              <div style={{ marginTop: 12 }}>
+                <label style={S.label}>Git Repository URL</label>
+                <input
+                  value={repoUrl}
+                  onChange={e => setRepoUrl(e.target.value)}
+                  placeholder="https://github.com/org/repo"
+                  style={{ ...S.input, marginTop: 6 }}
+                />
+              </div>
+            )}
+
+            {scanMode === 'ip' && (
+              <div style={{
+                marginTop: 10, fontSize: 12, color: '#58a6ff',
+                background: '#58a6ff11', border: '1px solid #58a6ff44',
+                borderRadius: 6, padding: '8px 10px',
+              }}>
+                IP/CIDR targets are taken from the program scope (in_scope_cidrs). Make sure the program
+                text includes IP ranges or CIDR blocks.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
         <button
           onClick={handleApprove}
-          disabled={phase === 'starting' || (scope && (scope.in_scope_domains?.length ?? 0) === 0)}
-          title={(scope && (scope.in_scope_domains?.length ?? 0) === 0) ? 'No in-scope domains — re-create the program' : ''}
+          disabled={
+            phase === 'starting' ||
+            (scanMode !== 'ip' && scanMode !== 'source_code' && scope && (scope.in_scope_domains?.length ?? 0) === 0)
+          }
+          title={
+            (scanMode !== 'ip' && scanMode !== 'source_code' && scope && (scope.in_scope_domains?.length ?? 0) === 0)
+              ? 'No in-scope domains — re-create the program'
+              : ''
+          }
           style={{
             ...S.btnPrimary,
-            opacity: (phase === 'starting' || (scope && (scope.in_scope_domains?.length ?? 0) === 0)) ? 0.4 : 1,
-            cursor: (scope && (scope.in_scope_domains?.length ?? 0) === 0) ? 'not-allowed' : 'pointer',
+            opacity: (
+              phase === 'starting' ||
+              (scanMode !== 'ip' && scanMode !== 'source_code' && scope && (scope.in_scope_domains?.length ?? 0) === 0)
+            ) ? 0.4 : 1,
+            cursor: (
+              scanMode !== 'ip' && scanMode !== 'source_code' && scope && (scope.in_scope_domains?.length ?? 0) === 0
+            ) ? 'not-allowed' : 'pointer',
           }}
         >
           {phase === 'starting' ? '⏳ Starting scan...' : '✓ Approve & Start Scan'}

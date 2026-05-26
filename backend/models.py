@@ -23,11 +23,12 @@ class ScanStatus(str, Enum):
 
 class Scope(BaseModel):
     in_scope_domains: list[str] = []
+    in_scope_cidrs: list[str] = []        # IP ranges / CIDRs for network scanning
     in_scope_urls: list[str] = []
     out_of_scope_domains: list[str] = []
     excluded_vuln_types: list[str] = []
     allowed_test_endpoints: list[str] = []
-    program_type: str = "web"  # web | api | blockchain | mobile | source_code
+    program_type: str = "web"  # web | api | ip | source_code | blockchain | mobile
     notes: str = ""
 
 
@@ -55,6 +56,9 @@ class ScanCreate(BaseModel):
     approved_plan: str  # user-approved plan (may differ from generated)
     session_cookies: str = ""   # "name=value; name2=value2"
     auth_header: str = ""       # "Bearer eyJ..."
+    scan_mode: str = "auto"     # auto | ip | api | source_code
+    api_spec_url: str = ""      # OpenAPI/Swagger spec URL or local path
+    repo_url: str = ""          # git repo URL for source_code mode
 
 
 class ScanJob(BaseModel):
@@ -67,6 +71,9 @@ class ScanJob(BaseModel):
     reports_count: int = 0
     session_cookies: str = ""
     auth_header: str = ""
+    scan_mode: str = "auto"       # auto | ip | api | source_code
+    api_spec_url: str = ""
+    repo_url: str = ""
 
 
 # --- Finding ---

@@ -8,6 +8,7 @@ import ReportsList from './components/ReportsList'
 import ProgramsList from './components/ProgramsList'
 import ProgramScorer from './components/ProgramScorer'
 import HistoryList from './components/HistoryList'
+import ManualFinding from './components/ManualFinding'
 
 const G = {
   bg: '#0d1117',
@@ -80,6 +81,7 @@ export default function App() {
           <Route path="/programs/:programId/scans/:scanId/findings" element={<FindingsList />} />
           <Route path="/programs/:programId/reports" element={<ReportsList />} />
           <Route path="/programs/:programId/reports/:reportId" element={<ReportViewer />} />
+          <Route path="/programs/:programId/manual-finding" element={<ManualFinding />} />
           <Route path="*" element={<Navigate to="/" />} />
         </Routes>
       </div>
