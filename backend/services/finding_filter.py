@@ -11,6 +11,7 @@ Rejected findings are saved to workspace/findings/rejected/ with reason.
 
 from backend.models import Finding, FilterResult, PocResult, Scope
 from backend.services import scope_parser, claude_service, poc_validator
+from backend.services import cve_enricher
 
 
 async def run_all_layers(
@@ -27,8 +28,25 @@ async def run_all_layers(
     if not passed:
         return False, f"[L1-Scope] {reason}"
 
-    # Layer 2: Claude impact assessment
-    passed, filter_result = await check_impact_layer(finding, scope, raw_program_text)
+    # EPSS + CISA KEV enrichment (before Claude so it can use the signal)
+    enrichment = await cve_enricher.enrich_finding(
+        raw_output=finding.raw_output,
+        title=finding.title,
+        tool=finding.tool,
+    )
+    # Apply automatic severity boost from EPSS/KEV before Claude sees it
+    boost = cve_enricher.severity_boost(enrichment)
+    if boost:
+        from backend.models import Severity
+        try:
+            current_weight = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informative": 4}
+            if current_weight.get(boost, 9) < current_weight.get(finding.severity.value, 9):
+                finding.severity = Severity(boost)
+        except Exception:
+            pass
+
+    # Layer 2: Claude impact assessment (enrichment injected via finding.raw_output annotation)
+    passed, filter_result = await check_impact_layer(finding, scope, raw_program_text, enrichment)
     if not passed:
         return False, f"[L2-Impact] {filter_result.reason}"
 
@@ -68,11 +86,15 @@ async def check_impact_layer(
     finding: Finding,
     scope: Scope,
     raw_program_text: str,
+    enrichment: dict | None = None,
 ) -> tuple[bool, FilterResult]:
     """
     Layer 2: Claude evaluates if finding has real business impact.
+    enrichment: optional EPSS/KEV dict from cve_enricher.enrich_finding()
     """
-    filter_result = await claude_service.filter_finding(finding, scope, raw_program_text)
+    filter_result = await claude_service.filter_finding(
+        finding, scope, raw_program_text, enrichment=enrichment
+    )
     return filter_result.approved, filter_result
 
 

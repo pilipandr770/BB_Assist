@@ -292,13 +292,29 @@ Return a well-structured, actionable markdown document."""
     return message.content[0].text
 
 
-async def filter_finding(finding: Finding, scope: Scope, raw_program_text: str) -> FilterResult:
+async def filter_finding(
+    finding: Finding,
+    scope: Scope,
+    raw_program_text: str,
+    enrichment: dict | None = None,
+) -> FilterResult:
     """
     Strict filter: decide if a finding deserves a H1 report.
+    enrichment: optional EPSS/KEV dict from cve_enricher (injected into prompt).
     Temperature 0 — never creative, always conservative.
     """
     finding_dict = finding.model_dump()
     scope_dict = scope.model_dump()
+
+    # Build EPSS/KEV context block if enrichment is available
+    _epss_kev_block = ""
+    if enrichment and enrichment.get("summary"):
+        kev_cves = [c for c, v in enrichment.get("kev", {}).items() if v]
+        _epss_kev_block = f"""
+CVE Intelligence (EPSS + CISA KEV):
+{enrichment['summary']}
+{"CRITICAL NOTE: " + ", ".join(kev_cves) + " appear in CISA's Known Exploited Vulnerabilities catalog — confirmed in-the-wild exploitation." if kev_cves else ""}
+"""
 
     system_prompt = """You are a senior HackerOne triage specialist. Your job is to pre-screen security findings before they waste a triager's time.
 
@@ -345,7 +361,7 @@ Program scope:
 
 Program rules (first 3000 chars):
 {raw_program_text[:3000]}
-
+{_epss_kev_block}
 Decision:"""
 
     message = await client.messages.create(
