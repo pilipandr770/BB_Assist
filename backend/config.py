@@ -19,8 +19,9 @@ class Settings(BaseSettings):
 
     # HackerOne researcher username — added as X-HackerOne-Researcher header to
     # all active-recon requests, as required by many H1 programs (e.g. Coupang).
-    h1_username: Optional[str] = None
-
+    h1_username: Optional[str] = None    # HackerOne API token for program discovery.
+    # Generate at: https://hackerone.com/settings/api_token/edit
+    h1_api_token: Optional[str] = None
     # Optional remote curated CVE CSV URL for version-based matching database.
     # If set, backend refreshes the local CSV on startup and then periodically.
     cve_csv_remote_url: Optional[str] = None

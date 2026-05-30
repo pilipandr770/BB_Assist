@@ -545,7 +545,20 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
             if prog_type == "ip":
                 _scan_mode = "ip"
             elif prog_type == "source_code" or job.repo_url:
-                _scan_mode = "source_code"
+                # Auto-fill repo_url from in_scope_urls if a GitHub/GitLab URL exists
+                if not job.repo_url:
+                    _git_urls = [
+                        u for u in (scope.in_scope_urls or [])
+                        if "github.com" in u or "gitlab.com" in u or "bitbucket.org" in u
+                    ]
+                    if _git_urls:
+                        job.repo_url = _git_urls[0]
+                        await _save_job(job, program_id)
+                # Fall back to web scan if source_code but no repo available
+                if job.repo_url:
+                    _scan_mode = "source_code"
+                else:
+                    _scan_mode = "web"
             elif prog_type == "api" or job.api_spec_url:
                 _scan_mode = "api"
             else:
@@ -2199,7 +2212,18 @@ async def start_scan(body: ScanCreate):
     program = await _load_scope_and_program(body.program_id)
     _effective_mode = (body.scan_mode or "auto").lower()
     _is_ip_mode = _effective_mode == "ip" or (program.scope and (program.scope.in_scope_cidrs or []))
-    _is_src_mode = _effective_mode == "source_code" or bool(body.repo_url)
+
+    # Also consider scope.program_type + in_scope_urls for source_code detection
+    _scope_prog_type = (program.scope.program_type or "web").lower() if program.scope else "web"
+    _has_git_urls = any(
+        "github.com" in u or "gitlab.com" in u or "bitbucket.org" in u
+        for u in (program.scope.in_scope_urls or [])
+    ) if program.scope else False
+    _is_src_mode = (
+        _effective_mode == "source_code"
+        or bool(body.repo_url)
+        or (_scope_prog_type == "source_code" and _has_git_urls)
+    )
 
     # For IP/source_code modes domains are not required
     if not _is_ip_mode and not _is_src_mode:

@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate, Link, useLocation } from 'react-router-dom'
+import { useState, useEffect } from 'react'
 import ProgramInput from './components/ProgramInput'
 import PlanReview from './components/PlanReview'
 import ScanProgress from './components/ScanProgress'
@@ -9,6 +10,7 @@ import ProgramsList from './components/ProgramsList'
 import ProgramScorer from './components/ProgramScorer'
 import HistoryList from './components/HistoryList'
 import ManualFinding from './components/ManualFinding'
+import ProgramDiscovery from './components/ProgramDiscovery'
 
 const G = {
   bg: '#0d1117',
@@ -40,11 +42,39 @@ const globalCss = `
   input, textarea { font-family: inherit; }
 `
 
+function StatusDot({ ok, label }) {
+  return (
+    <span
+      title={label}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 5,
+        fontSize: 11, color: ok ? G.green : G.muted,
+        cursor: 'default', userSelect: 'none',
+      }}
+    >
+      <span style={{
+        width: 7, height: 7, borderRadius: '50%',
+        background: ok ? G.green : G.border,
+        flexShrink: 0,
+      }} />
+      {label}
+    </span>
+  )
+}
+
 function Nav() {
   const loc = useLocation()
   const active = (path) => loc.pathname === path
     ? { color: G.text, borderBottom: `2px solid ${G.accent}`, paddingBottom: 2 }
     : { color: G.muted }
+
+  const [status, setStatus] = useState(null)
+  useEffect(() => {
+    fetch('/api/discover/status')
+      .then(r => r.json())
+      .then(setStatus)
+      .catch(() => {})
+  }, [])
 
   return (
     <nav style={{
@@ -60,6 +90,27 @@ function Nav() {
         <Link to="/scorer" style={active('/scorer')}>Program Scorer</Link>
         <Link to="/programs" style={active('/programs')}>My Programs</Link>
         <Link to="/history" style={active('/history')}>History</Link>
+        <Link to="/discover" style={active('/discover')}>Discover H1</Link>
+      </div>
+      <div style={{ marginLeft: 'auto', display: 'flex', gap: 12, alignItems: 'center' }}>
+        {status && (
+          <>
+            <StatusDot
+              ok={status.h1?.configured}
+              label={status.h1?.configured ? `H1: @${status.h1.username}` : 'H1: not set'}
+            />
+            <StatusDot
+              ok={status.telegram?.bot_username != null}
+              label={
+                status.telegram?.bot_username
+                  ? `TG: @${status.telegram.bot_username}`
+                  : status.telegram?.configured
+                    ? 'TG: connecting…'
+                    : 'TG: not set'
+              }
+            />
+          </>
+        )}
       </div>
     </nav>
   )
@@ -82,6 +133,7 @@ export default function App() {
           <Route path="/programs/:programId/reports" element={<ReportsList />} />
           <Route path="/programs/:programId/reports/:reportId" element={<ReportViewer />} />
           <Route path="/programs/:programId/manual-finding" element={<ManualFinding />} />
+          <Route path="/discover" element={<ProgramDiscovery />} />
           <Route path="*" element={<Navigate to="/" />} />
         </Routes>
       </div>
