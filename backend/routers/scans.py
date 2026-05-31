@@ -2355,8 +2355,10 @@ async def stream_scan(program_id: str, scan_id: str, request: Request):
                                     from datetime import timezone
                                     last_ts = datetime.fromisoformat(last_ts_str)
                                     age_s = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds()
-                                    if age_s > 60:
-                                        # Last event is >60s old and nothing new → zombie
+                                    # Long-running phases (e.g., nuclei/source scans) can be quiet for minutes.
+                                    # Use a conservative threshold to avoid false-positive interruption errors.
+                                    if age_s > 900:
+                                        # Last event is >15 minutes old and nothing new → likely zombie
                                         try:
                                             stale_job = await _load_job(program_id, scan_id)
                                             if stale_job.status not in (ScanStatus.done, ScanStatus.failed):
