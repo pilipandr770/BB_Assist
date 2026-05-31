@@ -25,17 +25,17 @@ async def init_db() -> None:
               started_at TIMESTAMP,
               finished_at TIMESTAMP,
               findings_count INTEGER DEFAULT 0,
-                            reports_count INTEGER DEFAULT 0,
-                            llm_cost_usd REAL DEFAULT 0,
+              reports_count INTEGER DEFAULT 0,
+              llm_cost_usd REAL DEFAULT 0,
               FOREIGN KEY (program_id) REFERENCES programs(id)
             )
             """
         )
-                # Backward-compatible migration for existing DBs created before llm_cost_usd.
-                cur = await db.execute("PRAGMA table_info(scans)")
-                cols = [r[1] for r in await cur.fetchall()]
-                if "llm_cost_usd" not in cols:
-                        await db.execute("ALTER TABLE scans ADD COLUMN llm_cost_usd REAL DEFAULT 0")
+        # Backward-compatible migration for existing DBs created before llm_cost_usd.
+        cur = await db.execute("PRAGMA table_info(scans)")
+        cols = [r[1] for r in await cur.fetchall()]
+        if "llm_cost_usd" not in cols:
+            await db.execute("ALTER TABLE scans ADD COLUMN llm_cost_usd REAL DEFAULT 0")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS findings (
