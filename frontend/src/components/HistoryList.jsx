@@ -44,7 +44,7 @@ export default function HistoryList() {
     <div style={{ maxWidth: 980 }}>
       <h1 style={{ fontSize: 22, color: '#f0883e', marginBottom: 10 }}>History</h1>
       <p style={{ color: '#8b949e', marginBottom: 16 }}>
-        Program name, last scan date, total scans and findings.
+        Program name, last scan date, total scans/findings, and estimated LLM cost.
       </p>
 
       {loading && <div style={{ color: '#8b949e' }}>Loading history...</div>}
@@ -59,6 +59,7 @@ export default function HistoryList() {
                 <th style={th}>Last scan</th>
                 <th style={th}>Total scans</th>
                 <th style={th}>Total findings</th>
+                <th style={th}>LLM cost</th>
                 <th style={th}>Actions</th>
               </tr>
             </thead>
@@ -69,6 +70,7 @@ export default function HistoryList() {
                   <td style={td}>{r.last_scan_at ? new Date(r.last_scan_at).toLocaleString() : '-'}</td>
                   <td style={td}>{r.scan_count}</td>
                   <td style={td}>{r.total_findings}</td>
+                  <td style={td}>${Number(r.total_llm_cost_usd || 0).toFixed(4)}</td>
                   <td style={td}>
                     <button style={btn} onClick={() => viewProgram(r.id)}>View</button>
                     <button style={btn} onClick={() => rescan(r.id)}>Rescan</button>
@@ -88,7 +90,7 @@ export default function HistoryList() {
             {(selected.scans || []).map((s) => (
               <div key={s.id} style={{ border: '1px solid #30363d', borderRadius: 6, padding: 8 }}>
                 <div style={{ color: '#c9d1d9', fontSize: 13 }}>
-                  {s.id} · {s.status} · findings {s.findings_count} · reports {s.reports_count}
+                  {s.id} · {s.status} · findings {s.findings_count} · reports {s.reports_count} · llm ${Number(s.llm_cost_usd || 0).toFixed(4)}
                 </div>
                 <div style={{ marginTop: 6 }}>
                   <button style={btn} onClick={() => navigate(`/programs/${selected.id}/scans/${s.id}`)}>Open scan</button>

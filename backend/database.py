@@ -25,11 +25,17 @@ async def init_db() -> None:
               started_at TIMESTAMP,
               finished_at TIMESTAMP,
               findings_count INTEGER DEFAULT 0,
-              reports_count INTEGER DEFAULT 0,
+                            reports_count INTEGER DEFAULT 0,
+                            llm_cost_usd REAL DEFAULT 0,
               FOREIGN KEY (program_id) REFERENCES programs(id)
             )
             """
         )
+                # Backward-compatible migration for existing DBs created before llm_cost_usd.
+                cur = await db.execute("PRAGMA table_info(scans)")
+                cols = [r[1] for r in await cur.fetchall()]
+                if "llm_cost_usd" not in cols:
+                        await db.execute("ALTER TABLE scans ADD COLUMN llm_cost_usd REAL DEFAULT 0")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS findings (
@@ -70,13 +76,14 @@ async def save_scan(
     finished_at: str | None = None,
     findings_count: int = 0,
     reports_count: int = 0,
+    llm_cost_usd: float = 0.0,
 ) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT OR REPLACE INTO scans(
-              id, program_id, status, started_at, finished_at, findings_count, reports_count
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+              id, program_id, status, started_at, finished_at, findings_count, reports_count, llm_cost_usd
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scan_id,
@@ -86,6 +93,7 @@ async def save_scan(
                 finished_at,
                 findings_count,
                 reports_count,
+                llm_cost_usd,
             ),
         )
         await db.commit()
@@ -98,6 +106,7 @@ async def update_scan_status(
     finished_at: str | None = None,
     findings_count: int | None = None,
     reports_count: int | None = None,
+    llm_cost_usd: float | None = None,
 ) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -107,10 +116,11 @@ async def update_scan_status(
                 started_at = COALESCE(?, started_at),
                 finished_at = COALESCE(?, finished_at),
                 findings_count = COALESCE(?, findings_count),
-                reports_count = COALESCE(?, reports_count)
+                reports_count = COALESCE(?, reports_count),
+                llm_cost_usd = COALESCE(?, llm_cost_usd)
             WHERE id = ?
             """,
-            (status, started_at, finished_at, findings_count, reports_count, scan_id),
+            (status, started_at, finished_at, findings_count, reports_count, llm_cost_usd, scan_id),
         )
         await db.commit()
 
@@ -148,6 +158,7 @@ async def get_program_history() -> list[dict]:
               COUNT(s.id) AS scan_count,
               COALESCE(SUM(s.findings_count), 0) AS total_findings,
               COALESCE(SUM(s.reports_count), 0) AS total_reports,
+                            COALESCE(SUM(s.llm_cost_usd), 0) AS total_llm_cost_usd,
               MAX(COALESCE(s.finished_at, s.started_at)) AS last_scan_at
             FROM programs p
             LEFT JOIN scans s ON s.program_id = p.id
@@ -173,7 +184,7 @@ async def get_program_detail(program_id: str) -> dict | None:
 
         scur = await db.execute(
             """
-            SELECT id, program_id, status, started_at, finished_at, findings_count, reports_count
+            SELECT id, program_id, status, started_at, finished_at, findings_count, reports_count, llm_cost_usd
             FROM scans
             WHERE program_id = ?
             ORDER BY COALESCE(finished_at, started_at) DESC
@@ -193,7 +204,7 @@ async def get_scan_findings(scan_id: str) -> dict:
 
         scan_cur = await db.execute(
             """
-            SELECT id, program_id, status, started_at, finished_at, findings_count, reports_count
+            SELECT id, program_id, status, started_at, finished_at, findings_count, reports_count, llm_cost_usd
             FROM scans WHERE id = ?
             """,
             (scan_id,),

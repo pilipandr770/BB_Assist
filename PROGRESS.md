@@ -81,6 +81,48 @@
 - [x] UI: `finding_error` event handled
 - [x] UI: `passive_recon_detail` added to PHASE_LABELS
 - [x] UI: `sqli_validation` added to PHASE_LABELS
+- [x] Anthropic model router with task-specific models + fallback chain
+- [x] LLM usage accounting (calls/tokens/estimated USD) in `claude_service`
+- [x] Scan pipeline now emits `llm_usage` SSE event on completion/failure
+- [x] UI: `llm_usage` event displayed + live "LLM Cost" status field
+- [x] Expanded no-automation policy keyword detection (`manual preferred` / `refrain` variants)
+- [x] Added unit tests for model chain + usage delta logic (`backend/tests/test_claude_routing.py`)
+- [x] Persisted per-scan `llm_cost_usd` in SQLite (`scans` table) with backward-compatible migration
+- [x] History API/UX now shows aggregated and per-scan LLM cost
+- [x] Extracted automation-policy matcher to `backend/services/policy_rules.py`
+- [x] Extracted passive target selection to `backend/services/scan_targets.py`
+- [x] Extracted passive recon orchestration to `backend/services/phases/passive_recon_phase.py`
+- [x] Extracted active recon core (subfinder/dnsx/nmap) to `backend/services/phases/active_recon_phase.py`
+- [x] Extracted URL recon phase (httpx/fallbacks/gau/katana/cred detection) to `backend/services/phases/url_recon_phase.py`
+- [x] Extracted GitHub dork phase to `backend/services/phases/github_dork_phase.py`
+- [x] Extracted content discovery + JS scanning phase to `backend/services/phases/content_and_js_phase.py`
+- [x] Extracted appsec probe phase (403 bypass + arjun + dalfox) to `backend/services/phases/appsec_probe_phase.py`
+- [x] Extracted security surface phase (cors/takeover/email/swagger/s3) to `backend/services/phases/security_surface_phase.py`
+- [x] Extracted finding aggregation helpers to `backend/services/phases/finding_aggregation_phase.py`
+- [x] Extracted filtering/reporting phase (sqli validation + filter + report generation) to `backend/services/phases/filtering_reporting_phase.py`
+- [x] Extracted non-web pipeline phase (ip/source_code/api modes) to `backend/services/phases/non_web_pipeline_phase.py`
+- [x] Extracted scan finalization helpers (done/failed status + LLM usage + notifications) to `backend/services/phases/scan_finalize_phase.py`
+- [x] Extracted raw findings persistence for non-web pipelines to `backend/services/phases/persist_raw_findings_phase.py`
+- [x] Extracted pipeline mode/policy resolver (auto mode + feature toggles) to `backend/services/phases/pipeline_mode_phase.py`
+- [x] Extracted delta history flow (baseline load, new surface diff, history save) to `backend/services/phases/delta_history_phase.py`
+- [x] Extracted full web pipeline orchestration (Phase 1 passive → Phase 4 filter) to `backend/services/phases/web_pipeline_phase.py`; also moved `select_nuclei_targets`, `select_ffuf_targets`, `nuclei_to_finding` there; `_run_scan_pipeline` in `scans.py` reduced to ~50 lines
+- [x] Extracted httpx target and generated fallback URL helpers in `backend/services/scan_targets.py`
+- [x] Replaced in-router GAU apex dedupe with shared `select_passive_domains` helper
+- [x] Added tests for policy matcher and passive target selector
+- [x] Added active recon phase unit test scaffold (`backend/tests/test_active_recon_phase.py`)
+- [x] Added URL recon phase unit test scaffold (`backend/tests/test_url_recon_phase.py`)
+- [x] Added GitHub dork phase unit test scaffold (`backend/tests/test_github_dork_phase.py`)
+- [x] Added content/js phase unit test scaffold (`backend/tests/test_content_and_js_phase.py`)
+- [x] Added appsec probe phase unit test scaffold (`backend/tests/test_appsec_probe_phase.py`)
+- [x] Added security surface phase unit test scaffold (`backend/tests/test_security_surface_phase.py`)
+- [x] Added finding aggregation phase unit test scaffold (`backend/tests/test_finding_aggregation_phase.py`)
+- [x] Added filtering/reporting phase unit test scaffold (`backend/tests/test_filtering_reporting_phase.py`)
+- [x] Added non-web pipeline phase unit test scaffold (`backend/tests/test_non_web_pipeline_phase.py`)
+- [x] Added scan finalization phase unit test scaffold (`backend/tests/test_scan_finalize_phase.py`)
+- [x] Added raw findings persistence phase unit test scaffold (`backend/tests/test_persist_raw_findings_phase.py`)
+- [x] Added pipeline mode phase unit test scaffold (`backend/tests/test_pipeline_mode_phase.py`)
+- [x] Added delta history phase unit test scaffold (`backend/tests/test_delta_history_phase.py`)
+- [x] Added web pipeline phase unit test scaffold (`backend/tests/test_web_pipeline_phase.py`)
 
 ### Next improvements to make
 - [ ] **Nuclei template curator** — detect WordPress/Jenkins/Jira and run targeted CVE subdirs

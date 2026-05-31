@@ -4,6 +4,23 @@ from typing import Optional
 
 class Settings(BaseSettings):
     anthropic_api_key: str
+    anthropic_model_scope: str = "claude-haiku-4-5"
+    anthropic_model_plan: str = "claude-sonnet-4-6"
+    anthropic_model_filter: str = "claude-sonnet-4-6"
+    anthropic_model_poc: str = "claude-sonnet-4-6"
+    anthropic_model_report: str = "claude-opus-4-7"
+    anthropic_model_rewrite: str = "claude-sonnet-4-6"
+    # Comma-separated model list tried after the task-specific primary model.
+    anthropic_model_fallbacks: str = "claude-sonnet-4-6,claude-haiku-4-5"
+
+    # Estimated per-1M token pricing used for UI scan-cost telemetry.
+    anthropic_cost_opus_input_per_mtok: float = 15.0
+    anthropic_cost_opus_output_per_mtok: float = 75.0
+    anthropic_cost_sonnet_input_per_mtok: float = 3.0
+    anthropic_cost_sonnet_output_per_mtok: float = 15.0
+    anthropic_cost_haiku_input_per_mtok: float = 0.8
+    anthropic_cost_haiku_output_per_mtok: float = 4.0
+
     redis_url: str = "redis://localhost:6379"
     workspace_dir: str = "/app/workspace"
     log_level: str = "INFO"

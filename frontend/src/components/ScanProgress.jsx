@@ -11,6 +11,7 @@ const EVENT_COLORS = {
   pipeline_config: '#8b949e',
   tech_detected: '#a371f7',
   service_versions: '#79c0ff',
+  llm_usage: '#79c0ff',
   finding_approved: '#f0883e',
   finding_rejected: '#6e7681',
   finding_evaluating: '#d29922',
@@ -53,7 +54,7 @@ export default function ScanProgress() {
   const navigate = useNavigate()
 
   const [lines, setLines] = useState([])
-  const [stats, setStats] = useState({ approved: 0, rejected: 0, reports: 0 })
+  const [stats, setStats] = useState({ approved: 0, rejected: 0, reports: 0, llmCost: 0 })
   const [phase, setPhase] = useState('Initializing...')
   const [done, setDone] = useState(false)
   const [failed, setFailed] = useState(false)
@@ -223,8 +224,18 @@ export default function ScanProgress() {
         addLine(`  ✗ Report failed for finding ${data.finding_id}: ${data.error}`, color)
         break
 
+      case 'llm_usage': {
+        const cost = Number(data.estimated_cost_usd || 0)
+        setStats(s => ({ ...s, llmCost: cost }))
+        addLine(
+          `  🤖 LLM usage: ${data.calls || 0} calls, in=${data.input_tokens || 0}, out=${data.output_tokens || 0}, cost=$${cost.toFixed(4)}`,
+          color,
+        )
+        break
+      }
+
       case 'scan_done':
-        setStats({ approved: data.approved, rejected: data.rejected, reports: data.reports })
+        setStats(s => ({ ...s, approved: data.approved, rejected: data.rejected, reports: data.reports }))
         addLine(
           `\n✓ SCAN COMPLETE — ${data.approved} approved, ${data.rejected} rejected, ${data.reports} reports`,
           color,
@@ -263,6 +274,7 @@ export default function ScanProgress() {
           <StatusItem label="Approved" value={stats.approved} color="#f0883e" />
           <StatusItem label="Rejected" value={stats.rejected} color="#6e7681" />
           <StatusItem label="Reports" value={stats.reports} color="#3fb950" />
+          <StatusItem label="LLM Cost" value={`$${Number(stats.llmCost || 0).toFixed(4)}`} color="#79c0ff" />
         </div>
       </div>
 

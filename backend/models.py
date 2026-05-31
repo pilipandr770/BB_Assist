@@ -69,6 +69,7 @@ class ScanJob(BaseModel):
     finished_at: Optional[datetime] = None
     findings_count: int = 0
     reports_count: int = 0
+    llm_cost_usd: float = 0.0
     session_cookies: str = ""
     auth_header: str = ""
     scan_mode: str = "auto"       # auto | ip | api | source_code
@@ -141,6 +142,7 @@ class HistoryProgram(BaseModel):
     scan_count: int = 0
     total_findings: int = 0
     total_reports: int = 0
+    total_llm_cost_usd: float = 0.0
     last_scan_at: Optional[str] = None
 
 
@@ -152,6 +154,7 @@ class HistoryScan(BaseModel):
     finished_at: Optional[str] = None
     findings_count: int = 0
     reports_count: int = 0
+    llm_cost_usd: float = 0.0
 
 
 class HistoryFinding(BaseModel):

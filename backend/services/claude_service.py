@@ -12,13 +12,195 @@ Five functions:
 import json
 import logging
 import re
+from threading import Lock
+
 import anthropic
 from backend.config import settings
 from backend.models import Scope, Finding, FilterResult, PocResult, Severity
 
 client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-MODEL = "claude-sonnet-4-6"
 log = logging.getLogger("claude_service")
+
+
+_TASK_MODELS = {
+    "scope": settings.anthropic_model_scope,
+    "plan": settings.anthropic_model_plan,
+    "filter": settings.anthropic_model_filter,
+    "poc": settings.anthropic_model_poc,
+    "report": settings.anthropic_model_report,
+    "rewrite": settings.anthropic_model_rewrite,
+}
+
+
+def _fallback_models() -> list[str]:
+    raw = settings.anthropic_model_fallbacks or ""
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def _model_chain(task: str) -> list[str]:
+    first = _TASK_MODELS.get(task) or settings.anthropic_model_plan
+    chain = [first]
+    for m in _fallback_models():
+        if m not in chain:
+            chain.append(m)
+    return chain
+
+
+def _model_pricing_per_mtok(model: str) -> tuple[float, float]:
+    m = (model or "").lower()
+    if "opus" in m:
+        return (
+            settings.anthropic_cost_opus_input_per_mtok,
+            settings.anthropic_cost_opus_output_per_mtok,
+        )
+    if "haiku" in m:
+        return (
+            settings.anthropic_cost_haiku_input_per_mtok,
+            settings.anthropic_cost_haiku_output_per_mtok,
+        )
+    return (
+        settings.anthropic_cost_sonnet_input_per_mtok,
+        settings.anthropic_cost_sonnet_output_per_mtok,
+    )
+
+
+_USAGE_LOCK = Lock()
+_USAGE_TOTALS = {
+    "calls": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "estimated_cost_usd": 0.0,
+    "by_task": {},
+    "by_model": {},
+}
+
+
+def _usage_increment(task: str, model: str, input_tokens: int, output_tokens: int) -> None:
+    in_price, out_price = _model_pricing_per_mtok(model)
+    est_cost = ((input_tokens * in_price) + (output_tokens * out_price)) / 1_000_000
+
+    with _USAGE_LOCK:
+        _USAGE_TOTALS["calls"] += 1
+        _USAGE_TOTALS["input_tokens"] += int(input_tokens)
+        _USAGE_TOTALS["output_tokens"] += int(output_tokens)
+        _USAGE_TOTALS["estimated_cost_usd"] += float(est_cost)
+
+        by_task = _USAGE_TOTALS["by_task"].setdefault(task, {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        })
+        by_task["calls"] += 1
+        by_task["input_tokens"] += int(input_tokens)
+        by_task["output_tokens"] += int(output_tokens)
+        by_task["estimated_cost_usd"] += float(est_cost)
+
+        by_model = _USAGE_TOTALS["by_model"].setdefault(model, {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        })
+        by_model["calls"] += 1
+        by_model["input_tokens"] += int(input_tokens)
+        by_model["output_tokens"] += int(output_tokens)
+        by_model["estimated_cost_usd"] += float(est_cost)
+
+
+def get_usage_snapshot() -> dict:
+    with _USAGE_LOCK:
+        return {
+            "calls": _USAGE_TOTALS["calls"],
+            "input_tokens": _USAGE_TOTALS["input_tokens"],
+            "output_tokens": _USAGE_TOTALS["output_tokens"],
+            "estimated_cost_usd": round(_USAGE_TOTALS["estimated_cost_usd"], 6),
+            "by_task": {
+                k: {
+                    "calls": v["calls"],
+                    "input_tokens": v["input_tokens"],
+                    "output_tokens": v["output_tokens"],
+                    "estimated_cost_usd": round(v["estimated_cost_usd"], 6),
+                }
+                for k, v in _USAGE_TOTALS["by_task"].items()
+            },
+            "by_model": {
+                k: {
+                    "calls": v["calls"],
+                    "input_tokens": v["input_tokens"],
+                    "output_tokens": v["output_tokens"],
+                    "estimated_cost_usd": round(v["estimated_cost_usd"], 6),
+                }
+                for k, v in _USAGE_TOTALS["by_model"].items()
+            },
+        }
+
+
+def _usage_diff(after: dict, before: dict) -> dict:
+    out = {
+        "calls": max(0, int(after.get("calls", 0)) - int(before.get("calls", 0))),
+        "input_tokens": max(0, int(after.get("input_tokens", 0)) - int(before.get("input_tokens", 0))),
+        "output_tokens": max(0, int(after.get("output_tokens", 0)) - int(before.get("output_tokens", 0))),
+        "estimated_cost_usd": round(max(0.0, float(after.get("estimated_cost_usd", 0.0)) - float(before.get("estimated_cost_usd", 0.0))), 6),
+        "by_task": {},
+        "by_model": {},
+    }
+    for bucket in ("by_task", "by_model"):
+        after_bucket = after.get(bucket, {}) or {}
+        before_bucket = before.get(bucket, {}) or {}
+        keys = set(after_bucket.keys()) | set(before_bucket.keys())
+        for key in keys:
+            a = after_bucket.get(key, {})
+            b = before_bucket.get(key, {})
+            diff_item = {
+                "calls": max(0, int(a.get("calls", 0)) - int(b.get("calls", 0))),
+                "input_tokens": max(0, int(a.get("input_tokens", 0)) - int(b.get("input_tokens", 0))),
+                "output_tokens": max(0, int(a.get("output_tokens", 0)) - int(b.get("output_tokens", 0))),
+                "estimated_cost_usd": round(max(0.0, float(a.get("estimated_cost_usd", 0.0)) - float(b.get("estimated_cost_usd", 0.0))), 6),
+            }
+            if diff_item["calls"] or diff_item["input_tokens"] or diff_item["output_tokens"]:
+                out[bucket][key] = diff_item
+    return out
+
+
+def usage_delta_since(snapshot: dict) -> dict:
+    return _usage_diff(get_usage_snapshot(), snapshot)
+
+
+def _extract_usage(message) -> tuple[int, int]:
+    usage = getattr(message, "usage", None)
+    if usage is None:
+        return 0, 0
+
+    in_tokens = getattr(usage, "input_tokens", None)
+    out_tokens = getattr(usage, "output_tokens", None)
+
+    if in_tokens is None and isinstance(usage, dict):
+        in_tokens = usage.get("input_tokens")
+    if out_tokens is None and isinstance(usage, dict):
+        out_tokens = usage.get("output_tokens")
+
+    return int(in_tokens or 0), int(out_tokens or 0)
+
+
+async def _create_message(task: str, **kwargs):
+    chain = _model_chain(task)
+    last_error = None
+    for model in chain:
+        try:
+            message = await client.messages.create(model=model, **kwargs)
+            in_tokens, out_tokens = _extract_usage(message)
+            _usage_increment(task=task, model=model, input_tokens=in_tokens, output_tokens=out_tokens)
+            return message
+        except Exception as exc:
+            last_error = exc
+            log.warning("LLM call failed task=%s model=%s err=%s", task, model, str(exc)[:220])
+            continue
+
+    raise RuntimeError(
+        f"All configured Anthropic models failed for task='{task}': {chain}. "
+        f"Last error: {last_error}"
+    )
 
 
 def _strip_json(text: str) -> str:
@@ -184,8 +366,8 @@ CRITICAL — Domain extraction rules:
 Program text:
 {raw_program_text}"""
 
-    message = await client.messages.create(
-        model=MODEL,
+    message = await _create_message(
+        task="scope",
         max_tokens=4000,
         temperature=0,
         messages=[{"role": "user", "content": prompt}],
@@ -202,8 +384,8 @@ Program text:
         "Output JSON only, no prose, no markdown:\n\n"
         f"{raw_text[:5000]}"
     )
-    repair_message = await client.messages.create(
-        model=MODEL,
+    repair_message = await _create_message(
+        task="scope",
         max_tokens=2000,
         temperature=0,
         messages=[{"role": "user", "content": repair_prompt}],
@@ -282,8 +464,8 @@ In-scope domains: {', '.join(scope.in_scope_domains) or 'See notes'}
 
 Return a well-structured, actionable markdown document."""
 
-    message = await client.messages.create(
-        model=MODEL,
+    message = await _create_message(
+        task="plan",
         max_tokens=6000,
         temperature=0.3,
         messages=[{"role": "user", "content": prompt}],
@@ -364,8 +546,8 @@ Program rules (first 3000 chars):
 {_epss_kev_block}
 Decision:"""
 
-    message = await client.messages.create(
-        model=MODEL,
+    message = await _create_message(
+        task="filter",
         max_tokens=500,
         temperature=0,
         system=system_prompt,
@@ -444,8 +626,8 @@ PoC output:
 
 Is this confirmed?"""
 
-    message = await client.messages.create(
-        model=MODEL,
+    message = await _create_message(
+        task="poc",
         max_tokens=800,
         temperature=0,
         system=system_prompt,
@@ -603,8 +785,8 @@ import requests
 ## Recommended Fix
 [Concrete, actionable remediation steps specific to this vulnerability type and stack. Include code examples where possible.]"""
 
-    message = await client.messages.create(
-        model=MODEL,
+    message = await _create_message(
+        task="report",
         max_tokens=4500,
         temperature=0.5,
         system=system_prompt,
@@ -629,8 +811,8 @@ Report to rewrite:
 {report_md}
 """
 
-        rewrite = await client.messages.create(
-            model=MODEL,
+        rewrite = await _create_message(
+            task="rewrite",
             max_tokens=4500,
             temperature=0.2,
             system="You are a strict technical editor for bug bounty reports.",
@@ -662,8 +844,8 @@ Report to revise:
 {report_md}
 """
 
-    rewrite = await client.messages.create(
-        model=MODEL,
+    rewrite = await _create_message(
+        task="rewrite",
         max_tokens=4500,
         temperature=0.2,
         system="You are a strict technical editor for bug bounty reports.",
