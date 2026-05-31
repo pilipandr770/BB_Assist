@@ -55,7 +55,7 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
 
 # Install trufflehog (standalone binary, pinned version)
 RUN wget -q -O /tmp/trufflehog.tar.gz \
-    "https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.3/trufflehog_Linux_x86_64.tar.gz" \
+    "https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.3/trufflehog_3.88.3_linux_amd64.tar.gz" \
     && tar -C /usr/local/bin -xzf /tmp/trufflehog.tar.gz trufflehog \
     && chmod +x /usr/local/bin/trufflehog \
     && rm /tmp/trufflehog.tar.gz
