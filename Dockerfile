@@ -53,9 +53,10 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     go install -v github.com/zricethezav/gitleaks/v8/cmd/gitleaks@latest && \
     go install -v github.com/infosec-au/altdns@latest 2>/dev/null || true
 
-# Install trufflehog (standalone binary)
-RUN wget -q -O /tmp/trufflehog.tar.gz \
-      "https://github.com/trufflesecurity/trufflehog/releases/latest/download/trufflehog_linux_amd64.tar.gz" && \
+# Install trufflehog (standalone binary, pinned version)
+RUN TRUFFLEHOG_VER="3.88.3" && \
+    wget -q -O /tmp/trufflehog.tar.gz \
+      "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VER}/trufflehog_Linux_x86_64.tar.gz" && \
     tar -C /usr/local/bin -xzf /tmp/trufflehog.tar.gz trufflehog && \
     chmod +x /usr/local/bin/trufflehog && \
     rm /tmp/trufflehog.tar.gz
