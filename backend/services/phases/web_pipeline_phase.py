@@ -330,6 +330,8 @@ async def run_web_pipeline(
     all_target_urls = phase_appsec["all_target_urls"]
     bypasses = phase_appsec["bypasses"]
     dalfox_findings = phase_appsec["dalfox_findings"]
+    graphql_findings = phase_appsec.get("graphql_findings", [])
+    jwt_findings = phase_appsec.get("jwt_findings", [])
 
     # Security surface (CORS, takeover, email, swagger, S3)
     phase_surface = await run_security_surface_phase(
@@ -348,6 +350,12 @@ async def run_web_pipeline(
     swagger_findings = phase_surface["swagger_findings"]
     s3_findings = phase_surface["s3_findings"]
 
+    # ── Phase 2.9: Interactsh OOB setup ──────────────────────────────────────
+    interactsh_session = await tool_runner.run_interactsh_client(scan_dir)
+    oob_domain = interactsh_session.get("oob_domain", "")
+    if oob_domain:
+        await emit("tool_done", {"tool": "interactsh", "detail": f"OOB domain: {oob_domain}"})
+
     # ── Phase 3: Nuclei ───────────────────────────────────────────────────────
     raw_findings: list[dict] = []
     await emit("phase_start", {"phase": "nuclei_scan"})
@@ -356,7 +364,8 @@ async def run_web_pipeline(
         nuclei_urls = select_nuclei_targets(all_target_urls, live_urls, max_urls=500)
         await emit("tool_start", {
             "tool": "nuclei",
-            "detail": f"{len(nuclei_urls)} targets (of {len(all_target_urls)} total)",
+            "detail": f"{len(nuclei_urls)} targets (of {len(all_target_urls)} total)"
+                      + (f" + OOB:{oob_domain}" if oob_domain else ""),
         })
 
         nuclei_out = os.path.join(scan_dir, "nuclei.jsonl")
@@ -377,9 +386,29 @@ async def run_web_pipeline(
                 detected_techs=detected_techs,
                 session_cookies=job.session_cookies,
                 auth_header=job.auth_header,
+                interactsh_url=oob_domain,
             )
         finally:
             ticker_task.cancel()
+
+        # Collect any OOB callbacks triggered during nuclei scan
+        if oob_domain and interactsh_session.get("output_file"):
+            oob_callbacks = await tool_runner.read_interactsh_callbacks(
+                interactsh_session["output_file"]
+            )
+            for cb in oob_callbacks:
+                raw_findings.append({
+                    "_source": "interactsh",
+                    "info": {
+                        "name": f"Out-of-Band Callback Detected ({cb.get('protocol', 'unknown').upper()})",
+                        "severity": "high",
+                        "tags": ["oob", "ssrf", "blind"],
+                        "description": f"OOB callback via {cb.get('protocol', '?')} from {cb.get('remote-address', '?')}",
+                    },
+                    "matched-at": cb.get("full-id", oob_domain),
+                    "type": "oob-callback",
+                    "raw_callback": cb,
+                })
 
         await emit("phase_done", {"phase": "nuclei_scan", "raw_findings": len(raw_findings)})
     else:
@@ -407,6 +436,8 @@ async def run_web_pipeline(
         cred_urls=cred_urls,
         github_findings=github_findings,
         is_in_scope=is_in_scope,
+        graphql_findings=graphql_findings,
+        jwt_findings=jwt_findings,
     )
 
     phase_filter = await run_filtering_reporting_phase(

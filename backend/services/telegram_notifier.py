@@ -35,12 +35,45 @@ async def send_scan_done(program_name: str, findings: int, reports: int, duratio
     await _send_message(text)
 
 
-async def send_critical_finding(program_name: str, title: str, severity: str, target: str):
+async def send_critical_finding(
+    program_name: str,
+    title: str,
+    severity: str,
+    target: str,
+    h1_report_url: str = "",
+):
     text = (
         f"*High-priority finding*\n"
         f"Target: `{program_name}`\n"
         f"Severity: {severity}\n"
         f"Title: {title}\n"
         f"Asset: `{target}`"
+    )
+    if h1_report_url:
+        text += f"\nReport: {h1_report_url}"
+    await _send_message(text)
+
+
+async def send_report_submitted(
+    program_name: str,
+    title: str,
+    severity: str,
+    h1_report_url: str,
+):
+    text = (
+        f"✅ Submitted to H1: {title} [{severity}] → {h1_report_url}\n"
+        f"Program: `{program_name}`"
+    )
+    await _send_message(text)
+
+
+async def send_new_subdomains(program_name: str, new_subdomains: list[str]):
+    count = len(new_subdomains)
+    preview = new_subdomains[:10]
+    lines = "\n".join(f"• `{s}`" for s in preview)
+    truncation = f"\n_...and {count - 10} more_" if count > 10 else ""
+    text = (
+        f"🆕 {count} new subdomain{'s' if count != 1 else ''} found for *{program_name}*:\n"
+        f"{lines}{truncation}"
     )
     await _send_message(text)

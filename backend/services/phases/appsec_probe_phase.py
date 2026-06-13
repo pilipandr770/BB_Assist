@@ -5,9 +5,18 @@ import os
 import re
 from urllib.parse import urlparse
 
+from urllib.parse import ParseResult
+
 from backend.models import Scope
 from backend.services import tool_runner
 from backend.services.scope_parser import is_in_scope
+
+
+def _try_parse(url: str) -> ParseResult | None:
+    try:
+        return urlparse(url)
+    except Exception:
+        return None
 
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
@@ -130,9 +139,40 @@ async def run_appsec_probe_phase(
             await emit("tool_done", {"tool": "dalfox", "count": len(dalfox_results)})
         await emit("phase_done", {"phase": "xss_scan", "findings": len(dalfox_findings)})
 
+    # ── GraphQL probe ─────────────────────────────────────────────────────────
+    graphql_findings: list[dict] = []
+    base_hosts = list({
+        f"{parsed.scheme}://{parsed.netloc}"
+        for url in all_target_urls[:50]
+        if (parsed := _try_parse(url)) and parsed.netloc
+    })
+    if base_hosts:
+        await emit("phase_start", {"phase": "graphql_probe"})
+        await emit("tool_start", {"tool": "graphql", "detail": f"{len(base_hosts)} hosts"})
+        gql_out = os.path.join(scan_dir, "graphql_findings.jsonl")
+        graphql_findings = await tool_runner.run_graphql_probe(base_hosts, scan_dir)
+        await emit("tool_done", {"tool": "graphql", "count": len(graphql_findings)})
+        await emit("phase_done", {"phase": "graphql_probe", "findings": len(graphql_findings)})
+
+    # ── JWT probe ─────────────────────────────────────────────────────────────
+    jwt_findings: list[dict] = []
+    if session_cookies or auth_header:
+        await emit("phase_start", {"phase": "jwt_probe"})
+        await emit("tool_start", {"tool": "jwt_probe", "detail": "testing JWT tokens"})
+        jwt_findings = await tool_runner.run_jwt_probe(
+            urls=all_target_urls[:5],
+            session_cookies=session_cookies,
+            auth_header=auth_header,
+            scan_dir=scan_dir,
+        )
+        await emit("tool_done", {"tool": "jwt_probe", "count": len(jwt_findings)})
+        await emit("phase_done", {"phase": "jwt_probe", "findings": len(jwt_findings)})
+
     return {
         "all_target_urls": all_target_urls,
         "bypasses": bypasses,
         "arjun_params": arjun_params,
         "dalfox_findings": dalfox_findings,
+        "graphql_findings": graphql_findings,
+        "jwt_findings": jwt_findings,
     }

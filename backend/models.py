@@ -46,6 +46,7 @@ class Program(BaseModel):
     raw_text: str
     scope: Optional[Scope] = None
     plan: Optional[str] = None  # markdown plan from Claude
+    h1_program_handle: Optional[str] = None  # HackerOne program handle for API submit
     created_at: datetime = datetime.utcnow()
 
 

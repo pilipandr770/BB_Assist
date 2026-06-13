@@ -28,6 +28,9 @@ export default function ReportViewer() {
   const [error, setError] = useState(null)
   const [view, setView] = useState('rendered') // 'rendered' | 'raw'
   const [copied, setCopied] = useState(false)
+  const [h1Handle, setH1Handle] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submitResult, setSubmitResult] = useState(null) // {success, url, error}
 
   useEffect(() => {
     Promise.all([
@@ -49,6 +52,31 @@ export default function ReportViewer() {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
+  }
+
+  async function handleH1Submit() {
+    if (!h1Handle.trim()) {
+      alert('Enter the HackerOne program handle (e.g. "acme" for hackerone.com/acme)')
+      return
+    }
+    setSubmitting(true)
+    setSubmitResult(null)
+    try {
+      const resp = await axios.post(
+        `/api/reports/${programId}/${reportId}/submit`,
+        { h1_program_handle: h1Handle.trim() }
+      )
+      const data = resp.data?.data || {}
+      if (data.success) {
+        setSubmitResult({ success: true, url: data.h1_report_url })
+      } else {
+        setSubmitResult({ success: false, error: data.error || 'Submission failed' })
+      }
+    } catch (e) {
+      setSubmitResult({ success: false, error: e.response?.data?.detail || 'Network error' })
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   function handleDownload() {
@@ -114,8 +142,62 @@ export default function ReportViewer() {
         </button>
       </div>
 
+      {/* H1 Auto-Submit */}
+      <div style={{
+        background: '#161b22', border: '1px solid #30363d', borderRadius: 6,
+        padding: '12px 14px', marginBottom: 14,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ color: '#c9d1d9', fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap' }}>
+            🚀 Submit to H1
+          </span>
+          <input
+            value={h1Handle}
+            onChange={e => setH1Handle(e.target.value)}
+            placeholder="program-handle"
+            style={{
+              flex: 1, minWidth: 140, maxWidth: 220,
+              background: '#0d1117', border: '1px solid #30363d', borderRadius: 4,
+              color: '#c9d1d9', fontSize: 13, padding: '5px 10px',
+            }}
+          />
+          <button
+            onClick={handleH1Submit}
+            disabled={submitting}
+            style={{
+              padding: '6px 16px',
+              background: submitting ? '#21262d' : '#238636',
+              color: '#fff', border: 'none', borderRadius: 6,
+              fontSize: 13, fontWeight: 600, cursor: submitting ? 'wait' : 'pointer',
+            }}
+          >
+            {submitting ? 'Submitting…' : 'Submit'}
+          </button>
+          {meta?.h1_submitted && meta?.h1_report_url && (
+            <a
+              href={meta.h1_report_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: '#3fb950', fontSize: 13 }}
+            >
+              ✓ Submitted → #{meta.h1_report_id}
+            </a>
+          )}
+        </div>
+        {submitResult && (
+          <div style={{
+            marginTop: 8, fontSize: 12,
+            color: submitResult.success ? '#3fb950' : '#f85149',
+          }}>
+            {submitResult.success
+              ? <>✓ Report submitted! <a href={submitResult.url} target="_blank" rel="noopener noreferrer" style={{ color: '#58a6ff' }}>{submitResult.url}</a></>
+              : `✗ ${submitResult.error}`}
+          </div>
+        )}
+      </div>
+
       <p style={{ color: '#8b949e', fontSize: 12, marginBottom: 16 }}>
-        Copy this markdown → open the HackerOne program → click "Submit a report" → paste into the description field.
+        Enter your HackerOne program handle above to auto-submit, or copy the markdown below and paste manually.
       </p>
 
       {meta?.quality && (

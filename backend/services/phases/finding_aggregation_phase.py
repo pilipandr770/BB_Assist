@@ -26,6 +26,8 @@ def append_phase_findings(
     cred_urls: list[dict],
     github_findings: list[dict],
     is_in_scope,
+    graphql_findings: list[dict] | None = None,
+    jwt_findings: list[dict] | None = None,
 ) -> list[dict]:
     for hit in nmap_csv_cve_hits:
         target_url = f"https://{hit['host']}:{hit['port']}"
@@ -260,5 +262,34 @@ def append_phase_findings(
                 "_secret_type": gh["secret_type"],
             }
         )
+
+    for gql in (graphql_findings or []):
+        raw_findings.append({
+            "_source": "graphql_probe",
+            "info": {
+                "name": gql["issue"],
+                "severity": gql["severity"],
+                "tags": ["graphql", "misconfig", "exposure"],
+                "description": gql.get("description", gql.get("evidence", "")),
+            },
+            "matched-at": gql["url"],
+            "type": "graphql-misconfig",
+            "_evidence": gql.get("evidence", "")[:500],
+        })
+
+    for jwt in (jwt_findings or []):
+        raw_findings.append({
+            "_source": "jwt_probe",
+            "info": {
+                "name": f"JWT Vulnerability — {jwt['issue']}",
+                "severity": jwt["severity"],
+                "tags": ["jwt", "auth", "cryptography"],
+                "description": jwt.get("evidence", ""),
+            },
+            "matched-at": jwt.get("token_location", "jwt"),
+            "type": "jwt-vulnerability",
+            "_evidence": jwt.get("evidence", "")[:500],
+            "_location": jwt.get("token_location", ""),
+        })
 
     return raw_findings
