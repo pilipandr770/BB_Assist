@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException
 from backend import database
 from backend.config import settings
 from backend.models import ApiResponse, Program, ProgramCreate
+from pydantic import BaseModel
 from backend.services import claude_service, scope_parser
 
 router = APIRouter()
@@ -175,3 +176,17 @@ async def get_plan(program_id: str):
         plan = await f.read()
 
     return ApiResponse(success=True, data={"plan": plan, "program_id": program_id})
+
+
+class ProgramPatch(BaseModel):
+    h1_program_handle: str | None = None
+
+
+@router.patch("/{program_id}", response_model=ApiResponse)
+async def patch_program(program_id: str, body: ProgramPatch):
+    """Update mutable program fields (currently: h1_program_handle)."""
+    program = await _load_program(program_id)
+    if body.h1_program_handle is not None:
+        program.h1_program_handle = body.h1_program_handle.strip() or None
+    await _save_program(program)
+    return ApiResponse(success=True, data=json.loads(program.model_dump_json()))
