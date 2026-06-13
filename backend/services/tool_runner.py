@@ -1066,6 +1066,83 @@ async def run_nuclei(
         os.unlink(input_file)
 
 
+async def run_gf_classify(urls: list[str], output_dir: str) -> dict[str, list[str]]:
+    """
+    Classify a URL list using gf patterns (grep-find).
+    Returns {category: [matched_urls]} for all non-empty categories.
+    Writes per-category .txt files to output_dir.
+
+    Categories attempted (subset of 1ndianl33t patterns that matter for BB):
+      ssrf, idor, lfi, redirect, sqli, xss, rce, ssti, upload-fields, cors, debug_logic, aws-keys
+    """
+    import shutil
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not urls:
+        return {}
+
+    gf_bin = shutil.which("gf") or "/root/go/bin/gf"
+    if not os.path.exists(gf_bin):
+        log.info("gf_classify: gf binary not found — skipping")
+        return {}
+
+    gf_pattern_dir = os.path.expanduser("~/.gf")
+    if not os.path.isdir(gf_pattern_dir):
+        log.info("gf_classify: no pattern dir at %s — skipping", gf_pattern_dir)
+        return {}
+
+    # Only try patterns that are actually installed
+    available = {fn[:-5] for fn in os.listdir(gf_pattern_dir) if fn.endswith(".json")}
+    target_categories = [
+        "ssrf", "idor", "lfi", "redirect", "sqli", "xss", "rce",
+        "ssti", "upload-fields", "cors", "debug_logic", "aws-keys",
+    ]
+    to_run = [c for c in target_categories if c in available]
+    if not to_run:
+        log.info("gf_classify: none of the target patterns installed — skipping")
+        return {}
+
+    url_file = _write_temp_list(urls)
+    os.makedirs(output_dir, exist_ok=True)
+    results: dict[str, list[str]] = {}
+
+    try:
+        for category in to_run:
+            try:
+                with open(url_file, "rb") as stdin_fh:
+                    proc = await asyncio.create_subprocess_exec(
+                        gf_bin, category,
+                        stdin=stdin_fh,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    try:
+                        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        continue
+
+                matched = [ln.strip() for ln in stdout_b.decode(errors="replace").splitlines() if ln.strip()]
+                if matched:
+                    results[category] = matched
+                    out_path = os.path.join(output_dir, f"gf_{category}.txt")
+                    with open(out_path, "w") as f:
+                        f.write("\n".join(matched) + "\n")
+            except Exception as e:
+                log.debug("gf_classify[%s]: %s", category, e)
+    finally:
+        try:
+            os.unlink(url_file)
+        except Exception:
+            pass
+
+    total = sum(len(v) for v in results.values())
+    log.info("gf_classify: %d categories, %d classified URLs", len(results), total)
+    return results
+
+
 async def run_ffuf(
     url: str,
     wordlist: str,
@@ -1306,6 +1383,117 @@ def _download_url(url: str, timeout: int = 10) -> Optional[str]:
             return resp.read(524288).decode("utf-8", errors="replace")
     except Exception:
         return None
+
+
+async def run_trufflehog(urls: list[str], output_file: str) -> list[dict]:
+    """
+    Run trufflehog on a list of HTTP URLs to detect verified secrets.
+    Downloads JS/config files to a temp directory then runs:
+      trufflehog filesystem --directory <tmp_dir> --only-verified --json
+    Returns list of findings: {detector, raw, verified, source_url, severity}.
+    """
+    import shutil
+    import tempfile
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not urls:
+        return []
+
+    trufflehog_bin = shutil.which("trufflehog") or "/usr/local/bin/trufflehog"
+    if not os.path.exists(trufflehog_bin):
+        log.info("run_trufflehog: trufflehog binary not found — skipping")
+        return []
+
+    _js_exts = (".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".env",
+                ".config", ".conf", ".txt", ".xml", ".map")
+    js_like = [u for u in urls[:200] if any(u.lower().endswith(ext) for ext in _js_exts)]
+    if not js_like:
+        return []
+
+    findings: list[dict] = []
+    tmp_dir = tempfile.mkdtemp(prefix="trufflehog_")
+    url_map: dict[str, str] = {}  # filename → original URL
+
+    try:
+        # Download JS files concurrently into tmp_dir
+        sem = asyncio.Semaphore(10)
+
+        async def _download(url: str) -> None:
+            async with sem:
+                try:
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                        resp = await client.get(url)
+                        if resp.status_code == 200:
+                            safe_name = re.sub(r"[^\w.\-]", "_", url.split("/")[-1].split("?")[0]) or "file.js"
+                            # Ensure unique filenames
+                            dest = os.path.join(tmp_dir, f"{abs(hash(url)) % 100000}_{safe_name}")
+                            with open(dest, "wb") as fh:
+                                fh.write(resp.content[:5 * 1024 * 1024])  # 5 MB cap per file
+                            url_map[dest] = url
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[_download(u) for u in js_like])
+
+        if not url_map:
+            return []
+
+        proc = await asyncio.create_subprocess_exec(
+            trufflehog_bin, "filesystem",
+            "--directory", tmp_dir,
+            "--json", "--no-update", "--only-verified",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            stdout_b = b""
+
+        for line in stdout_b.decode(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                local_file = obj.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {}).get("file", "")
+                source_url = url_map.get(local_file, local_file)
+                verified = obj.get("Verified", False)
+                findings.append({
+                    "source_url": source_url,
+                    "detector": obj.get("DetectorName", "unknown"),
+                    "raw": obj.get("Raw", "")[:200],
+                    "verified": verified,
+                    "severity": "high" if verified else "medium",
+                })
+            except json.JSONDecodeError:
+                continue
+
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp_dir, ignore_errors=True)
+
+    # Dedup by (detector, raw prefix)
+    seen: set[tuple[str, str]] = set()
+    deduped = []
+    for f in findings:
+        key = (f["detector"], f["raw"][:30])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+
+    if deduped and output_file:
+        with open(output_file, "w") as fout:
+            for f in deduped:
+                fout.write(json.dumps(f) + "\n")
+
+    log.info("run_trufflehog: %d findings (%d verified)",
+             len(deduped), sum(1 for f in deduped if f["verified"]))
+    return deduped
 
 
 async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:

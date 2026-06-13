@@ -84,6 +84,11 @@ RUN mkdir -p /root/.gf && \
     rm -rf /tmp/gf-patterns && \
     echo "gf patterns installed: $(ls /root/.gf/*.json 2>/dev/null | wc -l) files"
 
+# Install trufflehog (secret scanner with 700+ detectors + built-in validation)
+RUN curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+      | sh -s -- -b /usr/local/bin 2>/dev/null && \
+    trufflehog --version 2>&1 || echo "trufflehog install skipped (network unavailable at build time)"
+
 # Python dependencies
 WORKDIR /app
 COPY backend/requirements.txt .
