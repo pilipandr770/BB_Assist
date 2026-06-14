@@ -474,6 +474,58 @@ Return a well-structured, actionable markdown document."""
     return message.content[0].text
 
 
+async def check_duplicate_finding(finding: Finding, scope: Scope) -> tuple[bool, str]:
+    """
+    Gate 2: Assess whether this finding is likely a known/overreported duplicate.
+
+    Returns (is_duplicate: bool, reason: str).
+    Uses Claude's knowledge of H1 Hacktivity patterns — no external API calls.
+    Temperature 0 — conservative.
+    """
+    system_prompt = """You are a HackerOne triage lead who has reviewed thousands of reports.
+Your job is to identify findings that are almost certainly already known or overreported duplicates.
+
+Mark as DUPLICATE if ANY of the following:
+1. This exact vulnerability class on this asset type is universally closed as N/A or Informative on H1
+   (e.g., SPF/DMARC missing, missing security headers, version disclosure, clickjacking without sensitive action)
+2. The vulnerability is a well-known "staple" finding that every scanner finds and programs have explicitly
+   addressed in their policy (e.g., "we don't pay for missing HSTS")
+3. The finding matches a pattern that HackerOne's own Hacktivity shows has been reported and closed N/A
+   hundreds of times on similar program types (e.g., OPTIONS method allowed, server version header)
+4. The finding is a scanner false-positive archetype (e.g., "reflected input" in error pages, CSP header issues)
+
+Mark as UNIQUE if:
+- It is a concrete exploitable vulnerability with real impact (XSS with payload, SQLi with data extraction,
+  IDOR with actual data access, exposed secret validated as active, etc.)
+- It involves a specific business logic flaw unique to this application
+- It is a chained attack that achieves something novel
+
+Respond with valid JSON only:
+{"is_duplicate": true or false, "reason": "one sentence"}"""
+
+    user_prompt = f"""Finding type: {finding.vuln_type}
+Title: {finding.title}
+URL: {finding.url}
+Severity: {finding.severity}
+Program type: {scope.program_type}
+In-scope domains: {', '.join(scope.in_scope_domains[:3])}
+
+Is this likely a known/overreported duplicate on HackerOne?"""
+
+    try:
+        message = await _create_message(
+            task="filter",
+            max_tokens=200,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        data = json.loads(_strip_json(message.content[0].text))
+        return data.get("is_duplicate", False), data.get("reason", "")
+    except Exception:
+        return False, "dedup check failed — assuming unique"
+
+
 async def filter_finding(
     finding: Finding,
     scope: Scope,
@@ -723,7 +775,14 @@ Rules:
 - Recommended fix must be actionable and specific
 - Do NOT include unconfirmed speculation
 - Never leave template placeholders in output (e.g. "[add step]", "[X.X]", "[endpoint]")
-- Never translate code keywords, HTTP header names, or protocol fields"""
+- Never translate code keywords, HTTP header names, or protocol fields
+
+Language rules (strictly enforced):
+- NEVER use speculative language: "could potentially", "may allow", "might be possible", "might lead to", "could lead to", "theoretically", "in theory", "an attacker could potentially", "may result in"
+- Use declarative present tense: "This allows an attacker to..." not "This could allow..."
+- Keep the report body under 600 words (code blocks and HTTP requests excluded from count)
+- Every impact claim must be a fact demonstrated by the evidence, not a hypothesis
+- HTTP requests in Steps to Reproduce must be complete and copy-pasteable — include Host, Content-Type, Authorization headers as applicable"""
 
     user_prompt = f"""Write a complete HackerOne vulnerability report for this confirmed finding.
 

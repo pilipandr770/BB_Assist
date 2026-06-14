@@ -7,6 +7,7 @@ import FindingsList from './components/FindingsList'
 import ReportViewer from './components/ReportViewer'
 import ReportsList from './components/ReportsList'
 import ProgramsList from './components/ProgramsList'
+import ProgramDashboard from './components/ProgramDashboard'
 import ProgramScorer from './components/ProgramScorer'
 import HistoryList from './components/HistoryList'
 import ManualFinding from './components/ManualFinding'
@@ -126,6 +127,7 @@ export default function App() {
           <Route path="/" element={<ProgramInput />} />
           <Route path="/scorer" element={<ProgramScorer />} />
           <Route path="/programs" element={<ProgramsList />} />
+          <Route path="/programs/:programId" element={<ProgramDashboard />} />
           <Route path="/history" element={<HistoryList />} />
           <Route path="/programs/:programId/plan" element={<PlanReview />} />
           <Route path="/programs/:programId/scans/:scanId" element={<ScanProgress />} />

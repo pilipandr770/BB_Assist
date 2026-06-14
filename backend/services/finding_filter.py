@@ -55,6 +55,11 @@ async def run_all_layers(
     if filter_result.severity:
         finding.severity = filter_result.severity
 
+    # Gate 2: Duplicate / overreported check
+    is_dup, dup_reason = await check_dedup_layer(finding, scope)
+    if is_dup:
+        return False, f"[G2-Dedup] {dup_reason}"
+
     # Layer 3: PoC confirmation
     passed, poc_result = await check_poc_layer(finding)
     finding.poc_result = poc_result
@@ -80,6 +85,14 @@ def check_scope_layer(finding: Finding, scope: Scope) -> tuple[bool, str]:
         return False, f"Vulnerability type '{finding.vuln_type}' is excluded by program rules"
 
     return True, "in scope"
+
+
+async def check_dedup_layer(finding: Finding, scope: Scope) -> tuple[bool, str]:
+    """
+    Gate 2: Check if finding is a commonly known / overreported duplicate on H1.
+    Returns (is_duplicate, reason).
+    """
+    return await claude_service.check_duplicate_finding(finding, scope)
 
 
 async def check_impact_layer(

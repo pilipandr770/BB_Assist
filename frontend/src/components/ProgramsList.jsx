@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import axios from 'axios'
 
+const SEV_COLOR = { critical: '#f85149', high: '#f0883e', medium: '#d29922', low: '#3fb950' }
+
 const SEVERITY_COLOR = {
   critical: '#f85149',
   high: '#f0883e',
@@ -69,24 +71,27 @@ export default function ProgramsList() {
 }
 
 function ProgramCard({ program: p }) {
+  const navigate = useNavigate()
   const scope = p.scope ?? {}
   const domains = scope.in_scope_domains ?? []
   const programType = scope.program_type ?? 'web'
 
   const typeColor = {
-    web: '#58a6ff',
-    api: '#d29922',
-    blockchain: '#a371f7',
-    mobile: '#3fb950',
-    source_code: '#f0883e',
+    web: '#58a6ff', api: '#d29922', blockchain: '#a371f7',
+    mobile: '#3fb950', source_code: '#f0883e',
   }
 
   return (
-    <div style={{
-      background: '#161b22', border: '1px solid #30363d',
-      borderRadius: 6, padding: '16px 18px', marginBottom: 10,
-      transition: 'border-color .15s',
-    }}>
+    <div
+      onClick={() => navigate(`/programs/${p.id}`)}
+      style={{
+        background: '#161b22', border: '1px solid #30363d',
+        borderRadius: 6, padding: '16px 18px', marginBottom: 10,
+        cursor: 'pointer', transition: 'border-color .15s',
+      }}
+      onMouseEnter={e => e.currentTarget.style.borderColor = '#58a6ff'}
+      onMouseLeave={e => e.currentTarget.style.borderColor = '#30363d'}
+    >
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
         <div style={{ flex: 1 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
@@ -99,9 +104,13 @@ function ProgramCard({ program: p }) {
             }}>
               {programType}
             </span>
+            {p.h1_program_handle && (
+              <span style={{ color: '#8b949e', fontSize: 11 }}>
+                h1: {p.h1_program_handle}
+              </span>
+            )}
           </div>
 
-          {/* Domains */}
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
             {domains.slice(0, 5).map(d => (
               <code key={d} style={{
@@ -129,19 +138,8 @@ function ProgramCard({ program: p }) {
           </div>
         </div>
 
-        {/* Actions */}
-        <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-          <Link
-            to={`/programs/${p.id}/plan`}
-            style={{
-              padding: '6px 14px', background: '#21262d',
-              color: p.plan ? '#3fb950' : '#58a6ff',
-              border: '1px solid #30363d', borderRadius: 6,
-              fontSize: 12, fontWeight: 600,
-            }}
-          >
-            {p.plan ? '✓ View Plan' : 'Generate Plan'}
-          </Link>
+        <div style={{ color: '#8b949e', fontSize: 12, flexShrink: 0 }}>
+          View dashboard →
         </div>
       </div>
     </div>

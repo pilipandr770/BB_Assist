@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend import database
-from backend.routers import programs, scans, reports, scorer, history, discover
+from backend.routers import programs, scans, reports, scorer, history, discover, ct_monitor
 from backend.services import cve_updater
 
 
@@ -122,6 +122,7 @@ app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
 app.include_router(scorer.router, prefix="/api/scorer", tags=["scorer"])
 app.include_router(history.router, prefix="/api/history", tags=["history"])
 app.include_router(discover.router, prefix="/api/discover", tags=["discover"])
+app.include_router(ct_monitor.router, prefix="/api/ct", tags=["ct-monitor"])
 
 
 @app.get("/")

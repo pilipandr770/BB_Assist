@@ -882,6 +882,7 @@ async def run_nuclei(
     detected_techs: set[str] | None = None,
     session_cookies: str = "",
     auth_header: str = "",
+    interactsh_url: str = "",
 ) -> list[dict]:
     """
     Run nuclei vulnerability scanner with curated templates.
@@ -977,8 +978,9 @@ async def run_nuclei(
             "-retries", "1",
             "-nc",                           # no color codes in output
             "-H", f"User-Agent: {nuclei_ua}",
-            # Note: interactsh ENABLED intentionally — needed for blind SSRF/XSS/XXE detection
-        ] + template_args + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
+        ] + template_args + _h1_header_args() + _auth_header_args(session_cookies, auth_header) + (
+            ["-interactsh-url", interactsh_url] if interactsh_url else []
+        )
 
         MAX_NUCLEI_RUNTIME = 900  # 15 minutes hard cap — use partial results after
         rc, stdout, stderr = await _run_command(
@@ -1064,6 +1066,83 @@ async def run_nuclei(
         return findings
     finally:
         os.unlink(input_file)
+
+
+async def run_gf_classify(urls: list[str], output_dir: str) -> dict[str, list[str]]:
+    """
+    Classify a URL list using gf patterns (grep-find).
+    Returns {category: [matched_urls]} for all non-empty categories.
+    Writes per-category .txt files to output_dir.
+
+    Categories attempted (subset of 1ndianl33t patterns that matter for BB):
+      ssrf, idor, lfi, redirect, sqli, xss, rce, ssti, upload-fields, cors, debug_logic, aws-keys
+    """
+    import shutil
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not urls:
+        return {}
+
+    gf_bin = shutil.which("gf") or "/root/go/bin/gf"
+    if not os.path.exists(gf_bin):
+        log.info("gf_classify: gf binary not found — skipping")
+        return {}
+
+    gf_pattern_dir = os.path.expanduser("~/.gf")
+    if not os.path.isdir(gf_pattern_dir):
+        log.info("gf_classify: no pattern dir at %s — skipping", gf_pattern_dir)
+        return {}
+
+    # Only try patterns that are actually installed
+    available = {fn[:-5] for fn in os.listdir(gf_pattern_dir) if fn.endswith(".json")}
+    target_categories = [
+        "ssrf", "idor", "lfi", "redirect", "sqli", "xss", "rce",
+        "ssti", "upload-fields", "cors", "debug_logic", "aws-keys",
+    ]
+    to_run = [c for c in target_categories if c in available]
+    if not to_run:
+        log.info("gf_classify: none of the target patterns installed — skipping")
+        return {}
+
+    url_file = _write_temp_list(urls)
+    os.makedirs(output_dir, exist_ok=True)
+    results: dict[str, list[str]] = {}
+
+    try:
+        for category in to_run:
+            try:
+                with open(url_file, "rb") as stdin_fh:
+                    proc = await asyncio.create_subprocess_exec(
+                        gf_bin, category,
+                        stdin=stdin_fh,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    try:
+                        stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        continue
+
+                matched = [ln.strip() for ln in stdout_b.decode(errors="replace").splitlines() if ln.strip()]
+                if matched:
+                    results[category] = matched
+                    out_path = os.path.join(output_dir, f"gf_{category}.txt")
+                    with open(out_path, "w") as f:
+                        f.write("\n".join(matched) + "\n")
+            except Exception as e:
+                log.debug("gf_classify[%s]: %s", category, e)
+    finally:
+        try:
+            os.unlink(url_file)
+        except Exception:
+            pass
+
+    total = sum(len(v) for v in results.values())
+    log.info("gf_classify: %d categories, %d classified URLs", len(results), total)
+    return results
 
 
 async def run_ffuf(
@@ -1306,6 +1385,117 @@ def _download_url(url: str, timeout: int = 10) -> Optional[str]:
             return resp.read(524288).decode("utf-8", errors="replace")
     except Exception:
         return None
+
+
+async def run_trufflehog(urls: list[str], output_file: str) -> list[dict]:
+    """
+    Run trufflehog on a list of HTTP URLs to detect verified secrets.
+    Downloads JS/config files to a temp directory then runs:
+      trufflehog filesystem --directory <tmp_dir> --only-verified --json
+    Returns list of findings: {detector, raw, verified, source_url, severity}.
+    """
+    import shutil
+    import tempfile
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not urls:
+        return []
+
+    trufflehog_bin = shutil.which("trufflehog") or "/usr/local/bin/trufflehog"
+    if not os.path.exists(trufflehog_bin):
+        log.info("run_trufflehog: trufflehog binary not found — skipping")
+        return []
+
+    _js_exts = (".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml", ".env",
+                ".config", ".conf", ".txt", ".xml", ".map")
+    js_like = [u for u in urls[:200] if any(u.lower().endswith(ext) for ext in _js_exts)]
+    if not js_like:
+        return []
+
+    findings: list[dict] = []
+    tmp_dir = tempfile.mkdtemp(prefix="trufflehog_")
+    url_map: dict[str, str] = {}  # filename → original URL
+
+    try:
+        # Download JS files concurrently into tmp_dir
+        sem = asyncio.Semaphore(10)
+
+        async def _download(url: str) -> None:
+            async with sem:
+                try:
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                        resp = await client.get(url)
+                        if resp.status_code == 200:
+                            safe_name = re.sub(r"[^\w.\-]", "_", url.split("/")[-1].split("?")[0]) or "file.js"
+                            # Ensure unique filenames
+                            dest = os.path.join(tmp_dir, f"{abs(hash(url)) % 100000}_{safe_name}")
+                            with open(dest, "wb") as fh:
+                                fh.write(resp.content[:5 * 1024 * 1024])  # 5 MB cap per file
+                            url_map[dest] = url
+                except Exception:
+                    pass
+
+        await asyncio.gather(*[_download(u) for u in js_like])
+
+        if not url_map:
+            return []
+
+        proc = await asyncio.create_subprocess_exec(
+            trufflehog_bin, "filesystem",
+            "--directory", tmp_dir,
+            "--json", "--no-update", "--only-verified",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            stdout_b = b""
+
+        for line in stdout_b.decode(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                local_file = obj.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {}).get("file", "")
+                source_url = url_map.get(local_file, local_file)
+                verified = obj.get("Verified", False)
+                findings.append({
+                    "source_url": source_url,
+                    "detector": obj.get("DetectorName", "unknown"),
+                    "raw": obj.get("Raw", "")[:200],
+                    "verified": verified,
+                    "severity": "high" if verified else "medium",
+                })
+            except json.JSONDecodeError:
+                continue
+
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp_dir, ignore_errors=True)
+
+    # Dedup by (detector, raw prefix)
+    seen: set[tuple[str, str]] = set()
+    deduped = []
+    for f in findings:
+        key = (f["detector"], f["raw"][:30])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+
+    if deduped and output_file:
+        with open(output_file, "w") as fout:
+            for f in deduped:
+                fout.write(json.dumps(f) + "\n")
+
+    log.info("run_trufflehog: %d findings (%d verified)",
+             len(deduped), sum(1 for f in deduped if f["verified"]))
+    return deduped
 
 
 async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
@@ -3375,3 +3565,390 @@ async def run_source_scan(
         "trufflehog_findings": trufflehog_findings,
         "clone_path": clone_path,
     }
+
+
+async def run_interactsh_client(output_dir: str, duration_seconds: int = 0) -> dict:
+    """
+    Start interactsh-client and get an OOB callback domain.
+    Used for detecting blind SSRF, XXE, RCE, and other out-of-band vulnerabilities.
+
+    Returns:
+        {oob_domain: str, session_file: str} if successful
+        {} if interactsh-client is not available
+
+    The returned oob_domain should be passed to nuclei via:
+        nuclei -interactsh-url {oob_domain}
+    """
+    import shutil
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    interactsh_bin = shutil.which("interactsh-client") or "/root/go/bin/interactsh-client"
+    if not os.path.exists(interactsh_bin):
+        log.info("interactsh-client not found — OOB detection disabled")
+        return {}
+
+    session_file = os.path.join(output_dir, "interactsh_session.json")
+    output_file = os.path.join(output_dir, "interactsh_callbacks.txt")
+
+    try:
+        # Run interactsh-client to generate a unique OOB domain
+        # -persist: keep session for reuse; -o: output file for callbacks
+        cmd = [
+            interactsh_bin,
+            "-o", output_file,
+            "-json",
+            "-v",
+        ]
+        if duration_seconds > 0:
+            cmd += ["-duration", f"{duration_seconds}s"]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # Read the first few lines to get the OOB domain (printed immediately)
+        oob_domain = ""
+        try:
+            async def _read_domain():
+                nonlocal oob_domain
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    decoded = line.decode(errors="replace").strip()
+                    log.debug("interactsh: %s", decoded)
+                    # interactsh prints the domain on a line like:
+                    # "[INF] Listing on abcdef.oast.fun"
+                    if "Listing on" in decoded or "oast." in decoded.lower():
+                        parts = decoded.split()
+                        for part in parts:
+                            if "." in part and ("oast" in part or "interact" in part):
+                                oob_domain = part.strip("[]")
+                                return
+
+            await asyncio.wait_for(_read_domain(), timeout=15)
+        except asyncio.TimeoutError:
+            pass
+
+        if oob_domain:
+            # Save session info for later retrieval
+            with open(session_file, "w") as f:
+                json.dump({"oob_domain": oob_domain, "output_file": output_file, "pid": proc.pid}, f)
+            log.info("interactsh OOB domain: %s", oob_domain)
+            # Let the process keep running in the background to catch callbacks
+            return {"oob_domain": oob_domain, "session_file": session_file, "output_file": output_file}
+        else:
+            proc.kill()
+            await proc.wait()
+            log.info("interactsh: could not extract OOB domain from output")
+            return {}
+    except Exception as e:
+        log.debug("interactsh start error: %s", e)
+        return {}
+
+
+async def read_interactsh_callbacks(output_file: str) -> list[dict]:
+    """
+    Read OOB callbacks captured by interactsh-client.
+    Returns list of {protocol, full_id, q_type, remote_address, timestamp}.
+    """
+    if not output_file or not os.path.exists(output_file):
+        return []
+    callbacks = []
+    try:
+        with open(output_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    callbacks.append(obj)
+                except json.JSONDecodeError:
+                    # Non-JSON line (e.g., informational)
+                    callbacks.append({"raw": line})
+    except Exception:
+        pass
+    return callbacks
+
+
+async def run_graphql_probe(base_urls: list[str], scan_dir: str) -> list[dict]:
+    """
+    Probe for exposed GraphQL endpoints and test for common misconfigurations.
+
+    Checks:
+    - Introspection enabled (schema leak)
+    - Field suggestions enabled (information disclosure)
+    - Batch query support (amplification risk)
+    - Debug mode / stack traces
+
+    Returns list of findings: {url, issue, severity, evidence}.
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not base_urls:
+        return []
+
+    _graphql_paths = [
+        "/graphql", "/api/graphql", "/graphql/v1", "/v1/graphql", "/v2/graphql",
+        "/graphiql", "/playground", "/api/graph", "/query", "/gql",
+        "/graphql/console", "/api/v1/graphql", "/api/v2/graphql",
+    ]
+
+    _introspection_query = json.dumps({
+        "query": "{ __schema { queryType { name } types { name kind } } }"
+    })
+
+    _field_suggestion_query = json.dumps({
+        "query": "{ __typen { name } }"  # typo to trigger suggestion
+    })
+
+    findings = []
+    seen_urls: set[str] = set()
+
+    import httpx as _httpx
+
+    async with _httpx.AsyncClient(
+        timeout=10,
+        follow_redirects=True,
+        verify=False,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (security-research)",
+        }
+    ) as client:
+        for base_url in base_urls[:20]:  # cap at 20 base URLs
+            base_clean = base_url.rstrip("/")
+
+            for gql_path in _graphql_paths:
+                gql_url = base_clean + gql_path
+                if gql_url in seen_urls:
+                    continue
+                seen_urls.add(gql_url)
+
+                try:
+                    # 1. Check if endpoint exists (GET request first)
+                    head_resp = await client.get(gql_url)
+                    if head_resp.status_code not in (200, 400, 405):
+                        continue
+
+                    # 2. Test introspection
+                    intr_resp = await client.post(gql_url, content=_introspection_query)
+                    intr_text = intr_resp.text[:2000]
+
+                    if intr_resp.status_code == 200 and "__schema" in intr_text:
+                        findings.append({
+                            "url": gql_url,
+                            "issue": "GraphQL Introspection Enabled",
+                            "severity": "medium",
+                            "evidence": intr_text[:500],
+                            "description": "GraphQL introspection is enabled, leaking the full API schema including all types, queries, mutations, and fields.",
+                        })
+                        log.info("graphql_probe: introspection at %s", gql_url)
+
+                    # 3. Test field suggestions
+                    sugg_resp = await client.post(gql_url, content=_field_suggestion_query)
+                    sugg_text = sugg_resp.text[:1000]
+                    if "Did you mean" in sugg_text or "suggestions" in sugg_text.lower():
+                        findings.append({
+                            "url": gql_url,
+                            "issue": "GraphQL Field Suggestions Enabled",
+                            "severity": "low",
+                            "evidence": sugg_text[:300],
+                            "description": "GraphQL field name suggestions are enabled, aiding schema enumeration even without full introspection.",
+                        })
+
+                    # 4. Test batch queries (array of queries)
+                    batch_query = json.dumps([
+                        {"query": "{ __typename }"},
+                        {"query": "{ __typename }"},
+                    ])
+                    batch_resp = await client.post(gql_url, content=batch_query)
+                    batch_text = batch_resp.text[:500]
+                    if batch_resp.status_code == 200 and batch_text.startswith("["):
+                        findings.append({
+                            "url": gql_url,
+                            "issue": "GraphQL Batch Queries Enabled",
+                            "severity": "low",
+                            "evidence": batch_text[:200],
+                            "description": "GraphQL batch query support is enabled, which can be used to amplify rate-limit bypass attempts.",
+                        })
+
+                except Exception as e:
+                    log.debug("graphql_probe[%s]: %s", gql_url, e)
+                    continue
+
+    output_file = os.path.join(scan_dir, "graphql_findings.jsonl")
+    if findings:
+        with open(output_file, "w") as f:
+            for finding in findings:
+                f.write(json.dumps(finding) + "\n")
+        log.info("graphql_probe: %d findings", len(findings))
+
+    return findings
+
+
+async def run_jwt_probe(urls: list[str], session_cookies: str, auth_header: str, scan_dir: str) -> list[dict]:
+    """
+    Test JWT tokens found in session cookies or auth headers for common vulnerabilities:
+    1. Algorithm confusion (none algorithm, HS256 with RS256 public key)
+    2. Weak secret brute-force (common secrets list)
+    3. Missing expiry claim
+    4. Sensitive data in payload
+
+    Returns list of findings: {issue, severity, evidence, token_location}.
+    """
+    import base64
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    _COMMON_SECRETS = [
+        "secret", "password", "123456", "admin", "key", "jwt", "token",
+        "private", "changeme", "default", "test", "example", "sample",
+        "your-256-bit-secret", "your-secret", "shhhhh", "supersecret",
+    ]
+
+    def _extract_jwts(text: str) -> list[str]:
+        # JWT pattern: 3 base64url segments separated by dots
+        pattern = r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"
+        return list(set(re.findall(pattern, text)))
+
+    def _decode_jwt_payload(token: str) -> dict:
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                return {}
+            # Add padding
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception:
+            return {}
+
+    def _decode_jwt_header(token: str) -> dict:
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                return {}
+            header_b64 = parts[0] + "=" * (4 - len(parts[0]) % 4)
+            return json.loads(base64.urlsafe_b64decode(header_b64))
+        except Exception:
+            return {}
+
+    # Collect JWTs from auth_header and cookies
+    candidate_jwts: list[tuple[str, str]] = []  # (token, location)
+
+    if auth_header:
+        for jwt in _extract_jwts(auth_header):
+            candidate_jwts.append((jwt, "Authorization header"))
+
+    if session_cookies:
+        for jwt in _extract_jwts(session_cookies):
+            candidate_jwts.append((jwt, "Cookie"))
+
+    # Also try to fetch the app and extract JWTs from Set-Cookie headers
+    import httpx as _httpx
+    if urls and not candidate_jwts:
+        try:
+            async with _httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                resp = await client.get(urls[0])
+                all_cookies = " ".join(resp.headers.get_list("set-cookie", []))
+                for jwt in _extract_jwts(all_cookies):
+                    candidate_jwts.append((jwt, "Set-Cookie header"))
+                # Also check response body for JWTs
+                for jwt in _extract_jwts(resp.text[:5000]):
+                    candidate_jwts.append((jwt, "Response body"))
+        except Exception:
+            pass
+
+    if not candidate_jwts:
+        return []
+
+    findings = []
+    seen_tokens: set[str] = set()
+
+    for token, location in candidate_jwts:
+        if token[:20] in seen_tokens:
+            continue
+        seen_tokens.add(token[:20])
+
+        header = _decode_jwt_header(token)
+        payload = _decode_jwt_payload(token)
+
+        if not header:
+            continue
+
+        alg = header.get("alg", "").upper()
+
+        # Check 1: None algorithm
+        if alg == "NONE" or alg == "":
+            findings.append({
+                "issue": "JWT None Algorithm Accepted",
+                "severity": "critical",
+                "evidence": f"Token uses 'none' algorithm: {token[:80]}...",
+                "token_location": location,
+                "header": header,
+            })
+
+        # Check 2: Sensitive data in payload
+        sensitive_keys = {"password", "secret", "key", "ssn", "credit_card", "card_number", "cvv", "pin"}
+        found_sensitive = [k for k in payload.keys() if k.lower() in sensitive_keys]
+        if found_sensitive:
+            findings.append({
+                "issue": "JWT Contains Sensitive Data",
+                "severity": "medium",
+                "evidence": f"Payload contains sensitive keys: {found_sensitive}",
+                "token_location": location,
+                "payload_keys": list(payload.keys()),
+            })
+
+        # Check 3: Missing expiry
+        if "exp" not in payload:
+            findings.append({
+                "issue": "JWT Missing Expiry Claim",
+                "severity": "low",
+                "evidence": f"No 'exp' claim found in JWT payload. Token: {token[:80]}...",
+                "token_location": location,
+            })
+
+        # Check 4: Weak secret (HS256 only — can test by trying to verify)
+        if alg in ("HS256", "HS384", "HS512"):
+            try:
+                import hmac
+                import hashlib
+                header_payload = ".".join(token.split(".")[:2]).encode()
+                sig_b64 = token.split(".")[2]
+                sig_b64 += "=" * (4 - len(sig_b64) % 4)
+                expected_sig = base64.urlsafe_b64decode(sig_b64)
+
+                hash_fn = {
+                    "HS256": hashlib.sha256,
+                    "HS384": hashlib.sha384,
+                    "HS512": hashlib.sha512,
+                }.get(alg, hashlib.sha256)
+
+                for secret in _COMMON_SECRETS:
+                    computed = hmac.new(secret.encode(), header_payload, hash_fn).digest()
+                    if computed == expected_sig:
+                        findings.append({
+                            "issue": "JWT Signed with Weak Secret",
+                            "severity": "critical",
+                            "evidence": f"JWT secret is '{secret}'. Token: {token[:80]}...",
+                            "token_location": location,
+                            "cracked_secret": secret,
+                        })
+                        break
+            except Exception:
+                pass
+
+    output_file = os.path.join(scan_dir, "jwt_findings.jsonl")
+    if findings:
+        with open(output_file, "w") as f:
+            for finding in findings:
+                f.write(json.dumps(finding) + "\n")
+        log.info("jwt_probe: %d findings", len(findings))
+
+    return findings
