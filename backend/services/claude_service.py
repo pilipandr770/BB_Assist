@@ -18,6 +18,12 @@ import anthropic
 from backend.config import settings
 from backend.models import Scope, Finding, FilterResult, PocResult, Severity
 
+try:
+    from headroom import compress as _headroom_compress, CompressConfig as _CompressConfig
+    _HEADROOM_AVAILABLE = True
+except ImportError:
+    _HEADROOM_AVAILABLE = False
+
 client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 log = logging.getLogger("claude_service")
 
@@ -70,6 +76,8 @@ _USAGE_TOTALS = {
     "input_tokens": 0,
     "output_tokens": 0,
     "estimated_cost_usd": 0.0,
+    "compression_calls": 0,
+    "compression_tokens_saved": 0,
     "by_task": {},
     "by_model": {},
 }
@@ -108,6 +116,43 @@ def _usage_increment(task: str, model: str, input_tokens: int, output_tokens: in
         by_model["estimated_cost_usd"] += float(est_cost)
 
 
+_COMPRESS_CFG = None
+
+
+def _get_compress_cfg():
+    global _COMPRESS_CFG
+    if _COMPRESS_CFG is None and _HEADROOM_AVAILABLE:
+        _COMPRESS_CFG = _CompressConfig(
+            kompress_model="disabled",   # no ML model needed; SmartCrusher + CacheAligner only
+            compress_user_messages=True, # tool outputs live in user messages
+            protect_recent=2,            # keep last 2 messages uncompressed (active turn)
+        )
+    return _COMPRESS_CFG
+
+
+def _maybe_compress(messages: list, model: str) -> list:
+    """Run headroom compression on messages list; silently fall back on any error."""
+    if not _HEADROOM_AVAILABLE or not messages:
+        return messages
+    try:
+        cfg = _get_compress_cfg()
+        result = _headroom_compress(messages, model=model, config=cfg)
+        saved = getattr(result, "tokens_saved", 0) or 0
+        if saved > 0:
+            with _USAGE_LOCK:
+                _USAGE_TOTALS["compression_calls"] += 1
+                _USAGE_TOTALS["compression_tokens_saved"] += int(saved)
+            log.debug(
+                "headroom: saved %d tokens (ratio=%.2f)",
+                saved,
+                getattr(result, "compression_ratio", 0),
+            )
+        return result.messages
+    except Exception as exc:
+        log.debug("headroom compression skipped: %s", str(exc)[:120])
+        return messages
+
+
 def get_usage_snapshot() -> dict:
     with _USAGE_LOCK:
         return {
@@ -115,6 +160,9 @@ def get_usage_snapshot() -> dict:
             "input_tokens": _USAGE_TOTALS["input_tokens"],
             "output_tokens": _USAGE_TOTALS["output_tokens"],
             "estimated_cost_usd": round(_USAGE_TOTALS["estimated_cost_usd"], 6),
+            "headroom_available": _HEADROOM_AVAILABLE,
+            "compression_calls": _USAGE_TOTALS["compression_calls"],
+            "compression_tokens_saved": _USAGE_TOTALS["compression_tokens_saved"],
             "by_task": {
                 k: {
                     "calls": v["calls"],
@@ -188,7 +236,10 @@ async def _create_message(task: str, **kwargs):
     last_error = None
     for model in chain:
         try:
-            message = await client.messages.create(model=model, **kwargs)
+            call_kwargs = dict(kwargs)
+            if "messages" in call_kwargs:
+                call_kwargs["messages"] = _maybe_compress(call_kwargs["messages"], model)
+            message = await client.messages.create(model=model, **call_kwargs)
             in_tokens, out_tokens = _extract_usage(message)
             _usage_increment(task=task, model=model, input_tokens=in_tokens, output_tokens=out_tokens)
             return message
