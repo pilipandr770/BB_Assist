@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import aiofiles
 
+from backend.config import settings
 from backend.models import Finding, ScanJob, Scope, Severity
 from backend.services import tool_runner
 from backend.services.phases.active_recon_phase import run_active_recon_core
@@ -264,6 +265,7 @@ async def run_web_pipeline(
 
     live_urls: list[str] = phase2_urls["live_urls"]
     detected_techs: set[str] = set(phase2_urls["detected_techs"])
+    _http_results_raw: list[dict] = phase2_urls.get("http_results", [])
     nmap_service_versions = phase2_urls["nmap_service_versions"]
     nmap_csv_cve_hits = phase2_urls["nmap_csv_cve_hits"]
     gau_urls = phase2_urls["gau_urls"]
@@ -333,7 +335,7 @@ async def run_web_pipeline(
     graphql_findings = phase_appsec.get("graphql_findings", [])
     jwt_findings = phase_appsec.get("jwt_findings", [])
 
-    # Security surface (CORS, takeover, email, swagger, S3)
+    # Security surface (CORS, takeover, email, swagger, S3, WPScan, CSP)
     phase_surface = await run_security_surface_phase(
         scan_dir=scan_dir,
         scope=scope,
@@ -342,6 +344,9 @@ async def run_web_pipeline(
         all_target_urls=all_target_urls,
         takeover_timeout_s=takeover_timeout_s,
         emit=emit,
+        detected_techs=detected_techs,
+        http_results=_http_results_raw,
+        wpscan_api_token=settings.wpscan_api_token or "",
     )
     all_target_urls = phase_surface["all_target_urls"]
     cors_findings = phase_surface["cors_findings"]
@@ -349,6 +354,8 @@ async def run_web_pipeline(
     email_findings = phase_surface["email_findings"]
     swagger_findings = phase_surface["swagger_findings"]
     s3_findings = phase_surface["s3_findings"]
+    wpscan_findings = phase_surface.get("wpscan_findings", [])
+    csp_findings = phase_surface.get("csp_findings", [])
 
     # ── Phase 2.9: Interactsh OOB setup ──────────────────────────────────────
     interactsh_session = await tool_runner.run_interactsh_client(scan_dir)
@@ -438,6 +445,8 @@ async def run_web_pipeline(
         is_in_scope=is_in_scope,
         graphql_findings=graphql_findings,
         jwt_findings=jwt_findings,
+        wpscan_findings=wpscan_findings,
+        csp_findings=csp_findings,
     )
 
     phase_filter = await run_filtering_reporting_phase(

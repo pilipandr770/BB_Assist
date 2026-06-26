@@ -3952,3 +3952,329 @@ async def run_jwt_probe(urls: list[str], session_cookies: str, auth_header: str,
         log.info("jwt_probe: %d findings", len(findings))
 
     return findings
+
+
+# ── WPScan ────────────────────────────────────────────────────────────────────
+
+async def run_wpscan(
+    target_url: str,
+    output_file: str,
+    api_token: str = "",
+) -> list[dict]:
+    """
+    Run WPScan against a WordPress target. Returns structured findings.
+
+    Requires wpscan gem to be installed:  gem install wpscan
+    API token (free): https://wpscan.com/register
+    Without a token WPScan still detects plugins/themes/users but can't report CVEs.
+    """
+    import shutil
+    log = logging.getLogger("tool_runner")
+
+    wpscan_bin = shutil.which("wpscan") or "/usr/local/bin/wpscan"
+    if not os.path.exists(wpscan_bin):
+        log.info("run_wpscan: wpscan not found — skipping")
+        return []
+
+    cmd = [
+        wpscan_bin,
+        "--url", target_url,
+        "--format", "json",
+        "--output", output_file,
+        "--no-banner",
+        "--no-update",
+        "--disable-tls-checks",
+        "--enumerate", "vp,vt,u",  # vulnerable plugins, vulnerable themes, users
+        "--plugins-detection", "passive",
+    ]
+    if api_token:
+        cmd += ["--api-token", api_token]
+
+    log.info("run_wpscan: scanning %s", target_url)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except asyncio.TimeoutError:
+        log.warning("run_wpscan: timeout for %s", target_url)
+        return []
+    except Exception as e:
+        log.warning("run_wpscan: error for %s: %s", target_url, e)
+        return []
+
+    try:
+        with open(output_file) as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    findings: list[dict] = []
+
+    def _cvss_to_severity(score) -> str:
+        try:
+            s = float(score)
+        except (TypeError, ValueError):
+            return "medium"
+        if s >= 9.0:
+            return "critical"
+        if s >= 7.0:
+            return "high"
+        if s >= 4.0:
+            return "medium"
+        return "low"
+
+    # Vulnerable plugins
+    for plugin_name, plugin_data in (data.get("plugins") or {}).items():
+        for vuln in (plugin_data.get("vulnerabilities") or []):
+            cvss = (vuln.get("cvss") or {}).get("score", 5.0)
+            cves = (vuln.get("references") or {}).get("cve", [])
+            findings.append({
+                "type": "vulnerable-plugin",
+                "plugin": plugin_name,
+                "plugin_version": (plugin_data.get("version") or {}).get("number", "unknown"),
+                "title": vuln.get("title", f"WPScan: {plugin_name} vulnerability"),
+                "severity": _cvss_to_severity(cvss),
+                "cvss": cvss,
+                "cve": cves,
+                "fixed_in": vuln.get("fixed_in", ""),
+                "references": (vuln.get("references") or {}).get("url", []),
+                "url": target_url,
+            })
+
+    # Vulnerable themes
+    for theme_name, theme_data in (data.get("themes") or {}).items():
+        for vuln in (theme_data.get("vulnerabilities") or []):
+            cvss = (vuln.get("cvss") or {}).get("score", 5.0)
+            cves = (vuln.get("references") or {}).get("cve", [])
+            findings.append({
+                "type": "vulnerable-theme",
+                "theme": theme_name,
+                "theme_version": (theme_data.get("version") or {}).get("number", "unknown"),
+                "title": vuln.get("title", f"WPScan: {theme_name} theme vulnerability"),
+                "severity": _cvss_to_severity(cvss),
+                "cvss": cvss,
+                "cve": cves,
+                "fixed_in": vuln.get("fixed_in", ""),
+                "references": (vuln.get("references") or {}).get("url", []),
+                "url": target_url,
+            })
+
+    # WordPress core vulnerabilities
+    for vuln in ((data.get("version") or {}).get("vulnerabilities") or []):
+        cvss = (vuln.get("cvss") or {}).get("score", 6.0)
+        cves = (vuln.get("references") or {}).get("cve", [])
+        wp_ver = (data.get("version") or {}).get("number", "unknown")
+        findings.append({
+            "type": "vulnerable-wordpress-core",
+            "wp_version": wp_ver,
+            "title": vuln.get("title", f"WordPress {wp_ver} core vulnerability"),
+            "severity": _cvss_to_severity(cvss),
+            "cvss": cvss,
+            "cve": cves,
+            "fixed_in": vuln.get("fixed_in", ""),
+            "references": (vuln.get("references") or {}).get("url", []),
+            "url": target_url,
+        })
+
+    # Interesting findings: xmlrpc, readme, debug.log, etc.
+    for item in (data.get("interesting_findings") or []):
+        item_type = item.get("type", "")
+        if item_type == "xmlrpc":
+            findings.append({
+                "type": "xmlrpc-enabled",
+                "title": "WordPress XML-RPC Enabled",
+                "severity": "medium",
+                "url": item.get("url", target_url),
+                "description": (
+                    "XML-RPC is enabled. Can be abused for brute-force amplification "
+                    "(system.multicall) or blind SSRF via pingbacks."
+                ),
+            })
+        elif item_type == "readme":
+            findings.append({
+                "type": "wp-readme-exposed",
+                "title": "WordPress readme.html Version Disclosure",
+                "severity": "low",
+                "url": item.get("url", target_url),
+                "description": "readme.html discloses the WordPress version.",
+            })
+        elif "debug.log" in (item.get("url") or ""):
+            findings.append({
+                "type": "wp-debug-log",
+                "title": "WordPress debug.log Exposed",
+                "severity": "high",
+                "url": item.get("url", target_url),
+                "description": "wp-content/debug.log is publicly accessible and may contain stack traces, credentials, and internal paths.",
+            })
+
+    # User enumeration
+    users = data.get("users") or {}
+    if users:
+        findings.append({
+            "type": "wp-user-enum",
+            "title": f"WordPress User Enumeration — {len(users)} account(s)",
+            "severity": "medium",
+            "url": target_url,
+            "users_count": len(users),
+            "description": (
+                f"WPScan enumerated {len(users)} WordPress user(s) via author archive. "
+                "Username disclosure combined with weak passwords enables credential attacks."
+            ),
+        })
+
+    log.info("run_wpscan: %d findings for %s", len(findings), target_url)
+    return findings
+
+
+# ── CSP Analyzer ─────────────────────────────────────────────────────────────
+
+_CSP_UNSAFE = [
+    ("unsafe-inline", "script-src", "critical", "Allows inline <script> — XSS mitigations bypassed"),
+    ("unsafe-eval",   "script-src", "high",     "Allows eval() — opens DOM-based XSS vector"),
+    ("unsafe-inline", "style-src",  "medium",   "Allows inline styles — CSS injection possible"),
+    ("unsafe-hashes", "script-src", "medium",   "Allows hash-based inline scripts — partial bypass"),
+]
+
+_CSP_WILDCARD_RE = re.compile(r"(?<!\w)\*(?!\.\S)")
+
+
+async def run_csp_analyzer(http_results: list[dict], output_file: str) -> list[dict]:
+    """
+    Analyze Content-Security-Policy headers from httpx JSONL results.
+
+    Detects common weaknesses:
+      - unsafe-inline / unsafe-eval in script-src
+      - wildcard (*) in high-value directives
+      - http: scheme allowed (allows downgrade to HTTP sources)
+      - missing frame-ancestors (clickjacking risk if no X-Frame-Options)
+      - missing default-src or script-src (no baseline policy)
+    """
+    log = logging.getLogger("tool_runner")
+    findings: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for r in http_results:
+        url = r.get("url", "")
+        headers: dict = r.get("headers") or {}
+        csp_raw = (
+            headers.get("content-security-policy")
+            or headers.get("Content-Security-Policy")
+            or ""
+        )
+        xfo = (
+            headers.get("x-frame-options")
+            or headers.get("X-Frame-Options")
+            or ""
+        )
+
+        if not csp_raw:
+            # Missing CSP is worth noting for API endpoints and main pages
+            if url and url not in seen_urls and any(
+                kw in url.lower() for kw in ("/api/", "/graphql", "/login", "/admin")
+            ):
+                seen_urls.add(url)
+                findings.append({
+                    "type": "csp-missing",
+                    "url": url,
+                    "severity": "medium",
+                    "issue": "Content-Security-Policy header missing",
+                    "impact": (
+                        "No CSP means any reflected or stored XSS can execute arbitrary JS "
+                        "without browser-level mitigation."
+                    ),
+                    "csp": "",
+                })
+            continue
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        issues: list[dict] = []
+
+        # Parse directives
+        directives: dict[str, str] = {}
+        for directive in csp_raw.split(";"):
+            parts = directive.strip().split(None, 1)
+            if parts:
+                directives[parts[0].lower()] = parts[1] if len(parts) > 1 else ""
+
+        effective_script = (
+            directives.get("script-src")
+            or directives.get("default-src")
+            or ""
+        )
+        effective_style = (
+            directives.get("style-src")
+            or directives.get("default-src")
+            or ""
+        )
+
+        # Check unsafe- keywords
+        for keyword, directive_name, severity, description in _CSP_UNSAFE:
+            check_val = effective_script if "script" in directive_name else effective_style
+            if f"'{keyword}'" in check_val:
+                issues.append({"issue": keyword, "directive": directive_name,
+                                "severity": severity, "description": description})
+
+        # Wildcard in script-src / default-src
+        if _CSP_WILDCARD_RE.search(effective_script):
+            issues.append({
+                "issue": "wildcard-in-script-src",
+                "directive": "script-src",
+                "severity": "high",
+                "description": "Wildcard (*) in script-src allows loading scripts from any domain.",
+            })
+
+        # http: scheme allowed in script/default
+        if "http:" in effective_script:
+            issues.append({
+                "issue": "http-scheme-in-script-src",
+                "directive": "script-src",
+                "severity": "high",
+                "description": "http: allowed in script-src — enables loading scripts over unencrypted connections (MitM).",
+            })
+
+        # Missing frame-ancestors + no X-Frame-Options → clickjacking
+        if "frame-ancestors" not in directives and not xfo:
+            issues.append({
+                "issue": "missing-frame-ancestors",
+                "directive": "frame-ancestors",
+                "severity": "medium",
+                "description": "Neither frame-ancestors directive nor X-Frame-Options header set — clickjacking possible.",
+            })
+
+        # No script-src at all (only default-src without restriction)
+        if not directives.get("script-src") and not directives.get("default-src"):
+            issues.append({
+                "issue": "no-script-policy",
+                "directive": "script-src",
+                "severity": "high",
+                "description": "CSP present but lacks script-src and default-src — no script execution policy.",
+            })
+
+        if issues:
+            worst = max(issues, key=lambda i: {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(i["severity"], 0))
+            findings.append({
+                "type": "csp-weakness",
+                "url": url,
+                "severity": worst["severity"],
+                "issues": issues,
+                "issues_count": len(issues),
+                "csp": csp_raw[:300],
+                "impact": (
+                    f"Weak CSP ({len(issues)} issue(s)) on {url}. "
+                    "An attacker who achieves XSS can bypass browser-level script controls."
+                ),
+            })
+
+    if findings:
+        with open(output_file, "w") as f:
+            for item in findings:
+                f.write(json.dumps(item) + "\n")
+
+    log.info("csp_analyzer: %d findings from %d URLs", len(findings), len(seen_urls))
+    return findings

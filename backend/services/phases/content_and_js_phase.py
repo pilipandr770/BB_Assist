@@ -136,12 +136,42 @@ async def run_content_and_js_phase(
             js_kept.append(secret)
     js_secrets = js_kept
 
+    # trufflehog: verified secret detection on JS URLs (complements regex scanner)
+    trufflehog_secrets: list[dict] = []
+    if js_urls:
+        await emit("tool_start", {"tool": "trufflehog", "detail": f"{len(js_urls)} JS URLs"})
+        trufflehog_out = os.path.join(scan_dir, "trufflehog_web.jsonl")
+        try:
+            trufflehog_raw = await tool_runner.run_trufflehog(js_urls[:50], trufflehog_out)
+            # Convert trufflehog format to js_secrets format for unified processing
+            for th in trufflehog_raw:
+                if not th.get("verified"):
+                    continue  # skip unverified in web pipeline to reduce noise
+                trufflehog_secrets.append({
+                    "url": th.get("url", ""),
+                    "secret_type": th.get("detector_type", "unknown"),
+                    "match": th.get("raw", "")[:120],
+                    "context": th.get("extra_data", {}).get("context", ""),
+                    "severity": "high" if th.get("verified") else "medium",
+                    "_source": "trufflehog",
+                    "_verified": th.get("verified", False),
+                })
+        except Exception:
+            pass
+        await emit("tool_done", {"tool": "trufflehog", "count": len(trufflehog_secrets)})
+        # Merge verified trufflehog finds into js_secrets (dedup by match prefix)
+        existing_matches = {s.get("match", "")[:60] for s in js_secrets}
+        for th_secret in trufflehog_secrets:
+            if th_secret.get("match", "")[:60] not in existing_matches:
+                js_secrets.append(th_secret)
+
     await emit(
         "phase_done",
         {
             "phase": "js_scan",
             "js_files": len(js_urls),
             "secrets_found": len(js_secrets),
+            "trufflehog_verified": len(trufflehog_secrets),
             **({"pre_filtered_public_keys": js_pre_filtered} if js_pre_filtered else {}),
         },
     )

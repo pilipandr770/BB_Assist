@@ -1,4 +1,4 @@
-"""Phase helpers for CORS/takeover/email/swagger/S3 security surface checks."""
+"""Phase helpers for CORS/takeover/email/swagger/S3/WPScan/CSP security surface checks."""
 
 from collections.abc import Awaitable, Callable
 import asyncio
@@ -21,6 +21,9 @@ async def run_security_surface_phase(
     all_target_urls: list[str],
     takeover_timeout_s: int,
     emit: EventEmitter,
+    detected_techs: set[str] | None = None,
+    http_results: list[dict] | None = None,
+    wpscan_api_token: str = "",
 ) -> dict:
     await emit("phase_start", {"phase": "cors_check"})
     await emit("tool_start", {"tool": "cors_checker", "detail": f"{min(len(live_urls), 120)} live URLs"})
@@ -82,6 +85,39 @@ async def run_security_surface_phase(
     await emit("tool_done", {"tool": "s3_enum", "count": len(s3_findings)})
     await emit("phase_done", {"phase": "s3_enum", "public_buckets": len(s3_findings)})
 
+    # ── WPScan (only when WordPress detected) ────────────────────────────────
+    wpscan_findings: list[dict] = []
+    _techs = detected_techs or set()
+    if "wordpress" in _techs or "woocommerce" in _techs:
+        wp_targets = [u for u in live_urls if is_in_scope(u, scope)][:3]
+        if wp_targets:
+            await emit("phase_start", {"phase": "wpscan"})
+            for wp_url in wp_targets:
+                await emit("tool_start", {"tool": "wpscan", "detail": wp_url})
+                wpscan_out = os.path.join(scan_dir, f"wpscan_{len(wpscan_findings)}.json")
+                try:
+                    results = await tool_runner.run_wpscan(
+                        wp_url, wpscan_out, api_token=wpscan_api_token
+                    )
+                    wpscan_findings.extend(results)
+                    await emit("tool_done", {"tool": "wpscan", "count": len(results), "url": wp_url})
+                except Exception as e:
+                    await emit("tool_error", {"tool": "wpscan", "error": str(e)[:120]})
+            await emit("phase_done", {"phase": "wpscan", "findings": len(wpscan_findings)})
+
+    # ── CSP Analyzer ─────────────────────────────────────────────────────────
+    csp_findings: list[dict] = []
+    if http_results:
+        await emit("phase_start", {"phase": "csp_analysis"})
+        await emit("tool_start", {"tool": "csp_analyzer", "detail": f"{len(http_results)} HTTP results"})
+        csp_out = os.path.join(scan_dir, "csp_findings.jsonl")
+        try:
+            csp_findings = await tool_runner.run_csp_analyzer(http_results, csp_out)
+        except Exception:
+            pass
+        await emit("tool_done", {"tool": "csp_analyzer", "count": len(csp_findings)})
+        await emit("phase_done", {"phase": "csp_analysis", "issues": len(csp_findings)})
+
     return {
         "all_target_urls": all_target_urls,
         "cors_findings": cors_findings,
@@ -89,4 +125,6 @@ async def run_security_surface_phase(
         "email_findings": email_findings,
         "swagger_findings": swagger_findings,
         "s3_findings": s3_findings,
+        "wpscan_findings": wpscan_findings,
+        "csp_findings": csp_findings,
     }

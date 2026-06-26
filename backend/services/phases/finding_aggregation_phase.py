@@ -28,6 +28,8 @@ def append_phase_findings(
     is_in_scope,
     graphql_findings: list[dict] | None = None,
     jwt_findings: list[dict] | None = None,
+    wpscan_findings: list[dict] | None = None,
+    csp_findings: list[dict] | None = None,
 ) -> list[dict]:
     for hit in nmap_csv_cve_hits:
         target_url = f"https://{hit['host']}:{hit['port']}"
@@ -290,6 +292,88 @@ def append_phase_findings(
             "type": "jwt-vulnerability",
             "_evidence": jwt.get("evidence", "")[:500],
             "_location": jwt.get("token_location", ""),
+        })
+
+    for wp in (wpscan_findings or []):
+        vuln_type_map = {
+            "vulnerable-plugin":         "outdated-component",
+            "vulnerable-theme":          "outdated-component",
+            "vulnerable-wordpress-core": "outdated-component",
+            "xmlrpc-enabled":            "misconfig",
+            "wp-user-enum":              "information-disclosure",
+            "wp-readme-exposed":         "information-disclosure",
+            "wp-debug-log":              "exposure",
+        }
+        wp_type = wp.get("type", "unknown")
+        cve_list = wp.get("cve", [])
+        cve_str = ", ".join(cve_list[:3]) if cve_list else ""
+        name = wp.get("title", f"WPScan: {wp_type}")
+
+        tags = ["wordpress", "cms"]
+        if cve_str:
+            tags.append("cve")
+        if "plugin" in wp_type:
+            tags.append("plugin")
+        elif "theme" in wp_type:
+            tags.append("theme")
+
+        desc = wp.get("description", "")
+        if not desc:
+            parts = []
+            if wp.get("plugin"):
+                parts.append(f"Plugin: {wp['plugin']} v{wp.get('plugin_version', '?')}")
+            if wp.get("theme"):
+                parts.append(f"Theme: {wp['theme']} v{wp.get('theme_version', '?')}")
+            if wp.get("wp_version"):
+                parts.append(f"WordPress core v{wp['wp_version']}")
+            if cve_str:
+                parts.append(f"CVE(s): {cve_str}")
+            if wp.get("fixed_in"):
+                parts.append(f"Fixed in: {wp['fixed_in']}")
+            if wp.get("users_count"):
+                parts.append(f"{wp['users_count']} user(s) enumerated")
+            desc = ". ".join(parts) if parts else name
+
+        raw_findings.append({
+            "_source": "wpscan",
+            "info": {
+                "name": name,
+                "severity": wp.get("severity", "medium"),
+                "tags": tags,
+                "description": desc,
+            },
+            "matched-at": wp.get("url", ""),
+            "type": vuln_type_map.get(wp_type, "misconfig"),
+            "_wpscan_type": wp_type,
+            "_cvss": wp.get("cvss"),
+            "_cve": cve_list,
+            "_fixed_in": wp.get("fixed_in", ""),
+            "_plugin": wp.get("plugin", ""),
+            "_theme": wp.get("theme", ""),
+        })
+
+    for csp in (csp_findings or []):
+        issues_text = "; ".join(
+            i.get("description", i.get("issue", ""))
+            for i in (csp.get("issues") or [])
+        )
+        raw_findings.append({
+            "_source": "csp_analyzer",
+            "info": {
+                "name": (
+                    "Missing Content-Security-Policy"
+                    if csp.get("type") == "csp-missing"
+                    else f"Weak Content-Security-Policy — {csp.get('issues_count', 1)} issue(s)"
+                ),
+                "severity": csp.get("severity", "medium"),
+                "tags": ["csp", "misconfig", "xss"],
+                "description": csp.get("impact", issues_text or "CSP policy weakness detected"),
+            },
+            "matched-at": csp.get("url", ""),
+            "type": "misconfig",
+            "_csp_type": csp.get("type", "csp-weakness"),
+            "_csp_issues": csp.get("issues", []),
+            "_csp_header": csp.get("csp", ""),
         })
 
     return raw_findings

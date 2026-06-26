@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # Hard cap to keep generated CSV bounded and scan-time matching fast.
     cve_cvelist_max_rows: int = 20000
 
+    # WPScan API token (https://wpscan.com/register — free tier: 25 req/day)
+    wpscan_api_token: Optional[str] = None
+
     # Telegram notifications (optional)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
