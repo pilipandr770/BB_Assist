@@ -123,6 +123,7 @@ class Report(BaseModel):
     severity: Severity
     cvss_score: Optional[float] = None
     cvss_vector: Optional[str] = None
+    notes: Optional[str] = None
     created_at: datetime = datetime.utcnow()
 
 

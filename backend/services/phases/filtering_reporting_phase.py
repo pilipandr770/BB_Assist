@@ -9,6 +9,7 @@ import aiofiles
 from backend import database
 from backend.models import Finding, ScanJob, Scope, Severity
 from backend.services import finding_filter, report_generator, telegram_notifier, tool_runner
+from backend.services.presubmit_gate import get_gate
 from backend.services.scope_parser import is_in_scope
 
 
@@ -162,9 +163,27 @@ async def run_filtering_reporting_phase(
                         target=finding.url,
                     )
 
+                # Pre-submission duplicate gate
+                gate_decision = await get_gate().evaluate(finding)
+                if gate_decision.blocked:
+                    await emit(
+                        "finding_duplicate",
+                        {
+                            "finding_id": finding.id,
+                            "title":      finding.title,
+                            "reason":     gate_decision.reason,
+                            "cached":     gate_decision.cached,
+                        },
+                    )
+                    continue
+
                 try:
                     report = await report_generator.generate(finding, scope)
                     job.reports_count += 1
+
+                    # Attach REVIEW warnings to report if needed
+                    for warn in gate_decision.warning_lines():
+                        report.notes = (report.notes or "") + f"\n{warn}"
 
                     async with aiofiles.open(finding_path, "w") as f:
                         await f.write(finding.model_dump_json(indent=2))
@@ -172,9 +191,10 @@ async def run_filtering_reporting_phase(
                     await emit(
                         "report_generated",
                         {
-                            "finding_id": finding.id,
-                            "report_id": report.id,
-                            "title": report.title,
+                            "finding_id":  finding.id,
+                            "report_id":   report.id,
+                            "title":       report.title,
+                            "dup_status":  gate_decision.status.value,
                         },
                     )
                 except Exception as report_error:

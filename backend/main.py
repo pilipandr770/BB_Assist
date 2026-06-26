@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend import database
+from backend.config import settings
 from backend.routers import programs, scans, reports, scorer, history, discover, ct_monitor
 from backend.services import cve_updater
 
@@ -90,6 +91,16 @@ async def lifespan(app: FastAPI):
     await database.init_db()
     _kill_child_processes()
     await _mark_zombie_scans()
+
+    # Wire Redis into the pre-submission duplicate gate
+    try:
+        import redis.asyncio as aioredis
+        from backend.services.presubmit_gate import init_gate
+        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        init_gate(_redis)
+    except Exception:
+        pass  # Gate runs without Redis (no caching)
+
     cve_refresh_task = asyncio.create_task(cve_updater.periodic_cve_csv_refresh_loop())
     yield
     # Shutdown: kill all child tool processes

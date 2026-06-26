@@ -11,6 +11,7 @@ import aiofiles
 from backend import database
 from backend.models import Finding, ScanJob, ScanStatus, Severity
 from backend.services import claude_service, finding_filter, report_generator, telegram_notifier
+from backend.services.presubmit_gate import get_gate
 
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
@@ -96,17 +97,34 @@ async def persist_raw_findings_phase(
                         target=finding.url,
                     )
 
+                # Pre-submission duplicate gate
+                gate_decision = await get_gate().evaluate(finding)
+                if gate_decision.blocked:
+                    await emit(
+                        "finding_duplicate",
+                        {
+                            "finding_id": finding.id,
+                            "title":      finding.title,
+                            "reason":     gate_decision.reason,
+                            "cached":     gate_decision.cached,
+                        },
+                    )
+                    continue
+
                 try:
                     report = await report_generator.generate(finding, scope)
                     job.reports_count += 1
+                    for warn in gate_decision.warning_lines():
+                        report.notes = (report.notes or "") + f"\n{warn}"
                     async with aiofiles.open(finding_path, "w") as f:
                         await f.write(finding.model_dump_json(indent=2))
                     await emit(
                         "report_generated",
                         {
                             "finding_id": finding.id,
-                            "report_id": report.id,
-                            "title": report.title,
+                            "report_id":  report.id,
+                            "title":      report.title,
+                            "dup_status": gate_decision.status.value,
                         },
                     )
                 except Exception as report_error:
