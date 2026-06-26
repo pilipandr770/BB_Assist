@@ -6,11 +6,13 @@ import json
 import os
 import uuid
 
+
 import aiofiles
 
 from backend import database
-from backend.models import Finding, ScanJob, ScanStatus, Severity
+from backend.models import Finding, PocResult, ScanJob, ScanStatus, Severity
 from backend.services import claude_service, finding_filter, report_generator, telegram_notifier
+from backend.services.impact_validator import ProbeStatus, run_for_finding
 from backend.services.presubmit_gate import get_gate
 
 
@@ -110,6 +112,29 @@ async def persist_raw_findings_phase(
                         },
                     )
                     continue
+
+                # Non-destructive PoC validation
+                try:
+                    probe = await run_for_finding(finding)
+                    if probe and probe.status == ProbeStatus.CONFIRMED:
+                        finding.poc_result = PocResult(
+                            confirmed=True,
+                            evidence=json.dumps(probe.evidence, ensure_ascii=False),
+                            safe_output=probe.summary(),
+                            request=probe.poc_command or None,
+                            response_snippet=probe.to_report_block() or None,
+                        )
+                        await emit(
+                            "impact_validated",
+                            {
+                                "finding_id": finding.id,
+                                "vuln_type":  probe.vuln_type,
+                                "status":     probe.status.value,
+                                "note":       probe.note[:200],
+                            },
+                        )
+                except Exception:
+                    pass
 
                 try:
                     report = await report_generator.generate(finding, scope)
