@@ -231,6 +231,16 @@ def _extract_usage(message) -> tuple[int, int]:
     return int(in_tokens or 0), int(out_tokens or 0)
 
 
+def _is_claude4(model: str) -> bool:
+    m = (model or "").lower()
+    return (
+        "claude-opus-4" in m
+        or "claude-sonnet-4" in m
+        or "claude-haiku-4" in m
+        or "claude-fable" in m
+    )
+
+
 async def _create_message(task: str, **kwargs):
     chain = _model_chain(task)
     last_error = None
@@ -239,6 +249,8 @@ async def _create_message(task: str, **kwargs):
             call_kwargs = dict(kwargs)
             if "messages" in call_kwargs:
                 call_kwargs["messages"] = _maybe_compress(call_kwargs["messages"], model)
+            if _is_claude4(model):
+                call_kwargs.pop("temperature", None)
             message = await client.messages.create(model=model, **call_kwargs)
             in_tokens, out_tokens = _extract_usage(message)
             _usage_increment(task=task, model=model, input_tokens=in_tokens, output_tokens=out_tokens)
