@@ -10,13 +10,16 @@ Requires in .env:
 
 Notes on the H1 /hackers/programs list endpoint:
   - Returns: handle, name, offers_bounties, submission_state, open_scope,
-             fast_payments, gold_standard_safe_harbor, policy (full markdown)
+             fast_payments, gold_standard_safe_harbor, policy (full markdown),
+             started_accepting_at (ISO datetime, may be null)
   - Does NOT return: bounty amounts, response times, last_report_accepted_at
     (those fields are on /v1/programs/{handle} which requires program-staff auth)
-  - We therefore filter only by offers_bounties + submission_state == open
-  - The `policy` markdown field is used directly as raw_text for scope parsing
+  - We filter by offers_bounties + submission_state == open
+  - Seen-programs tracker (h1_seen_programs.json) enables "new since last check"
 """
+import json
 import logging
+from pathlib import Path
 
 import httpx
 
@@ -25,7 +28,6 @@ from backend.config import settings
 log = logging.getLogger("h1_discovery")
 H1_BASE = "https://api.hackerone.com/v1"
 
-# Asset types we care about for web/API scanning
 _WEB_TYPES = {"URL", "WILDCARD", "CIDR", "IP_ADDRESS"}
 
 
@@ -36,6 +38,37 @@ def has_credentials() -> bool:
 def _auth() -> tuple[str, str]:
     return (settings.h1_username or "", settings.h1_api_token or "")
 
+
+# ── seen-programs tracker ────────────────────────────────────────────────────
+
+def _seen_file() -> Path:
+    return Path(settings.workspace_dir) / "h1_seen_programs.json"
+
+
+def _load_seen() -> set[str]:
+    f = _seen_file()
+    if f.exists():
+        try:
+            return set(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return set()
+
+
+def _save_seen(handles: set[str]) -> None:
+    f = _seen_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(sorted(handles), indent=2), encoding="utf-8")
+
+
+def mark_seen(handles: list[str]) -> None:
+    """Add handles to the persistent seen set."""
+    seen = _load_seen()
+    seen.update(handles)
+    _save_seen(seen)
+
+
+# ── H1 API helpers ───────────────────────────────────────────────────────────
 
 async def _fetch_page(page: int, size: int) -> tuple[list, bool]:
     """Fetch one page from /hackers/programs. Returns (items, has_next)."""
@@ -54,15 +87,27 @@ async def _fetch_page(page: int, size: int) -> tuple[list, bool]:
     return data.get("data", []), has_next
 
 
+def _build_program(attrs: dict, seen: set[str]) -> dict:
+    handle = attrs.get("handle") or ""
+    return {
+        "handle": handle,
+        "name": attrs.get("name"),
+        "open_scope": attrs.get("open_scope", False),
+        "fast_payments": attrs.get("fast_payments", False),
+        "gold_standard": attrs.get("gold_standard_safe_harbor", False),
+        "policy_preview": (attrs.get("policy") or "")[:300],
+        "started_accepting_at": attrs.get("started_accepting_at"),
+        "is_new": handle not in seen,
+    }
+
+
 async def list_programs(page: int = 1, size: int = 50) -> list[dict]:
     """
-    Fetch open bounty programs from HackerOne.
-    Filters: offers_bounties=True AND submission_state="open".
-
-    Note: bounty amounts are not available from this endpoint.
-    The `policy_preview` field contains the first 300 chars of the program policy.
+    Fetch one page of open bounty programs. Marks is_new=True for handles
+    not yet in the seen file.
     """
     items, _ = await _fetch_page(page, size)
+    seen = _load_seen()
     results = []
     for item in items:
         attrs = item.get("attributes", {})
@@ -70,16 +115,52 @@ async def list_programs(page: int = 1, size: int = 50) -> list[dict]:
             continue
         if attrs.get("submission_state") != "open":
             continue
-        results.append({
-            "handle": attrs.get("handle"),
-            "name": attrs.get("name"),
-            "open_scope": attrs.get("open_scope", False),
-            "fast_payments": attrs.get("fast_payments", False),
-            "gold_standard": attrs.get("gold_standard_safe_harbor", False),
-            "policy_preview": (attrs.get("policy") or "")[:300],
-        })
+        results.append(_build_program(attrs, seen))
     return results
 
+
+async def get_new_programs(max_pages: int = 10) -> tuple[list[dict], int]:
+    """
+    Scan up to max_pages×100 H1 programs and return only those not yet in the
+    seen file that offer bounties and have open submissions.
+
+    Returned list is sorted by started_accepting_at descending (newest first).
+    Does NOT update the seen file — call mark_seen() explicitly when the user
+    is done reviewing (e.g. "Mark all seen" button).
+
+    Returns (new_programs, total_items_scanned).
+    """
+    seen = _load_seen()
+    new_programs: list[dict] = []
+    total_scanned = 0
+
+    for page in range(1, max_pages + 1):
+        items, has_next = await _fetch_page(page, 100)
+        total_scanned += len(items)
+
+        for item in items:
+            attrs = item.get("attributes", {})
+            handle = attrs.get("handle") or ""
+            if not handle:
+                continue
+            if not attrs.get("offers_bounties"):
+                continue
+            if attrs.get("submission_state") != "open":
+                continue
+            if handle not in seen:
+                new_programs.append(_build_program(attrs, seen))
+
+        if not has_next:
+            break
+
+    new_programs.sort(
+        key=lambda x: x.get("started_accepting_at") or "",
+        reverse=True,
+    )
+    return new_programs, total_scanned
+
+
+# ── program data fetchers ────────────────────────────────────────────────────
 
 async def get_policy_text(handle: str) -> str:
     """
@@ -112,8 +193,6 @@ async def get_program_scopes(handle: str) -> tuple[list[dict], list[dict]]:
                 headers={"Accept": "application/json"},
             )
             if resp.status_code in (401, 403):
-                # Structured scopes require program-staff auth for many programs;
-                # fall back to policy text only.
                 log.debug("structured_scopes %s: %s (ignored)", handle, resp.status_code)
                 break
             resp.raise_for_status()
@@ -148,13 +227,11 @@ def build_program_text(
     out_of_scope: list[dict],
 ) -> str:
     """
-    Combine the H1 policy markdown with structured scope data.
-    The policy text is used as-is (it's what H1 shows to hackers).
-    Structured scopes are appended as a structured supplement.
+    Combine the H1 policy markdown with structured scope data into normalized
+    text for Claude scope parsing.
     """
     lines: list[str] = []
 
-    # Use existing policy text as the primary source
     if policy_text:
         lines.append(policy_text.strip())
         lines.append("")

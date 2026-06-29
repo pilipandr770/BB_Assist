@@ -16,7 +16,7 @@ from datetime import datetime
 
 import aiofiles
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from backend import database
 from backend.config import settings
@@ -102,6 +102,9 @@ async def _do_import(handle: str, name: str) -> tuple[str, "Program"]:
     Fetch H1 policy text + structured scopes, build program text,
     parse with Claude, persist to disk. Returns (slug, program).
     """
+    # Mark this program seen as soon as we start importing it
+    h1_discovery.mark_seen([handle])
+
     # Fetch policy text and scopes in parallel
     try:
         policy_text, (in_scope, out_of_scope) = await asyncio.gather(
@@ -171,6 +174,39 @@ async def discover_programs(
         raise HTTPException(status_code=502, detail=f"HackerOne API error: {exc}")
 
     return {"programs": programs, "count": len(programs)}
+
+
+@router.get("/new-programs")
+async def discover_new_programs(max_pages: int = Query(10, ge=1, le=20)):
+    """
+    Return open bounty programs not yet seen, sorted by newest first.
+    Scans up to max_pages×100 H1 programs.
+    Does NOT mark them seen — call POST /mark-seen when the user is done.
+    """
+    if not h1_discovery.has_credentials():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "H1_USERNAME and H1_API_TOKEN must be set in .env — "
+                "generate a token at https://hackerone.com/settings/api_token/edit"
+            ),
+        )
+    try:
+        programs, total_scanned = await h1_discovery.get_new_programs(max_pages=max_pages)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except Exception as exc:
+        log.error("H1 new-programs error: %s", exc)
+        raise HTTPException(status_code=502, detail=f"HackerOne API error: {exc}")
+
+    return {"programs": programs, "count": len(programs), "total_scanned": total_scanned}
+
+
+@router.post("/mark-seen")
+async def mark_seen_handles(handles: list[str] = Body(...)):
+    """Mark the given program handles as seen so they no longer appear as 'new'."""
+    h1_discovery.mark_seen(handles)
+    return {"marked": len(handles)}
 
 
 @router.post("/import/{handle}")
