@@ -1,8 +1,8 @@
 {
   "source_url": "https://github.com/CVEProject/cvelistV5",
   "source_kind": "cvelistv5",
-  "last_checked_utc": "2026-06-13T10:03:39.947594+00:00",
-  "last_success_utc": "2026-06-13T10:03:39.947594+00:00",
+  "last_checked_utc": "2026-06-29T11:25:53.664860+00:00",
+  "last_success_utc": "2026-06-29T11:25:53.664860+00:00",
   "rows": 20000,
-  "sha256": "fe416873f18492986e45dfcf6c4020f78162e22f677c0671135d137960bae47a"
+  "sha256": "3865993490e29269737d999f50583024f19faa6192d91481eb67ec9d327901d1"
 }
