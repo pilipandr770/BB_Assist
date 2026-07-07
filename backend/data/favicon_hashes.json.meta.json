@@ -1,0 +1,20 @@
+{
+  "source_url": "https://github.com/BishopFox/Favicons",
+  "source_kind": "bishopfox_favicons",
+  "source_license": "MIT",
+  "hash_algorithm": "mmh3.hash(base64.encodebytes(favicon_bytes)) — Shodan/Censys http.favicon.hash compatible",
+  "generated_from": ["identified.csv", "data/known_favicons.json"],
+  "entries": 3300,
+  "categories": {
+    "technologies": 2970,
+    "cves": 160,
+    "exposed-panels": 115,
+    "misconfiguration": 22,
+    "vulnerabilities": 17,
+    "default-logins": 9,
+    "iot": 3,
+    "cnvd": 2,
+    "exposures": 2
+  },
+  "sha256": "c3ea8bb7bfb30ff5aa9770658015a03d62a51fab35b9d469a38f95235584051f"
+}

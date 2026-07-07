@@ -272,6 +272,7 @@ async def run_web_pipeline(
     crawled_urls = phase2_urls["crawled_urls"]
     all_target_urls: list[str] = phase2_urls["all_target_urls"]
     cred_urls = phase2_urls["cred_urls"]
+    favicon_findings = phase2_urls.get("favicon_findings", [])
 
     await emit("phase_done", {
         "phase": "active_recon",
@@ -447,6 +448,7 @@ async def run_web_pipeline(
         jwt_findings=jwt_findings,
         wpscan_findings=wpscan_findings,
         csp_findings=csp_findings,
+        favicon_findings=favicon_findings,
     )
 
     phase_filter = await run_filtering_reporting_phase(
