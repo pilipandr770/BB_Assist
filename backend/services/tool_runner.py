@@ -3968,6 +3968,7 @@ async def run_wpscan(
     API token (free): https://wpscan.com/register
     Without a token WPScan still detects plugins/themes/users but can't report CVEs.
     """
+    import logging
     import shutil
     log = logging.getLogger("tool_runner")
 
@@ -4152,6 +4153,7 @@ async def run_csp_analyzer(http_results: list[dict], output_file: str) -> list[d
       - missing frame-ancestors (clickjacking risk if no X-Frame-Options)
       - missing default-src or script-src (no baseline policy)
     """
+    import logging
     log = logging.getLogger("tool_runner")
     findings: list[dict] = []
     seen_urls: set[str] = set()
@@ -4278,3 +4280,142 @@ async def run_csp_analyzer(http_results: list[dict], output_file: str) -> list[d
 
     log.info("csp_analyzer: %d findings from %d URLs", len(findings), len(seen_urls))
     return findings
+
+
+# ── Favicon fingerprinting (BishopFox/Favicons, MIT) ───────────────────────────
+
+_FAVICON_HASH_DB: Optional[dict] = None
+
+# category → (vuln_type, severity) for hashes worth reporting as findings.
+# Anything under "technologies" is treated as a plain tech-stack signal instead
+# (merged into detected_techs, no finding raised).
+_FAVICON_INTERESTING_CATEGORIES: dict[str, tuple[str, str]] = {
+    "exposed-panels":   ("exposed-panel", "low"),
+    "iot":              ("exposed-panel", "low"),
+    "default-logins":   ("exposed-panel", "medium"),
+    "cves":             ("outdated-component", "low"),
+    "vulnerabilities":  ("outdated-component", "low"),
+    "cnvd":             ("outdated-component", "low"),
+    "misconfiguration": ("misconfig", "low"),
+    "exposures":        ("information-disclosure", "low"),
+}
+
+
+def _load_favicon_hashes() -> dict:
+    """Lazy-load the favicon hash → product database (BishopFox/Favicons, MIT)."""
+    global _FAVICON_HASH_DB
+    if _FAVICON_HASH_DB is None:
+        db_path = Path(__file__).resolve().parent.parent / "data" / "favicon_hashes.json"
+        try:
+            with open(db_path) as f:
+                _FAVICON_HASH_DB = json.load(f)
+        except Exception:
+            _FAVICON_HASH_DB = {}
+    return _FAVICON_HASH_DB
+
+
+def _favicon_mmh3_hash(content: bytes) -> str:
+    """Shodan/Censys-compatible favicon hash: mmh3.hash(base64(bytes))."""
+    import base64
+    import mmh3
+
+    return str(mmh3.hash(base64.encodebytes(content)))
+
+
+async def run_favicon_fingerprint(base_urls: list[str], scan_dir: str) -> dict:
+    """
+    Fetch /favicon.ico from each base host and match against the BishopFox
+    favicon-hash database to fingerprint products that don't reveal themselves
+    via headers/cookies — exposed management panels, IoT device UIs, EOL
+    software with known CVEs. Uses the same hashing scheme as Shodan's
+    `http.favicon.hash` (mmh3 of the base64-encoded favicon bytes), so hits
+    are also directly searchable there for context.
+
+    Returns:
+        {
+          "tech_names": [...]  generic product names — caller should merge
+                               these into detected_techs for nuclei tagging.
+          "findings":   [...]  {url, name, description, cpe, category,
+                               vuln_type, severity, favicon_hash} for
+                               security-relevant categories only (exposed
+                               panels, IoT, default logins, CVE-linked
+                               software) — plain tech matches are excluded.
+        }
+    """
+    import logging
+    log = logging.getLogger("tool_runner")
+
+    if not base_urls:
+        return {"tech_names": [], "findings": []}
+
+    db = _load_favicon_hashes()
+    if not db:
+        return {"tech_names": [], "findings": []}
+
+    seen_hosts: set[str] = set()
+    base_hosts: list[str] = []
+    for url in base_urls:
+        try:
+            parsed = urlparse(url)
+            base = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            continue
+        if base and base not in seen_hosts:
+            seen_hosts.add(base)
+            base_hosts.append(base)
+        if len(base_hosts) >= 40:
+            break
+
+    tech_names: set[str] = set()
+    findings: list[dict] = []
+
+    async with _httpx.AsyncClient(
+        timeout=8,
+        follow_redirects=True,
+        verify=False,
+        headers={"User-Agent": "Mozilla/5.0 (security-research)"},
+    ) as client:
+        for base in base_hosts:
+            try:
+                resp = await client.get(f"{base}/favicon.ico")
+                if resp.status_code != 200 or len(resp.content) < 20:
+                    continue
+
+                fav_hash = _favicon_mmh3_hash(resp.content)
+                match = db.get(fav_hash)
+                if not match:
+                    continue
+
+                name = (match.get("name") or "").strip()
+                category = match.get("category", "technologies")
+
+                if category == "technologies":
+                    if name:
+                        tech_names.add(name.lower().split("/")[0].strip())
+                    continue
+
+                vuln_type, severity = _FAVICON_INTERESTING_CATEGORIES.get(
+                    category, ("information-disclosure", "low")
+                )
+                findings.append({
+                    "url": base,
+                    "name": name,
+                    "description": match.get("description", ""),
+                    "cpe": match.get("cpe"),
+                    "category": category,
+                    "vuln_type": vuln_type,
+                    "severity": severity,
+                    "favicon_hash": fav_hash,
+                })
+                log.info("favicon_fingerprint: %s -> %s (%s)", base, name, category)
+            except Exception as e:
+                log.debug("favicon_fingerprint[%s]: %s", base, e)
+                continue
+
+    if findings:
+        output_file = os.path.join(scan_dir, "favicon_findings.jsonl")
+        with open(output_file, "w") as f:
+            for finding in findings:
+                f.write(json.dumps(finding) + "\n")
+
+    return {"tech_names": sorted(tech_names), "findings": findings}

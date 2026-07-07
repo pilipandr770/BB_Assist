@@ -33,6 +33,10 @@ async def _fake_run_katana(_urls, _out_path, session_cookies="", auth_header="")
     return ["https://api.example.com/app.js"]
 
 
+async def _fake_run_favicon_fingerprint(_base_urls, _scan_dir):
+    return {"tech_names": ["mikrotik"], "findings": []}
+
+
 async def test_run_url_recon_phase_basic(monkeypatch):
     monkeypatch.setattr(url_recon_phase.tool_runner, "run_httpx", _fake_run_httpx)
     monkeypatch.setattr(url_recon_phase.tool_runner, "run_nmap", _fake_run_nmap)
@@ -41,6 +45,7 @@ async def test_run_url_recon_phase_basic(monkeypatch):
     monkeypatch.setattr(url_recon_phase.tool_runner, "extract_service_versions_from_httpx", _fake_extract_service_versions_from_httpx)
     monkeypatch.setattr(url_recon_phase.tool_runner, "run_gau", _fake_run_gau)
     monkeypatch.setattr(url_recon_phase.tool_runner, "run_katana", _fake_run_katana)
+    monkeypatch.setattr(url_recon_phase.tool_runner, "run_favicon_fingerprint", _fake_run_favicon_fingerprint)
 
     events = []
 
@@ -68,7 +73,10 @@ async def test_run_url_recon_phase_basic(monkeypatch):
 
     assert "https://api.example.com" in result["live_urls"]
     assert "react" in result["detected_techs"]
+    assert "mikrotik" in result["detected_techs"]
+    assert result["favicon_findings"] == []
     assert len(result["all_target_urls"]) >= 1
     assert len(result["cred_urls"]) == 1
     assert any(e[0] == "tool_start" and e[1].get("tool") == "httpx" for e in events)
     assert any(e[0] == "tool_done" and e[1].get("tool") == "gau" for e in events)
+    assert any(e[0] == "tool_done" and e[1].get("tool") == "favicon_fingerprint" for e in events)

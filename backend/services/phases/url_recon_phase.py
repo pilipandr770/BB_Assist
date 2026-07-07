@@ -290,6 +290,13 @@ async def run_url_recon_phase(
     async with aiofiles.open(os.path.join(recon_dir, "all_urls.txt"), "w", encoding="utf-8") as f:
         await f.write("\n".join(sorted(all_target_urls)))
 
+    await emit("tool_start", {"tool": "favicon_fingerprint", "detail": f"{len(live_urls)} hosts"})
+    favicon_result = await tool_runner.run_favicon_fingerprint(live_urls, recon_dir)
+    favicon_findings = favicon_result.get("findings", [])
+    if favicon_result.get("tech_names"):
+        detected_techs.update(favicon_result["tech_names"])
+    await emit("tool_done", {"tool": "favicon_fingerprint", "count": len(favicon_findings)})
+
     return {
         "live_urls": live_urls,
         "http_results": http_results,
@@ -300,4 +307,5 @@ async def run_url_recon_phase(
         "crawled_urls": crawled_urls,
         "all_target_urls": all_target_urls,
         "cred_urls": cred_urls,
+        "favicon_findings": favicon_findings,
     }

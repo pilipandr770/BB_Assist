@@ -30,6 +30,7 @@ def append_phase_findings(
     jwt_findings: list[dict] | None = None,
     wpscan_findings: list[dict] | None = None,
     csp_findings: list[dict] | None = None,
+    favicon_findings: list[dict] | None = None,
 ) -> list[dict]:
     for hit in nmap_csv_cve_hits:
         target_url = f"https://{hit['host']}:{hit['port']}"
@@ -374,6 +375,32 @@ def append_phase_findings(
             "_csp_type": csp.get("type", "csp-weakness"),
             "_csp_issues": csp.get("issues", []),
             "_csp_header": csp.get("csp", ""),
+        })
+
+    for fav in (favicon_findings or []):
+        category = fav.get("category", "misconfiguration")
+        name = fav.get("name", "Unknown Product")
+        if category in ("exposed-panels", "iot", "default-logins"):
+            title = f"Exposed Management Interface: {name}"
+        elif category in ("cves", "vulnerabilities", "cnvd"):
+            title = f"Fingerprinted Vulnerable Software: {name}"
+        else:
+            title = f"Favicon-Fingerprinted Software: {name}"
+
+        raw_findings.append({
+            "_source": "favicon_fingerprint",
+            "info": {
+                "name": title,
+                "severity": fav.get("severity", "low"),
+                "tags": ["favicon-fingerprint", category],
+                "description": fav.get("description", "") + (
+                    f" (CPE: {fav['cpe']})" if fav.get("cpe") else ""
+                ),
+            },
+            "matched-at": fav.get("url", ""),
+            "type": fav.get("vuln_type", "information-disclosure"),
+            "_favicon_hash": fav.get("favicon_hash", ""),
+            "_category": category,
         })
 
     return raw_findings

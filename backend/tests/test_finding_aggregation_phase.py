@@ -40,3 +40,44 @@ def test_append_phase_findings_adds_expected_records():
     assert any(item.get("_source") == "js_scanner" for item in out)
     assert any(item.get("_source") == "gau_credentials" for item in out)
     assert any(item.get("_source") == "github_dork" and item.get("info", {}).get("severity") == "high" for item in out)
+
+
+def test_append_phase_findings_converts_favicon_findings():
+    scope = Scope(in_scope_domains=["*.example.com"], in_scope_urls=["https://app.example.com"])
+
+    out = append_phase_findings(
+        raw_findings=[],
+        scope=scope,
+        nmap_csv_cve_hits=[],
+        js_secrets=[],
+        bypasses=[],
+        cors_findings=[],
+        takeover_findings=[],
+        email_findings=[],
+        swagger_findings=[],
+        s3_findings=[],
+        dalfox_findings=[],
+        cred_urls=[],
+        github_findings=[],
+        is_in_scope=lambda url, _scope: "example.com" in url,
+        favicon_findings=[
+            {
+                "url": "https://app.example.com",
+                "name": "MikroTik RouterOS",
+                "description": "MikroTik RouterOS WebFig",
+                "cpe": "cpe:2.3:o:mikrotik:routeros",
+                "category": "exposed-panels",
+                "vuln_type": "exposed-panel",
+                "severity": "low",
+                "favicon_hash": "1924358485",
+            }
+        ],
+    )
+
+    assert len(out) == 1
+    finding = out[0]
+    assert finding["_source"] == "favicon_fingerprint"
+    assert finding["type"] == "exposed-panel"
+    assert finding["info"]["severity"] == "low"
+    assert "MikroTik RouterOS" in finding["info"]["name"]
+    assert finding["matched-at"] == "https://app.example.com"
