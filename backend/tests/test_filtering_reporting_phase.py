@@ -15,6 +15,7 @@ async def _fake_report_generate(_finding, _scope):
     class _Report:
         id = "rep-1"
         title = "Generated"
+        notes = None
 
     return _Report()
 

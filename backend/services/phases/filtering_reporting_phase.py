@@ -10,7 +10,7 @@ from backend import database
 from backend.models import Finding, ScanJob, Scope, Severity
 from backend.models import PocResult
 from backend.services import finding_filter, report_generator, telegram_notifier, tool_runner
-from backend.services.impact_validator import ProbeStatus, run_for_finding
+from backend.services.impact_validator import ProbeStatus, run_for_finding, synthesize_from_tool_evidence
 from backend.services.presubmit_gate import get_gate
 from backend.services.scope_parser import is_in_scope
 
@@ -182,6 +182,11 @@ async def run_filtering_reporting_phase(
                 # Non-destructive PoC validation
                 try:
                     probe = await run_for_finding(finding)
+                    if not probe:
+                        # No active probe applies (e.g. sqlmap/dalfox/cors/takeover/
+                        # 403-bypass) — these tools already confirmed live during
+                        # the scan, so repackage that evidence instead of a fresh probe.
+                        probe = synthesize_from_tool_evidence(finding)
                     if probe and probe.status == ProbeStatus.CONFIRMED:
                         finding.poc_result = PocResult(
                             confirmed=True,

@@ -437,6 +437,94 @@ async def run_for_finding(finding) -> Optional[ProbeResult]:
     return None
 
 
+# Sources whose tool ALREADY performed a live, non-destructive confirmation
+# request during the scan (sqlmap's time-based blind retest, dalfox's payload
+# reflection check, cors_checker's live Origin-reflection probe,
+# subdomain_takeover's CNAME/fingerprint match, 403_bypass's live retest).
+# No extra network call here — this only repackages evidence that already
+# exists into the standard PocResult shape, so these findings get the same
+# report/UI treatment as the active probes above instead of silently having
+# no poc_result despite already being tool-confirmed.
+_TOOL_CONFIRMED_SOURCES = {"sqlmap", "dalfox", "cors_checker", "subdomain_takeover", "403_bypass"}
+
+
+def synthesize_from_tool_evidence(finding) -> Optional[ProbeResult]:
+    """
+    Build a ProbeResult from evidence a specialized tool already captured
+    live during the scan — no network call. Returns None for sources this
+    doesn't recognize (fall through to nuclei's own raw match, unconfirmed).
+    """
+    try:
+        raw = json.loads(finding.raw_output or "{}")
+    except Exception:
+        return None
+
+    source = raw.get("_source", "")
+    if source not in _TOOL_CONFIRMED_SOURCES:
+        return None
+
+    url = raw.get("matched-at") or finding.url
+
+    if source == "sqlmap":
+        evidence_text = raw.get("info", {}).get("description", "")
+        return ProbeResult(
+            status=ProbeStatus.CONFIRMED,
+            vuln_type="sqlmap_sqli",
+            evidence={"technique": "time-based blind", "sqlmap_output": evidence_text[:500]},
+            poc_command=f'sqlmap -u "{url}" --technique=T --risk=1 --batch',
+            note="sqlmap confirmed time-based blind SQL injection via a live retest.",
+        )
+
+    if source == "dalfox":
+        return ProbeResult(
+            status=ProbeStatus.CONFIRMED,
+            vuln_type="dalfox_xss",
+            evidence={"param": raw.get("_param", ""), "reflection": raw.get("_evidence", "")[:400]},
+            poc_command=f'dalfox url "{url}"',
+            note="dalfox confirmed payload reflection in a live response.",
+        )
+
+    if source == "cors_checker":
+        return ProbeResult(
+            status=ProbeStatus.CONFIRMED,
+            vuln_type="cors_misconfig",
+            evidence={
+                "origin_sent": raw.get("_origin_sent", ""),
+                "access_control_allow_origin": raw.get("_acao", ""),
+                "access_control_allow_credentials": raw.get("_acac", ""),
+            },
+            poc_command=f'curl -s -I -H "Origin: {raw.get("_origin_sent", "https://evil.com")}" "{url}"',
+            note="Live probe confirmed the server reflects an attacker-controlled Origin.",
+        )
+
+    if source == "subdomain_takeover":
+        return ProbeResult(
+            status=ProbeStatus.CONFIRMED,
+            vuln_type="subdomain_takeover",
+            evidence={
+                "provider": raw.get("_provider", ""),
+                "fingerprint": raw.get("_fingerprint", ""),
+                "evidence_url": raw.get("_evidence_url", ""),
+            },
+            poc_command=f'curl -s "{url}"',
+            note=f"CNAME resolves to an unclaimed {raw.get('_provider', '')} resource — fingerprint matched live.",
+        )
+
+    if source == "403_bypass":
+        return ProbeResult(
+            status=ProbeStatus.CONFIRMED,
+            vuln_type="403_bypass",
+            evidence={
+                "bypass_payload": raw.get("_bypass_payload", ""),
+                "resulting_status": raw.get("_bypass_status", ""),
+            },
+            poc_command=f'curl -s -o /dev/null -w "%{{http_code}}\\n" "{url}" {raw.get("_bypass_payload", "")}',
+            note="Live retest confirmed the bypass technique changes the response status code.",
+        )
+
+    return None
+
+
 # ──────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────
