@@ -181,6 +181,14 @@ function ReportCard({ report, programId, onClick }) {
           </div>
           <div style={{ color: '#8b949e', fontSize: 12 }}>
             {date && <span>Generated: {date}</span>}
+            {typeof report.cvss_score === 'number' && (
+              <>
+                <span style={{ margin: '0 8px' }}>·</span>
+                <span title={report.cvss_vector || ''} style={{ color: color, fontWeight: 600 }}>
+                  CVSS {report.cvss_score.toFixed(1)}
+                </span>
+              </>
+            )}
             <span style={{ margin: '0 8px' }}>·</span>
             {hasScore && (
               <>

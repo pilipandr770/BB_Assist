@@ -19,6 +19,7 @@ from backend.services.claude_service import (
     generate_report as claude_generate_report,
     rewrite_report_with_quality_feedback,
 )
+from backend.services.cvss_calculator import extract_cvss_vector, score_and_reconcile
 
 
 def _evaluate_report_quality(markdown: str, finding: Finding) -> dict:
@@ -59,6 +60,12 @@ def _evaluate_report_quality(markdown: str, finding: Finding) -> dict:
     if "CVSS Vector" not in markdown:
         issues.append("CVSS vector is missing.")
         score -= 10
+    elif not extract_cvss_vector(markdown):
+        issues.append(
+            "CVSS vector is present but malformed — must be a valid CVSS:3.0 or "
+            "CVSS:3.1 vector string (e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N)."
+        )
+        score -= 15
 
     if "**One-liner (curl):**" not in markdown:
         issues.append("PoC curl one-liner section is missing.")
@@ -175,6 +182,26 @@ def _extract_title_and_severity(markdown: str) -> tuple[str, Severity]:
     return "Vulnerability Report", Severity.medium
 
 
+_CVSS_SCORE_LINE_RE = re.compile(r"(\*\*CVSS Score\*\*:\s*)([^\n]+)")
+_TITLE_SEVERITY_BRACKET_RE = re.compile(
+    r"^(#\s*)\[(CRITICAL|HIGH|MEDIUM|LOW|INFORMATIVE)\]", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _reconcile_cvss_in_markdown(markdown: str, score: float, severity: Severity) -> str:
+    """
+    Replace the displayed CVSS Score value and the title's severity bracket
+    with the deterministically-computed ones, so the report Claude wrote
+    is internally consistent with the vector it also wrote — instead of
+    trusting an LLM-guessed score that may not mathematically match its
+    own vector.
+    """
+    label = severity.value.upper()
+    markdown = _CVSS_SCORE_LINE_RE.sub(rf"\g<1>{score} ({label.title()})", markdown, count=1)
+    markdown = _TITLE_SEVERITY_BRACKET_RE.sub(rf"\g<1>[{label}]", markdown, count=1)
+    return markdown
+
+
 async def generate(finding: Finding, scope: Scope) -> Report:
     """
     Generate and save a markdown report for a confirmed finding.
@@ -192,6 +219,15 @@ async def generate(finding: Finding, scope: Scope) -> Report:
 
     title, severity = _extract_title_and_severity(markdown)
 
+    # Deterministic CVSS: recompute score+severity from whatever vector
+    # Claude wrote, rather than trusting its free-text score/severity guess.
+    cvss_score: float | None = None
+    cvss_vector: str | None = None
+    cvss_result = score_and_reconcile(markdown)
+    if cvss_result:
+        cvss_score, severity, cvss_vector = cvss_result
+        markdown = _reconcile_cvss_in_markdown(markdown, cvss_score, severity)
+
     report = Report(
         id=str(uuid.uuid4()),
         finding_id=finding.id,
@@ -199,6 +235,8 @@ async def generate(finding: Finding, scope: Scope) -> Report:
         markdown=markdown,
         title=title,
         severity=severity,
+        cvss_score=cvss_score,
+        cvss_vector=cvss_vector,
     )
 
     # Derive program slug from program_id (slug is stored as program_id in our system)
@@ -230,6 +268,8 @@ async def save_report(report: Report, program_slug: str, quality: dict | None = 
         "program_id": report.program_id,
         "title": report.title,
         "severity": report.severity if isinstance(report.severity, str) else report.severity.value,
+        "cvss_score": report.cvss_score,
+        "cvss_vector": report.cvss_vector,
         "created_at": datetime.utcnow().isoformat(),
         "quality": quality or {"score": None, "gate_passed": None, "hard_blocked": None, "issues": []},
     }

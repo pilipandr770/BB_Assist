@@ -217,6 +217,12 @@ export default function ReportViewer() {
             <span style={{ color: '#8b949e', fontSize: 12 }}>
               Status: {meta.quality.hard_blocked ? 'Hard-blocked' : meta.quality.gate_passed ? 'Passed' : 'Needs review'}
             </span>
+            {typeof meta.cvss_score === 'number' && (
+              <span style={{ color: '#8b949e', fontSize: 12 }} title={meta.cvss_vector || ''}>
+                CVSS: <strong style={{ color: '#c9d1d9' }}>{meta.cvss_score.toFixed(1)}</strong>
+                {' '}(computed from vector, not LLM-estimated)
+              </span>
+            )}
           </div>
           {Array.isArray(meta.quality.issues) && meta.quality.issues.length > 0 && (
             <div style={{ marginTop: 8, color: '#d29922', fontSize: 12 }}>
