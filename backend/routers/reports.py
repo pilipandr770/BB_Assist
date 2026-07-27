@@ -3,7 +3,7 @@ import os
 
 import aiofiles
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from backend.config import settings
@@ -79,6 +79,37 @@ async def get_report(program_id: str, report_id: str):
 
     async with aiofiles.open(report_path, encoding="utf-8") as f:
         return await f.read()
+
+
+@router.get("/{program_id}/{report_id}/screenshot")
+async def get_report_screenshot(program_id: str, report_id: str):
+    """
+    Serve the PoC screenshot for the finding this report was generated from,
+    if one was captured (js_scanner, subdomain_takeover, dalfox sources).
+
+    HackerOne's public Reports API has no attachment upload endpoint —
+    attachments require a separate Report Intent workflow that this app's
+    submit flow doesn't use. This endpoint exists so the user can download
+    the screenshot right next to the "Submit to H1" button and attach it
+    manually in the H1 UI after submitting.
+    """
+    meta_path = os.path.join(WORKSPACE, program_id, "reports", f"{report_id}.json")
+    if not os.path.exists(meta_path):
+        raise HTTPException(status_code=404, detail=f"Report metadata '{report_id}' not found")
+
+    async with aiofiles.open(meta_path, encoding="utf-8") as f:
+        meta = json.loads(await f.read())
+
+    finding_id = meta.get("finding_id")
+    if not finding_id:
+        raise HTTPException(status_code=404, detail="Report has no associated finding")
+
+    finding = await _load_finding(program_id, finding_id)
+    screenshot_path = os.path.join(WORKSPACE, program_id, "scans", finding.scan_id, f"evidence_{finding_id}.png")
+    if not os.path.exists(screenshot_path):
+        raise HTTPException(status_code=404, detail="No screenshot captured for this finding")
+
+    return FileResponse(screenshot_path, media_type="image/png")
 
 
 @router.get("/{program_id}", response_model=ApiResponse)

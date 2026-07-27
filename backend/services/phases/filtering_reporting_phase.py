@@ -108,7 +108,7 @@ async def run_filtering_reporting_phase(
                 try:
                     raw_data = json.loads(finding.raw_output)
                     source = raw_data.get("_source", "")
-                    if source in ("js_scanner",):
+                    if source in ("js_scanner", "subdomain_takeover", "dalfox"):
                         evidence_out = os.path.join(scan_dir, f"evidence_{finding.id}.json")
                         evidence_png = os.path.join(scan_dir, f"evidence_{finding.id}.png")
                         evidence_data = await tool_runner.capture_finding_evidence(

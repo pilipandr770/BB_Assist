@@ -155,6 +155,15 @@ function FindingCard({ finding: f, generating, hasReport, onGenerate }) {
   const sev = f.severity ?? 'informative'
   const color = SEVERITY_COLOR[sev]
 
+  let evidence = null
+  try {
+    evidence = f.http_evidence ? JSON.parse(f.http_evidence) : null
+  } catch { /* ignore malformed evidence JSON */ }
+  const hasScreenshot = evidence?.screenshot?.saved === true
+  const screenshotUrl = hasScreenshot
+    ? `/api/scans/${f.program_id}/${f.scan_id}/findings/${f.id}/screenshot`
+    : null
+
   return (
     <div style={{
       background: '#161b22', border: `1px solid #30363d`,
@@ -198,6 +207,32 @@ function FindingCard({ finding: f, generating, hasReport, onGenerate }) {
       {f.poc_result?.evidence && (
         <div style={{ marginTop: 8, color: '#3fb950', fontSize: 12 }}>
           ✓ {f.poc_result.evidence}
+        </div>
+      )}
+
+      {/* Screenshot evidence */}
+      {hasScreenshot && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ color: '#3fb950', fontSize: 12, marginBottom: 6 }}>
+            📷 Screenshot PoC captured — attach this when submitting to H1
+          </div>
+          <a href={screenshotUrl} target="_blank" rel="noopener noreferrer">
+            <img
+              src={screenshotUrl}
+              alt="PoC screenshot"
+              style={{
+                maxWidth: '100%', maxHeight: 260, borderRadius: 4,
+                border: '1px solid #30363d', display: 'block',
+              }}
+            />
+          </a>
+          <a
+            href={screenshotUrl}
+            download={`poc-${f.id.slice(0, 8)}.png`}
+            style={{ fontSize: 11, color: '#58a6ff', display: 'inline-block', marginTop: 4 }}
+          >
+            ⬇ Download screenshot
+          </a>
         </div>
       )}
 

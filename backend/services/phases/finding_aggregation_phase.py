@@ -184,18 +184,24 @@ def append_phase_findings(
         )
 
     for xss in dalfox_findings:
+        # dalfox's own JSON output puts the full PoC URL (with payload already
+        # encoded in) in "data" — NOT "url" (that key doesn't exist in real
+        # dalfox output, so this used to always resolve to an empty matched-at).
+        poc_url = xss.get("data") or xss.get("url", "")
         raw_findings.append(
             {
                 "_source": "dalfox",
                 "info": {
                     "name": f"Cross-Site Scripting (XSS) — {xss.get('param', 'unknown param')}",
-                    "severity": "high",
+                    "severity": (xss.get("severity") or "high").lower(),
                     "tags": ["xss", "injection"],
-                    "description": str(xss.get("evidence", xss)),
+                    "description": str(xss.get("message_str") or xss.get("evidence") or xss),
                 },
-                "matched-at": xss.get("url", ""),
+                "matched-at": poc_url,
                 "type": "xss",
                 "_param": xss.get("param", ""),
+                "_payload": xss.get("payload", ""),
+                "_poc_url": poc_url,
                 "_evidence": str(xss.get("evidence", ""))[:500],
             }
         )

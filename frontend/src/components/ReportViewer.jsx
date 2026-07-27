@@ -31,17 +31,22 @@ export default function ReportViewer() {
   const [h1Handle, setH1Handle] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [submitResult, setSubmitResult] = useState(null) // {success, url, error}
+  const [hasScreenshot, setHasScreenshot] = useState(false)
+
+  const screenshotUrl = `/api/reports/${programId}/${reportId}/screenshot`
 
   useEffect(() => {
     Promise.all([
       axios.get(`/api/reports/${programId}/${reportId}`, { responseType: 'text' }),
       axios.get(`/api/reports/${programId}/${reportId}/meta`).catch(() => null),
+      axios.head(screenshotUrl).then(() => true).catch(() => false),
     ])
-      .then(([reportResp, metaResp]) => {
+      .then(([reportResp, metaResp, screenshotOk]) => {
         setMarkdown(reportResp.data)
         if (metaResp?.data?.data) {
           setMeta(metaResp.data.data)
         }
+        setHasScreenshot(screenshotOk)
       })
       .catch(e => setError(e.response?.data?.detail || 'Failed to load report'))
       .finally(() => setLoading(false))
@@ -192,6 +197,38 @@ export default function ReportViewer() {
             {submitResult.success
               ? <>✓ Report submitted! <a href={submitResult.url} target="_blank" rel="noopener noreferrer" style={{ color: '#58a6ff' }}>{submitResult.url}</a></>
               : `✗ ${submitResult.error}`}
+          </div>
+        )}
+        {hasScreenshot && (
+          <div style={{
+            marginTop: 10, paddingTop: 10, borderTop: '1px solid #30363d',
+            display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+          }}>
+            <span style={{ color: '#d29922', fontSize: 12 }}>
+              📷 PoC screenshot captured — H1's API can't accept attachments on submit,
+              attach it manually after submitting:
+            </span>
+            <a
+              href={screenshotUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                padding: '4px 12px', background: '#21262d', color: '#58a6ff',
+                border: '1px solid #30363d', borderRadius: 4, fontSize: 12,
+              }}
+            >
+              🔍 Preview
+            </a>
+            <a
+              href={screenshotUrl}
+              download={`poc-${reportId?.slice(0, 8) ?? 'screenshot'}.png`}
+              style={{
+                padding: '4px 12px', background: '#21262d', color: '#3fb950',
+                border: '1px solid #30363d', borderRadius: 4, fontSize: 12,
+              }}
+            >
+              ⬇ Download
+            </a>
           </div>
         )}
       </div>
