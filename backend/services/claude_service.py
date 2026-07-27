@@ -808,6 +808,25 @@ async def generate_report(finding: Finding, scope: Scope) -> str:
         except Exception:
             pass
 
+    # Parse confirmed PoC evidence (live tool-based validation — sqlmap, dalfox,
+    # cors_checker, subdomain_takeover, 403_bypass, or an active impact_validator
+    # probe) so Claude uses the real confirmed output instead of writing a
+    # plausible-sounding but unconfirmed PoC.
+    if finding.poc_result and finding.poc_result.confirmed:
+        poc = finding.poc_result
+        poc_parts = ["PoC status: CONFIRMED by live, non-destructive validation (not speculative)."]
+        if poc.request:
+            poc_parts.append(f"Validation command: {poc.request}")
+        if poc.response_snippet:
+            poc_parts.append(f"Validation output:\n{poc.response_snippet[:800]}")
+        if poc.safe_output:
+            poc_parts.append(f"Summary: {poc.safe_output}")
+        evidence_block += (
+            "\n\nConfirmed PoC evidence (use these exact values verbatim in the "
+            "PoC section — do not invent a different PoC, this one already ran "
+            "successfully against the live target):\n" + "\n".join(poc_parts)
+        )
+
     vuln_type = (finding.vuln_type or "").lower()
     cors_extra = ""
     if "cors" in vuln_type:

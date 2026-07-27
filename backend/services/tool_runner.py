@@ -2844,6 +2844,22 @@ async def capture_finding_evidence(
         if secret_type and match_val:
             evidence["key_validation"] = await validate_api_key(secret_type, match_val)
 
+    elif source == "subdomain_takeover":
+        # Screenshot the vulnerable subdomain directly — this IS the standard
+        # takeover PoC (the unclaimed-service error page: "There isn't a
+        # GitHub Pages site here", "NoSuchBucket", etc.).
+        takeover_url = raw_output_dict.get("matched-at", "")
+        if takeover_url and screenshot_file:
+            evidence["screenshot"] = await capture_page_screenshot(takeover_url, screenshot_file)
+
+    elif source == "dalfox":
+        # dalfox's "matched-at" (from "data") is the full URL with the
+        # payload already encoded in — navigating there renders/executes it,
+        # so the screenshot shows the actual triggered payload.
+        poc_url = raw_output_dict.get("_poc_url") or raw_output_dict.get("matched-at", "")
+        if poc_url and screenshot_file:
+            evidence["screenshot"] = await capture_page_screenshot(poc_url, screenshot_file)
+
     if output_file:
         try:
             import aiofiles

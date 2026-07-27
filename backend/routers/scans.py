@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from urllib.parse import urlparse
@@ -8,6 +9,7 @@ from urllib.parse import urlparse
 import aiofiles
 import redis.asyncio as aioredis
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -712,6 +714,25 @@ async def get_findings(program_id: str, scan_id: str):
 
     findings.sort(key=lambda f: f.get("created_at", ""), reverse=True)
     return ApiResponse(success=True, data={"findings": findings})
+
+
+_FINDING_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+@router.get("/{program_id}/{scan_id}/findings/{finding_id}/screenshot")
+async def get_finding_screenshot(program_id: str, scan_id: str, finding_id: str):
+    """
+    Serve the Playwright PoC screenshot captured for a finding (js_scanner,
+    subdomain_takeover, dalfox), if one was captured.
+    """
+    if not _FINDING_ID_RE.match(finding_id):
+        raise HTTPException(status_code=400, detail="Invalid finding_id")
+
+    screenshot_path = os.path.join(_scan_dir(program_id, scan_id), f"evidence_{finding_id}.png")
+    if not os.path.exists(screenshot_path):
+        raise HTTPException(status_code=404, detail="No screenshot captured for this finding")
+
+    return FileResponse(screenshot_path, media_type="image/png")
 
 
 @router.post("/{scan_id}/rerun-phase", response_model=ApiResponse)

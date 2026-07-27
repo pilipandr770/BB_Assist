@@ -31,17 +31,22 @@ export default function ReportViewer() {
   const [h1Handle, setH1Handle] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [submitResult, setSubmitResult] = useState(null) // {success, url, error}
+  const [hasScreenshot, setHasScreenshot] = useState(false)
+
+  const screenshotUrl = `/api/reports/${programId}/${reportId}/screenshot`
 
   useEffect(() => {
     Promise.all([
       axios.get(`/api/reports/${programId}/${reportId}`, { responseType: 'text' }),
       axios.get(`/api/reports/${programId}/${reportId}/meta`).catch(() => null),
+      axios.head(screenshotUrl).then(() => true).catch(() => false),
     ])
-      .then(([reportResp, metaResp]) => {
+      .then(([reportResp, metaResp, screenshotOk]) => {
         setMarkdown(reportResp.data)
         if (metaResp?.data?.data) {
           setMeta(metaResp.data.data)
         }
+        setHasScreenshot(screenshotOk)
       })
       .catch(e => setError(e.response?.data?.detail || 'Failed to load report'))
       .finally(() => setLoading(false))
@@ -194,6 +199,38 @@ export default function ReportViewer() {
               : `✗ ${submitResult.error}`}
           </div>
         )}
+        {hasScreenshot && (
+          <div style={{
+            marginTop: 10, paddingTop: 10, borderTop: '1px solid #30363d',
+            display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+          }}>
+            <span style={{ color: '#d29922', fontSize: 12 }}>
+              📷 PoC screenshot captured — H1's API can't accept attachments on submit,
+              attach it manually after submitting:
+            </span>
+            <a
+              href={screenshotUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                padding: '4px 12px', background: '#21262d', color: '#58a6ff',
+                border: '1px solid #30363d', borderRadius: 4, fontSize: 12,
+              }}
+            >
+              🔍 Preview
+            </a>
+            <a
+              href={screenshotUrl}
+              download={`poc-${reportId?.slice(0, 8) ?? 'screenshot'}.png`}
+              style={{
+                padding: '4px 12px', background: '#21262d', color: '#3fb950',
+                border: '1px solid #30363d', borderRadius: 4, fontSize: 12,
+              }}
+            >
+              ⬇ Download
+            </a>
+          </div>
+        )}
       </div>
 
       <p style={{ color: '#8b949e', fontSize: 12, marginBottom: 16 }}>
@@ -217,6 +254,12 @@ export default function ReportViewer() {
             <span style={{ color: '#8b949e', fontSize: 12 }}>
               Status: {meta.quality.hard_blocked ? 'Hard-blocked' : meta.quality.gate_passed ? 'Passed' : 'Needs review'}
             </span>
+            {typeof meta.cvss_score === 'number' && (
+              <span style={{ color: '#8b949e', fontSize: 12 }} title={meta.cvss_vector || ''}>
+                CVSS: <strong style={{ color: '#c9d1d9' }}>{meta.cvss_score.toFixed(1)}</strong>
+                {' '}(computed from vector, not LLM-estimated)
+              </span>
+            )}
           </div>
           {Array.isArray(meta.quality.issues) && meta.quality.issues.length > 0 && (
             <div style={{ marginTop: 8, color: '#d29922', fontSize: 12 }}>
