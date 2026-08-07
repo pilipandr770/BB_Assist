@@ -148,51 +148,54 @@ async def _do_import(handle: str, name: str) -> tuple[str, "Program"]:
 
 # ── routes ───────────────────────────────────────────────────────────────────
 
+_NO_CREDS = (
+    "H1_USERNAME and H1_API_TOKEN must be set in .env — "
+    "generate a token at https://hackerone.com/settings/api_token/edit"
+)
+
+
 @router.get("/programs")
 async def discover_programs(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=100),
+    sort: str = Query("newest", pattern="^(newest|oldest|added|name)$"),
+    refresh: bool = Query(False),
 ):
     """
-    List open H1 bounty programs.
+    List open H1 bounty programs, newest first by default.
+
+    The H1 API only serves oldest-first pages and ignores sort params, so the
+    backend caches the full catalogue and paginates/sorts locally.
+    `sort`: newest | oldest | added (newest H1 listing) | name.
+    `refresh=true` bypasses the cache.
     Requires H1_USERNAME + H1_API_TOKEN in .env.
     """
     if not h1_discovery.has_credentials():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "H1_USERNAME and H1_API_TOKEN must be set in .env — "
-                "generate a token at https://hackerone.com/settings/api_token/edit"
-            ),
-        )
+        raise HTTPException(status_code=400, detail=_NO_CREDS)
     try:
-        programs = await h1_discovery.list_programs(page=page, size=size)
+        result = await h1_discovery.list_programs(
+            page=page, size=size, sort=sort, refresh=refresh
+        )
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     except Exception as exc:
         log.error("H1 API error: %s", exc)
         raise HTTPException(status_code=502, detail=f"HackerOne API error: {exc}")
 
-    return {"programs": programs, "count": len(programs)}
+    return {**result, "count": len(result["programs"])}
 
 
 @router.get("/new-programs")
-async def discover_new_programs(max_pages: int = Query(10, ge=1, le=20)):
+async def discover_new_programs(refresh: bool = Query(False)):
     """
-    Return open bounty programs not yet seen, sorted by newest first.
-    Scans up to max_pages×100 H1 programs.
+    Return open bounty programs not yet seen, newest first.
+    Scans the whole H1 catalogue (cached).
     Does NOT mark them seen — call POST /mark-seen when the user is done.
     """
     if not h1_discovery.has_credentials():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "H1_USERNAME and H1_API_TOKEN must be set in .env — "
-                "generate a token at https://hackerone.com/settings/api_token/edit"
-            ),
-        )
+        raise HTTPException(status_code=400, detail=_NO_CREDS)
     try:
-        programs, total_scanned = await h1_discovery.get_new_programs(max_pages=max_pages)
+        programs, total_scanned = await h1_discovery.get_new_programs(refresh=refresh)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     except Exception as exc:

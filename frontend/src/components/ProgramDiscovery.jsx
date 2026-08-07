@@ -25,6 +25,8 @@ export default function ProgramDiscovery() {
   const [allError, setAllError] = useState('')
   const [page, setPage] = useState(1)
   const [hasMore, setHasMore] = useState(false)
+  const [total, setTotal] = useState(0)
+  const [sort, setSort] = useState('newest')
 
   // New Programs tab
   const [newPrograms, setNewPrograms] = useState([])
@@ -38,16 +40,17 @@ export default function ProgramDiscovery() {
   const [expanded, setExpanded] = useState({})
   const [actionState, setActionState] = useState({})
 
-  const fetchAll = useCallback(async (p) => {
+  const fetchAll = useCallback(async (p, sortKey) => {
     setAllLoading(true)
     setAllError('')
     try {
-      const r = await fetch(`/api/discover/programs?page=${p}&size=50`)
+      const r = await fetch(`/api/discover/programs?page=${p}&size=50&sort=${sortKey}`)
       const j = await r.json()
       if (!r.ok) throw new Error(j.detail || r.statusText)
       if (p === 1) setAllPrograms(j.programs || [])
       else setAllPrograms(prev => [...prev, ...(j.programs || [])])
-      setHasMore((j.programs || []).length === 50)
+      setHasMore(!!j.has_more)
+      setTotal(j.total || 0)
     } catch (e) {
       setAllError(e.message)
     } finally {
@@ -55,13 +58,20 @@ export default function ProgramDiscovery() {
     }
   }, [])
 
-  const fetchNew = useCallback(async () => {
+  const changeSort = (next) => {
+    setSort(next)
+    setPage(1)
+    setAllPrograms([])
+    fetchAll(1, next)
+  }
+
+  const fetchNew = useCallback(async (refresh = false) => {
     setNewLoading(true)
     setNewError('')
     setNewChecked(false)
     setMarkingDone(false)
     try {
-      const r = await fetch('/api/discover/new-programs?max_pages=10')
+      const r = await fetch(`/api/discover/new-programs?refresh=${refresh ? 'true' : 'false'}`)
       const j = await r.json()
       if (!r.ok) throw new Error(j.detail || r.statusText)
       setNewPrograms(j.programs || [])
@@ -91,7 +101,7 @@ export default function ProgramDiscovery() {
   }, []) // eslint-disable-line
 
   useEffect(() => {
-    if (activeTab === 'all' && allPrograms.length === 0) fetchAll(1)
+    if (activeTab === 'all' && allPrograms.length === 0) fetchAll(1, sort)
   }, [activeTab]) // eslint-disable-line
 
   async function doImport(p) {
@@ -164,7 +174,7 @@ export default function ProgramDiscovery() {
         <div>
           {newLoading && (
             <p style={{ color: G.muted, fontSize: 13 }}>
-              ⟳ Scanning HackerOne for new programs… (checking up to 1 000 entries)
+              ⟳ Scanning the full HackerOne catalogue for new programs…
             </p>
           )}
 
@@ -181,7 +191,8 @@ export default function ProgramDiscovery() {
                 }
               </span>
               <button
-                onClick={fetchNew}
+                onClick={() => fetchNew(true)}
+                title="Re-fetch the catalogue from HackerOne, bypassing the 15 min cache"
                 style={{ background: 'none', border: `1px solid ${G.border}`,
                   color: G.muted, fontSize: 12, padding: '3px 10px', borderRadius: 4, cursor: 'pointer' }}
               >
@@ -218,11 +229,29 @@ export default function ProgramDiscovery() {
         <div>
           {allError && <CredError error={allError} />}
 
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+            <label style={{ color: G.muted, fontSize: 12 }}>Sort</label>
+            <select
+              value={sort}
+              onChange={e => changeSort(e.target.value)}
+              disabled={allLoading}
+              style={{ background: G.surface, color: G.text, border: `1px solid ${G.border}`,
+                borderRadius: 4, fontSize: 12, padding: '3px 8px' }}
+            >
+              <option value="newest">Newest launched</option>
+              <option value="added">Recently added to H1</option>
+              <option value="oldest">Oldest launched</option>
+              <option value="name">Name (A–Z)</option>
+            </select>
+            {allPrograms.length > 0 && (
+              <span style={{ color: G.muted, fontSize: 12 }}>
+                {allPrograms.length} of {total} · open · offers bounties
+              </span>
+            )}
+          </div>
+
           {allPrograms.length > 0 && (
             <>
-              <p style={{ color: G.muted, fontSize: 12, marginBottom: 10 }}>
-                {allPrograms.length} programs loaded · open · offers bounties
-              </p>
               <ProgramTable
                 programs={allPrograms}
                 actionState={actionState}
@@ -230,10 +259,11 @@ export default function ProgramDiscovery() {
                 setExpanded={setExpanded}
                 onImport={doImport}
                 onImportScan={doImportScan}
+                showDate
               />
               {hasMore && (
                 <button
-                  onClick={() => { const next = page + 1; setPage(next); fetchAll(next) }}
+                  onClick={() => { const next = page + 1; setPage(next); fetchAll(next, sort) }}
                   disabled={allLoading}
                   style={{ marginTop: 16, background: G.surface, color: G.muted,
                     border: `1px solid ${G.border}`, padding: '6px 18px',
