@@ -242,12 +242,14 @@ async def run_web_pipeline(
         recon_dir=recon_dir,
         seed_subdomains=all_subdomains,
         emit=emit,
+        shodan_api_key=settings.shodan_api_key or "",
     )
     all_subdomains = phase2["all_subdomains"]
     live_hosts = phase2["live_hosts"]
     nmap_endpoints = phase2["nmap_endpoints"]
     nmap_service_versions = phase2["nmap_service_versions"]
     nmap_csv_cve_hits = phase2["nmap_csv_cve_hits"]
+    shodan_vuln_findings = phase2["shodan_vuln_findings"]
 
     phase2_urls = await run_url_recon_phase(
         scope=scope,
@@ -449,6 +451,7 @@ async def run_web_pipeline(
         wpscan_findings=wpscan_findings,
         csp_findings=csp_findings,
         favicon_findings=favicon_findings,
+        shodan_vuln_findings=shodan_vuln_findings,
     )
 
     phase_filter = await run_filtering_reporting_phase(

@@ -31,6 +31,7 @@ def append_phase_findings(
     wpscan_findings: list[dict] | None = None,
     csp_findings: list[dict] | None = None,
     favicon_findings: list[dict] | None = None,
+    shodan_vuln_findings: list[dict] | None = None,
 ) -> list[dict]:
     for hit in nmap_csv_cve_hits:
         target_url = f"https://{hit['host']}:{hit['port']}"
@@ -407,6 +408,26 @@ def append_phase_findings(
             "type": fav.get("vuln_type", "information-disclosure"),
             "_favicon_hash": fav.get("favicon_hash", ""),
             "_category": category,
+        })
+
+    for hit in (shodan_vuln_findings or []):
+        raw_findings.append({
+            "_source": "shodan",
+            "info": {
+                "name": f"Shodan-Detected Vulnerability: {hit['cve']}",
+                "severity": "medium",
+                "tags": ["cve", "shodan", "passive"],
+                "description": (
+                    f"Shodan's passive banner-based vulnerability detection flagged "
+                    f"{hit['cve']} on {hit['host']} ({hit.get('ip', '')}). Detected via "
+                    f"Shodan's own historical scan data — no active scan performed "
+                    f"against the target for this finding."
+                ),
+            },
+            "matched-at": f"https://{hit['host']}",
+            "type": "cve",
+            "_cve": hit["cve"],
+            "_ip": hit.get("ip", ""),
         })
 
     return raw_findings
