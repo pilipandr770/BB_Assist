@@ -197,6 +197,7 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
             await _push_event(redis, scan_id, "tool_done", {"tool": "js_scan_rerun", "count": len(js_findings)})
 
         elif phase == "ffuf":
+            rerun_scope = (await _load_scope_and_program(program_id)).scope
             ffuf_targets = _select_ffuf_targets(live_urls, max_hosts=5)
             total = 0
             for i, host_url in enumerate(ffuf_targets, 1):
@@ -206,6 +207,7 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
                     host_url,
                     "",
                     ffuf_out,
+                    scope=rerun_scope,
                     session_cookies=rerun_job.session_cookies,
                     auth_header=rerun_job.auth_header,
                 )
@@ -213,16 +215,18 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
             await _push_event(redis, scan_id, "tool_done", {"tool": "ffuf_rerun", "count": total})
 
         elif phase == "cors":
+            rerun_scope = (await _load_scope_and_program(program_id)).scope
             cors_out = os.path.join(scan_dir, "cors_rerun.jsonl")
-            findings = await tool_runner.run_cors_checker(live_urls[:60], cors_out)
+            findings = await tool_runner.run_cors_checker(live_urls[:60], cors_out, scope=rerun_scope)
             await _push_event(redis, scan_id, "tool_done", {"tool": "cors_rerun", "count": len(findings)})
 
         elif phase == "takeover":
+            rerun_scope = (await _load_scope_and_program(program_id)).scope
             subs = _phase_file(subfinder_path)
             takeover_out = os.path.join(scan_dir, "takeover_rerun.jsonl")
             try:
                 findings = await asyncio.wait_for(
-                    tool_runner.run_subdomain_takeover(subs[:200], takeover_out),
+                    tool_runner.run_subdomain_takeover(subs[:200], takeover_out, scope=rerun_scope),
                     timeout=TAKEOVER_PHASE_TIMEOUT_S,
                 )
                 await _push_event(redis, scan_id, "tool_done", {"tool": "takeover_rerun", "count": len(findings)})
@@ -239,6 +243,7 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
                 return
 
         elif phase == "sqli":
+            rerun_scope = (await _load_scope_and_program(program_id)).scope
             candidates = []
             if os.path.exists(nuclei_out):
                 import aiofiles as _af
@@ -259,7 +264,7 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
                                 candidates.append(_url)
             confirmed = 0
             for url in list(dict.fromkeys(candidates))[:5]:
-                res = await tool_runner.run_sqlmap(url, scan_dir)
+                res = await tool_runner.run_sqlmap(url, scan_dir, scope=rerun_scope)
                 confirmed += len(res)
             await _push_event(redis, scan_id, "tool_done", {
                 "tool": "sqli_rerun",

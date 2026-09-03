@@ -2,7 +2,7 @@ from backend.models import Scope
 from backend.services.phases import appsec_probe_phase
 
 
-async def _fake_403_bypass(_urls, _out_path):
+async def _fake_403_bypass(_urls, _out_path, scope=None):
     return [{"url": "https://app.example.com/admin", "bypass_type": "header", "severity": "high", "payload": "X-Original-URL", "status": 200}]
 
 
@@ -10,7 +10,7 @@ async def _fake_arjun(_url, _out_path):
     return ["id", "token"]
 
 
-async def _fake_dalfox(_url, _params, _out_path):
+async def _fake_dalfox(_url, _params, _out_path, scope=None):
     return [{"url": _url, "param": _params[0], "evidence": "reflected payload"}]
 
 

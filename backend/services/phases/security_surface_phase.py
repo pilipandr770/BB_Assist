@@ -28,7 +28,7 @@ async def run_security_surface_phase(
     await emit("phase_start", {"phase": "cors_check"})
     await emit("tool_start", {"tool": "cors_checker", "detail": f"{min(len(live_urls), 120)} live URLs"})
     cors_out = os.path.join(scan_dir, "cors.jsonl")
-    cors_findings = await tool_runner.run_cors_checker(live_urls, cors_out)
+    cors_findings = await tool_runner.run_cors_checker(live_urls, cors_out, scope=scope)
     await emit("tool_done", {"tool": "cors_checker", "count": len(cors_findings)})
     await emit("phase_done", {"phase": "cors_check", "issues": len(cors_findings)})
 
@@ -43,7 +43,7 @@ async def run_security_surface_phase(
     takeover_out = os.path.join(scan_dir, "takeovers.jsonl")
     try:
         takeover_findings = await asyncio.wait_for(
-            tool_runner.run_subdomain_takeover(list(all_subdomains), takeover_out),
+            tool_runner.run_subdomain_takeover(list(all_subdomains), takeover_out, scope=scope),
             timeout=takeover_timeout_s,
         )
     except asyncio.TimeoutError:
