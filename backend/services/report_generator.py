@@ -272,6 +272,8 @@ async def save_report(report: Report, program_slug: str, quality: dict | None = 
         "cvss_vector": report.cvss_vector,
         "created_at": datetime.utcnow().isoformat(),
         "quality": quality or {"score": None, "gate_passed": None, "hard_blocked": None, "issues": []},
+        "reviewed": False,
+        "reviewed_at": None,
     }
     meta_path = os.path.join(report_dir, f"{report.id}.json")
     async with aiofiles.open(meta_path, "w", encoding="utf-8") as f:

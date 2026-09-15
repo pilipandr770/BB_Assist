@@ -175,6 +175,15 @@ function ReportCard({ report, programId, onClick }) {
             HARD-BLOCKED
           </span>
         )}
+        {!report.h1_submitted && !report.reviewed && (
+          <span style={{
+            background: '#f0883e22', color: '#f0883e', border: '1px solid #f0883e',
+            padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 700,
+            flexShrink: 0, marginTop: 1,
+          }}>
+            NEEDS REVIEW
+          </span>
+        )}
         <div style={{ flex: 1 }}>
           <div style={{ fontWeight: 600, color: '#e6edf3', marginBottom: 4 }}>
             {report.title}
