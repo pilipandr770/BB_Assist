@@ -39,6 +39,7 @@ async def integration_status():
     """
     h1_ok = bool(settings.h1_username and settings.h1_api_token)
     tg_ok = bool(settings.telegram_bot_token and settings.telegram_chat_id)
+    shodan_ok = bool(settings.shodan_api_key)
 
     result = {
         "h1": {
@@ -49,6 +50,9 @@ async def integration_status():
             "configured": tg_ok,
             "bot_username": None,
             "bot_name": None,
+        },
+        "shodan": {
+            "configured": shodan_ok,
         },
     }
 

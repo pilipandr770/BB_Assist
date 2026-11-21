@@ -2,11 +2,11 @@ from backend.models import Scope
 from backend.services.phases import security_surface_phase
 
 
-async def _fake_cors_checker(_live_urls, _out_path):
+async def _fake_cors_checker(_live_urls, _out_path, scope=None):
     return [{"url": "https://app.example.com", "severity": "medium", "attack_type": "origin_reflection"}]
 
 
-async def _fake_takeover(_subs, _out_path):
+async def _fake_takeover(_subs, _out_path, scope=None):
     return [{"subdomain": "old.example.com", "provider": "github", "severity": "high"}]
 
 

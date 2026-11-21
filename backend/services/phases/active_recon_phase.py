@@ -17,6 +17,7 @@ async def run_active_recon_core(
     recon_dir: str,
     seed_subdomains: set[str],
     emit: EventEmitter,
+    shodan_api_key: str = "",
 ) -> dict:
     """
     Run subfinder -> dnsx -> nmap and return structured outputs.
@@ -45,6 +46,23 @@ async def run_active_recon_core(
     )
     nmap_out = os.path.join(recon_dir, "nmap.gnmap")
     nmap_endpoints, nmap_service_versions = await tool_runner.run_nmap(live_hosts, nmap_out)
+
+    shodan_vuln_findings: list[dict] = []
+    if shodan_api_key:
+        await emit("tool_start", {"tool": "shodan", "detail": f"passive lookup on {min(len(live_hosts), 25)} hosts"})
+        shodan_out = os.path.join(recon_dir, "shodan.json")
+        shodan_result = await tool_runner.run_shodan_lookup(live_hosts, shodan_api_key, shodan_out)
+        nmap_service_versions += shodan_result["service_versions"]
+        shodan_vuln_findings = shodan_result["vuln_findings"]
+        await emit(
+            "tool_done",
+            {
+                "tool": "shodan",
+                "count": len(shodan_result["service_versions"]),
+                "shodan_vulns": len(shodan_vuln_findings),
+            },
+        )
+
     nmap_csv_cve_hits = tool_runner.match_service_versions_to_cves(nmap_service_versions)
 
     version_samples = []
@@ -100,4 +118,5 @@ async def run_active_recon_core(
         "nmap_service_versions": nmap_service_versions,
         "nmap_csv_cve_hits": nmap_csv_cve_hits,
         "version_samples": version_samples,
+        "shodan_vuln_findings": shodan_vuln_findings,
     }

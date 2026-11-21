@@ -40,6 +40,7 @@ import redis.asyncio as aioredis
 
 from backend.config import settings
 from backend.models import Scope
+from backend.services.scope_parser import is_in_scope
 
 WORKSPACE = settings.workspace_dir
 
@@ -689,8 +690,112 @@ def match_service_versions_to_cves(
 
     if matches:
         log.info(f"cve_matcher: found {len(matches)} version-based CVE candidates across {len(service_versions)} services")
-    
+
     return matches
+
+
+# ── Shodan Host API (passive, no packets sent to target) ──────────────────────
+
+_SHODAN_MAX_IPS = 25  # keep monthly query-credit usage bounded per scan
+
+
+async def run_shodan_lookup(hosts: list[str], api_key: str, output_file: str = "") -> dict:
+    """
+    Passive host/service/vuln enrichment via Shodan's Host API.
+
+    Zero packets sent to the target — Shodan already scanned it, we just
+    read what it found. Resolves each host to an IP, dedupes (many
+    subdomains share one IP behind a CDN), and looks up each unique IP.
+
+    Returns:
+        {
+          "service_versions": [...]  same shape as run_nmap's — {host, port,
+                               service, version, fingerprint} — caller should
+                               feed these into match_service_versions_to_cves()
+                               alongside nmap's own results.
+          "vuln_findings":    [...]  {host, ip, cve, hostnames} — Shodan's own
+                               banner-based vulnerability detections, a signal
+                               independent from our local CSV matcher.
+        }
+    """
+    import logging
+    import socket
+    log = logging.getLogger("tool_runner")
+
+    if not api_key or not hosts:
+        return {"service_versions": [], "vuln_findings": []}
+
+    ip_to_hosts: dict[str, list[str]] = {}
+    for h in hosts:
+        try:
+            ip = socket.gethostbyname(h)
+            ip_to_hosts.setdefault(ip, []).append(h)
+        except Exception:
+            continue
+
+    unique_ips = list(ip_to_hosts.keys())[:_SHODAN_MAX_IPS]
+    service_versions: list[dict] = []
+    vuln_findings: list[dict] = []
+    raw_results: list[dict] = []
+
+    async with _httpx.AsyncClient(timeout=15) as client:
+        for i, ip in enumerate(unique_ips):
+            if i > 0:
+                await asyncio.sleep(1.1)  # Shodan enforces ~1 req/sec on most plans
+            try:
+                resp = await client.get(
+                    f"https://api.shodan.io/shodan/host/{ip}",
+                    params={"key": api_key},
+                )
+                if resp.status_code == 401:
+                    log.warning("shodan_lookup: invalid API key — aborting remaining lookups")
+                    break
+                if resp.status_code != 200:
+                    continue  # 404 = no Shodan data for this IP; skip and continue
+
+                data = resp.json()
+                hostnames = ip_to_hosts.get(ip, [ip])
+                primary_host = hostnames[0]
+                raw_results.append(data)
+
+                for banner in data.get("data", []) or []:
+                    product = (banner.get("product") or "").strip()
+                    version = (banner.get("version") or "").strip()
+                    if not product and not version:
+                        continue
+                    service_versions.append({
+                        "host": primary_host,
+                        "port": banner.get("port", 0),
+                        "service": product,
+                        "version": version,
+                        "fingerprint": f"{product} {version}".strip(),
+                    })
+
+                raw_vulns = data.get("vulns", []) or []
+                cve_ids = list(raw_vulns.keys()) if isinstance(raw_vulns, dict) else list(raw_vulns)
+                for cve in cve_ids:
+                    vuln_findings.append({
+                        "host": primary_host,
+                        "ip": ip,
+                        "cve": str(cve),
+                        "hostnames": hostnames,
+                    })
+            except Exception as e:
+                log.debug("shodan_lookup[%s]: %s", ip, e)
+                continue
+
+    if output_file and raw_results:
+        try:
+            with open(output_file, "w") as f:
+                json.dump(raw_results, f, indent=2)
+        except Exception:
+            pass
+
+    log.info(
+        "shodan_lookup: %d/%d IPs had data, %d service versions, %d Shodan-flagged vulns",
+        len(raw_results), len(unique_ips), len(service_versions), len(vuln_findings),
+    )
+    return {"service_versions": service_versions, "vuln_findings": vuln_findings}
 
 
 async def run_httpx(
@@ -1149,6 +1254,8 @@ async def run_ffuf(
     url: str,
     wordlist: str,
     output_file: str,
+    *,
+    scope: Scope,
     session_cookies: str = "",
     auth_header: str = "",
 ) -> list[dict]:
@@ -1157,6 +1264,12 @@ async def run_ffuf(
     Returns all results (200/201/301/302/403) so callers can extract 403s
     for bypass testing and 200s for new attack surface.
     """
+    import logging
+
+    if not is_in_scope(url, scope):
+        logging.getLogger("tool_runner").warning("run_ffuf: refusing out-of-scope target %s", url)
+        return []
+
     # Try wordlist locations in priority order.
     # /wordlists/ is populated at Docker build time from SecLists.
     wordlist = resolve_ffuf_wordlist(wordlist)
@@ -1203,11 +1316,17 @@ def resolve_ffuf_wordlist(wordlist: str) -> str:
     return ""
 
 
-async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict]:
+async def run_dalfox(url: str, params: list[str], output_file: str, *, scope: Scope) -> list[dict]:
     """
     XSS scanner — only call if nuclei or manual review flagged XSS candidate.
     Command: dalfox url {url} --silence --format json -o {output_file}
     """
+    import logging
+
+    if not is_in_scope(url, scope):
+        logging.getLogger("tool_runner").warning("run_dalfox: refusing out-of-scope target %s", url)
+        return []
+
     # dalfox uses --header instead of -H
     _dalfox_hdrs = []
     if settings.h1_username:
@@ -1248,7 +1367,7 @@ async def run_dalfox(url: str, params: list[str], output_file: str) -> list[dict
     return []
 
 
-async def run_sqlmap(url: str, scan_dir: str) -> list[dict]:
+async def run_sqlmap(url: str, scan_dir: str, *, scope: Scope) -> list[dict]:
     """
     Test URL for SQL injection using time-based blind technique only.
 
@@ -1264,6 +1383,10 @@ async def run_sqlmap(url: str, scan_dir: str) -> list[dict]:
     """
     import logging
     log = logging.getLogger("tool_runner")
+
+    if not is_in_scope(url, scope):
+        log.warning("run_sqlmap: refusing out-of-scope target %s", url)
+        return []
 
     output_dir = os.path.join(scan_dir, "sqlmap_output")
     os.makedirs(output_dir, exist_ok=True)
@@ -1648,7 +1771,7 @@ def _try_bypass_sync(url: str) -> Optional[dict]:
     return None
 
 
-async def run_403_bypass(urls_403: list[str], output_file: str) -> list[dict]:
+async def run_403_bypass(urls_403: list[str], output_file: str, *, scope: Scope) -> list[dict]:
     """
     Try common 403 bypass techniques on restricted endpoints.
     Returns list of successful bypasses.
@@ -1660,7 +1783,14 @@ async def run_403_bypass(urls_403: list[str], output_file: str) -> list[dict]:
     if not urls_403:
         return []
 
-    targets = urls_403[:30]
+    in_scope_urls = [u for u in urls_403 if is_in_scope(u, scope)]
+    dropped = len(urls_403) - len(in_scope_urls)
+    if dropped:
+        log.warning("run_403_bypass: dropped %d out-of-scope target(s)", dropped)
+    if not in_scope_urls:
+        return []
+
+    targets = in_scope_urls[:30]
     bypasses: list[dict] = []
     semaphore = asyncio.Semaphore(8)
     loop = asyncio.get_event_loop()
@@ -1737,7 +1867,7 @@ def _test_cors_sync(url: str) -> Optional[dict]:
     return None
 
 
-async def run_cors_checker(urls: list[str], output_file: str) -> list[dict]:
+async def run_cors_checker(urls: list[str], output_file: str, *, scope: Scope) -> list[dict]:
     """
     Check live URLs for CORS misconfiguration.
     Focuses on API-like endpoints where credentials are likely present.
@@ -1746,6 +1876,10 @@ async def run_cors_checker(urls: list[str], output_file: str) -> list[dict]:
     import logging
     log = logging.getLogger("tool_runner")
 
+    if not urls:
+        return []
+
+    urls = [u for u in urls if is_in_scope(u, scope)]
     if not urls:
         return []
 
@@ -1885,6 +2019,8 @@ def _check_takeover_sync(subdomain: str) -> Optional[dict]:
 async def run_subdomain_takeover(
     subdomains: list[str],
     output_file: str,
+    *,
+    scope: Scope,
     per_subdomain_timeout_s: int = 20,
 ) -> list[dict]:
     """
@@ -1894,6 +2030,10 @@ async def run_subdomain_takeover(
     import logging
     log = logging.getLogger("tool_runner")
 
+    if not subdomains:
+        return []
+
+    subdomains = [s for s in subdomains if is_in_scope(s, scope)]
     if not subdomains:
         return []
 

@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timezone
 
 import aiofiles
 from fastapi import APIRouter, HTTPException
@@ -15,6 +16,10 @@ router = APIRouter()
 
 class H1SubmitRequest(BaseModel):
     h1_program_handle: str = ""  # override stored handle if provided
+
+
+class ReviewRequest(BaseModel):
+    note: str = ""  # optional reviewer note, stored alongside the approval
 
 WORKSPACE = settings.workspace_dir
 
@@ -147,11 +152,38 @@ async def list_reports(program_id: str):
     return ApiResponse(success=True, data={"reports": reports})
 
 
+@router.post("/{program_id}/{report_id}/review", response_model=ApiResponse)
+async def mark_report_reviewed(program_id: str, report_id: str, body: ReviewRequest):
+    """
+    Mark a report as human-reviewed — a mandatory gate before H1 submission.
+    Separate from generating the report or clicking submit: this records an
+    explicit "I looked at this and confirm it's accurate" checkpoint, with a
+    timestamp, so an accidental or premature submit isn't the only thing
+    standing between a draft report and HackerOne.
+    """
+    meta_path = os.path.join(WORKSPACE, program_id, "reports", f"{report_id}.json")
+    if not os.path.exists(meta_path):
+        raise HTTPException(status_code=404, detail=f"Report metadata '{report_id}' not found")
+
+    async with aiofiles.open(meta_path, encoding="utf-8") as f:
+        meta = json.loads(await f.read())
+
+    meta["reviewed"] = True
+    meta["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    meta["review_note"] = body.note
+
+    async with aiofiles.open(meta_path, "w") as f:
+        await f.write(json.dumps(meta, indent=2))
+
+    return ApiResponse(success=True, data=meta)
+
+
 @router.post("/{program_id}/{report_id}/submit", response_model=ApiResponse)
 async def submit_report_to_h1(program_id: str, report_id: str, body: H1SubmitRequest):
     """
     Submit an approved report to HackerOne via H1 REST API.
-    Requires H1_USERNAME and H1_API_TOKEN set in environment.
+    Requires H1_USERNAME and H1_API_TOKEN set in environment, and the report
+    to already be marked reviewed via POST .../review.
     Returns {success, h1_report_id, h1_report_url} or error.
     """
     if not settings.h1_username or not settings.h1_api_token:
@@ -173,6 +205,12 @@ async def submit_report_to_h1(program_id: str, report_id: str, body: H1SubmitReq
     if os.path.exists(meta_path):
         async with aiofiles.open(meta_path, encoding="utf-8") as f:
             meta = json.loads(await f.read())
+
+    if not meta.get("reviewed"):
+        raise HTTPException(
+            status_code=400,
+            detail="Report must be marked as reviewed (POST .../review) before submitting to HackerOne",
+        )
 
     # Resolve program handle: request body > stored program h1_handle > program slug
     program = await _load_program(program_id)

@@ -69,6 +69,7 @@ async def run_content_and_js_phase(
                 host_url,
                 "",
                 ffuf_out,
+                scope=scope,
                 session_cookies=session_cookies,
                 auth_header=auth_header,
             )

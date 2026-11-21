@@ -10,7 +10,7 @@ def _fake_resolve_ffuf_wordlist(_path):
     return "/wordlists/common.txt"
 
 
-async def _fake_run_ffuf(_host_url, _wordlist, _out_path, session_cookies="", auth_header=""):
+async def _fake_run_ffuf(_host_url, _wordlist, _out_path, scope=None, session_cookies="", auth_header=""):
     return [
         {"status": 200, "input": {"FUZZ": "admin"}},
         {"status": 403, "input": {"FUZZ": "secret"}},

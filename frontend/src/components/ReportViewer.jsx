@@ -32,6 +32,7 @@ export default function ReportViewer() {
   const [submitting, setSubmitting] = useState(false)
   const [submitResult, setSubmitResult] = useState(null) // {success, url, error}
   const [hasScreenshot, setHasScreenshot] = useState(false)
+  const [reviewing, setReviewing] = useState(false)
 
   const screenshotUrl = `/api/reports/${programId}/${reportId}/screenshot`
 
@@ -57,6 +58,20 @@ export default function ReportViewer() {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
+  }
+
+  async function handleMarkReviewed() {
+    setReviewing(true)
+    try {
+      const resp = await axios.post(`/api/reports/${programId}/${reportId}/review`, {})
+      if (resp.data?.data) {
+        setMeta(m => ({ ...(m || {}), ...resp.data.data }))
+      }
+    } catch (e) {
+      alert('Failed to mark reviewed: ' + (e.response?.data?.detail || 'server error'))
+    } finally {
+      setReviewing(false)
+    }
   }
 
   async function handleH1Submit() {
@@ -147,6 +162,40 @@ export default function ReportViewer() {
         </button>
       </div>
 
+      {/* Review gate — mandatory human checkpoint before H1 submission */}
+      {!meta?.h1_submitted && (
+        <div style={{
+          background: meta?.reviewed ? '#161b22' : '#f0883e11',
+          border: `1px solid ${meta?.reviewed ? '#30363d' : '#f0883e'}`,
+          borderRadius: 6, padding: '12px 14px', marginBottom: 14,
+        }}>
+          {meta?.reviewed ? (
+            <span style={{ color: '#3fb950', fontSize: 13 }}>
+              ✓ Reviewed {meta.reviewed_at ? `on ${new Date(meta.reviewed_at).toLocaleString()}` : ''}
+              {meta.review_note ? ` — "${meta.review_note}"` : ''}
+            </span>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ color: '#f0883e', fontSize: 13 }}>
+                ⚠ Not yet reviewed — confirm this finding and PoC before submitting to H1
+              </span>
+              <button
+                onClick={handleMarkReviewed}
+                disabled={reviewing}
+                style={{
+                  padding: '6px 14px',
+                  background: reviewing ? '#21262d' : '#238636',
+                  color: '#fff', border: 'none', borderRadius: 6,
+                  fontSize: 13, fontWeight: 600, cursor: reviewing ? 'wait' : 'pointer',
+                }}
+              >
+                {reviewing ? 'Marking…' : '✅ Mark as Reviewed'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* H1 Auto-Submit */}
       <div style={{
         background: '#161b22', border: '1px solid #30363d', borderRadius: 6,
@@ -168,12 +217,15 @@ export default function ReportViewer() {
           />
           <button
             onClick={handleH1Submit}
-            disabled={submitting}
+            disabled={submitting || !meta?.reviewed}
+            title={!meta?.reviewed ? 'Mark as reviewed first' : ''}
             style={{
               padding: '6px 16px',
-              background: submitting ? '#21262d' : '#238636',
-              color: '#fff', border: 'none', borderRadius: 6,
-              fontSize: 13, fontWeight: 600, cursor: submitting ? 'wait' : 'pointer',
+              background: (submitting || !meta?.reviewed) ? '#21262d' : '#238636',
+              color: (!meta?.reviewed && !submitting) ? '#8b949e' : '#fff',
+              border: 'none', borderRadius: 6,
+              fontSize: 13, fontWeight: 600,
+              cursor: submitting ? 'wait' : (!meta?.reviewed ? 'not-allowed' : 'pointer'),
             }}
           >
             {submitting ? 'Submitting…' : 'Submit'}
@@ -258,6 +310,11 @@ export default function ReportViewer() {
               <span style={{ color: '#8b949e', fontSize: 12 }} title={meta.cvss_vector || ''}>
                 CVSS: <strong style={{ color: '#c9d1d9' }}>{meta.cvss_score.toFixed(1)}</strong>
                 {' '}(computed from vector, not LLM-estimated)
+              </span>
+            )}
+            {typeof meta.cwe === 'number' && (
+              <span style={{ color: '#8b949e', fontSize: 12 }}>
+                CWE-<strong style={{ color: '#c9d1d9' }}>{meta.cwe}</strong>
               </span>
             )}
           </div>

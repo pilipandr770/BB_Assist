@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     otx_api_key: Optional[str] = None
     ipinfo_token: Optional[str] = None
 
+    # Shodan Host API (paid membership) — passive host/service/vuln enrichment.
+    # Zero packets sent to the target; Shodan already scanned it.
+    shodan_api_key: Optional[str] = None
+
     # GitHub token for dorking (https://github.com/settings/tokens — read:public_repo)
     github_token: Optional[str] = None
 

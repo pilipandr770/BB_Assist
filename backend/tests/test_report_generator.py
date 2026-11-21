@@ -41,6 +41,49 @@ def test_evaluate_report_quality_flags_malformed_cvss_vector():
     assert not any("cvss" in i.lower() for i in q_valid["issues"])
 
 
+def test_evaluate_report_quality_flags_cwe_mismatch():
+    finding = _finding(vuln_type="sqli")
+    md_mismatch = "## Summary\n- **CWE**: CWE-79: Cross-Site Scripting\n"
+    md_matching = "## Summary\n- **CWE**: CWE-89: SQL Injection\n"
+
+    q_mismatch = report_generator._evaluate_report_quality(md_mismatch, finding)
+    q_matching = report_generator._evaluate_report_quality(md_matching, finding)
+
+    assert any("CWE-79" in i and "CWE-89" in i for i in q_mismatch["issues"])
+    assert not q_mismatch["hard_blocked"]  # soft flag, not a hard block
+    assert not any("cwe" in i.lower() for i in q_matching["issues"])
+
+
+async def test_generate_populates_cwe_field(monkeypatch, tmp_path):
+    markdown = (
+        "# [MEDIUM] SQL Injection on api.example.com\n\n"
+        "## Summary\nConfirmed SQLi.\n\n"
+        "## Vulnerability Details\n"
+        "- **CVSS Score**: 8.0 (High)\n"
+        "- **CVSS Vector**: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N\n"
+        "- **CWE**: CWE-89: SQL Injection\n\n"
+        "## Steps to Reproduce\n1. do the thing\n\n"
+        "## Proof of Concept\n"
+        "**One-liner (curl):**\n```bash\ncurl https://app.example.com\n```\n"
+        "**Python script:**\n```python\nprint('poc')\n```\n\n"
+        "## Impact\nBad.\n\n"
+        "## Recommended Fix\nUse parameterized queries.\n"
+    )
+
+    async def _fake_claude_generate_report(_finding, _scope):
+        return markdown
+
+    monkeypatch.setattr(report_generator, "claude_generate_report", _fake_claude_generate_report)
+    monkeypatch.setattr(report_generator.settings, "workspace_dir", str(tmp_path))
+
+    finding = _finding(vuln_type="sqli")
+    scope = Scope(in_scope_domains=["*.example.com"], in_scope_urls=["https://app.example.com"])
+
+    report = await report_generator.generate(finding, scope)
+
+    assert report.cwe == 89
+
+
 async def test_generate_populates_cvss_fields_from_vector(monkeypatch, tmp_path):
     markdown = (
         "# [MEDIUM] SQL Injection on api.example.com\n\n"

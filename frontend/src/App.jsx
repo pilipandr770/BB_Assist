@@ -110,6 +110,10 @@ function Nav() {
                     : 'TG: not set'
               }
             />
+            <StatusDot
+              ok={status.shodan?.configured}
+              label={status.shodan?.configured ? 'Shodan: connected' : 'Shodan: not set'}
+            />
           </>
         )}
       </div>

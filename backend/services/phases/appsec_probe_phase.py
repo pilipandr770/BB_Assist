@@ -64,7 +64,7 @@ async def run_appsec_probe_phase(
         await emit("phase_start", {"phase": "bypass_403"})
         await emit("tool_start", {"tool": "403_bypass", "detail": f"{len(ffuf_403_urls)} forbidden endpoints"})
         bypass_out = os.path.join(scan_dir, "bypasses.jsonl")
-        bypasses = await tool_runner.run_403_bypass(ffuf_403_urls, bypass_out)
+        bypasses = await tool_runner.run_403_bypass(ffuf_403_urls, bypass_out, scope=scope)
         await emit("tool_done", {"tool": "403_bypass", "count": len(bypasses)})
         await emit("phase_done", {"phase": "bypass_403", "bypasses": len(bypasses)})
 
@@ -134,7 +134,7 @@ async def run_appsec_probe_phase(
             xss_url = xss_base + "?" + "&".join(f"{p}=test" for p in xss_params[:5])
             await emit("tool_start", {"tool": "dalfox", "detail": f"{xss_base} ({len(xss_params)} params)"})
             dalfox_out = os.path.join(scan_dir, f"dalfox_{len(dalfox_findings)}.json")
-            dalfox_results = await tool_runner.run_dalfox(xss_url, xss_params, dalfox_out)
+            dalfox_results = await tool_runner.run_dalfox(xss_url, xss_params, dalfox_out, scope=scope)
             dalfox_findings.extend(dalfox_results)
             await emit("tool_done", {"tool": "dalfox", "count": len(dalfox_results)})
         await emit("phase_done", {"phase": "xss_scan", "findings": len(dalfox_findings)})

@@ -50,7 +50,7 @@ async def run_filtering_reporting_phase(
         for sql_url in sqli_candidates[:3]:
             await emit("tool_start", {"tool": "sqlmap", "detail": sql_url[:120]})
             try:
-                sql_results = await tool_runner.run_sqlmap(sql_url, scan_dir)
+                sql_results = await tool_runner.run_sqlmap(sql_url, scan_dir, scope=scope)
                 sqlmap_confirmed.extend(sql_results)
                 await emit("tool_done", {"tool": "sqlmap", "count": len(sql_results)})
             except Exception as sqlmap_error:
