@@ -20,6 +20,7 @@ from backend.services.claude_service import (
     rewrite_report_with_quality_feedback,
 )
 from backend.services.cvss_calculator import extract_cvss_vector, score_and_reconcile
+from backend.services.cwe_checker import check_cwe_mismatch, extract_cwe
 
 
 def _evaluate_report_quality(markdown: str, finding: Finding) -> dict:
@@ -66,6 +67,11 @@ def _evaluate_report_quality(markdown: str, finding: Finding) -> dict:
             "CVSS:3.1 vector string (e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N)."
         )
         score -= 15
+
+    cwe_mismatch = check_cwe_mismatch(markdown, finding.vuln_type)
+    if cwe_mismatch:
+        issues.append(cwe_mismatch)
+        score -= 5
 
     if "**One-liner (curl):**" not in markdown:
         issues.append("PoC curl one-liner section is missing.")
@@ -228,6 +234,8 @@ async def generate(finding: Finding, scope: Scope) -> Report:
         cvss_score, severity, cvss_vector = cvss_result
         markdown = _reconcile_cvss_in_markdown(markdown, cvss_score, severity)
 
+    cwe = extract_cwe(markdown)
+
     report = Report(
         id=str(uuid.uuid4()),
         finding_id=finding.id,
@@ -237,6 +245,7 @@ async def generate(finding: Finding, scope: Scope) -> Report:
         severity=severity,
         cvss_score=cvss_score,
         cvss_vector=cvss_vector,
+        cwe=cwe,
     )
 
     # Derive program slug from program_id (slug is stored as program_id in our system)
@@ -270,6 +279,7 @@ async def save_report(report: Report, program_slug: str, quality: dict | None = 
         "severity": report.severity if isinstance(report.severity, str) else report.severity.value,
         "cvss_score": report.cvss_score,
         "cvss_vector": report.cvss_vector,
+        "cwe": report.cwe,
         "created_at": datetime.utcnow().isoformat(),
         "quality": quality or {"score": None, "gate_passed": None, "hard_blocked": None, "issues": []},
         "reviewed": False,

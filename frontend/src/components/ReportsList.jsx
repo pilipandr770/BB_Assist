@@ -198,6 +198,12 @@ function ReportCard({ report, programId, onClick }) {
                 </span>
               </>
             )}
+            {typeof report.cwe === 'number' && (
+              <>
+                <span style={{ margin: '0 8px' }}>·</span>
+                <span style={{ color: '#8b949e' }}>CWE-{report.cwe}</span>
+              </>
+            )}
             <span style={{ margin: '0 8px' }}>·</span>
             {hasScore && (
               <>

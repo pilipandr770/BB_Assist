@@ -312,6 +312,11 @@ export default function ReportViewer() {
                 {' '}(computed from vector, not LLM-estimated)
               </span>
             )}
+            {typeof meta.cwe === 'number' && (
+              <span style={{ color: '#8b949e', fontSize: 12 }}>
+                CWE-<strong style={{ color: '#c9d1d9' }}>{meta.cwe}</strong>
+              </span>
+            )}
           </div>
           {Array.isArray(meta.quality.issues) && meta.quality.issues.length > 0 && (
             <div style={{ marginTop: 8, color: '#d29922', fontSize: 12 }}>
