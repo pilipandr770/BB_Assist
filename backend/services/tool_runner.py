@@ -278,7 +278,23 @@ def _h1_header_args(h1_username: Optional[str] = None) -> list[str]:
     username = h1_username or settings.h1_username
     if not username:
         return []
-    return ["-H", f"X-HackerOne-Researcher: {username}"]
+    # Programs name this header differently: "X-HackerOne-Research" (e.g. Anduril policy)
+    # vs "X-HackerOne-Researcher". Sending both is harmless and satisfies either.
+    return [
+        "-H", f"X-HackerOne-Researcher: {username}",
+        "-H", f"X-HackerOne-Research: {username}",
+    ]
+
+
+def h1_research_headers(h1_username: Optional[str] = None) -> dict[str, str]:
+    """Same identification headers as a dict, for in-process httpx clients."""
+    username = h1_username or settings.h1_username
+    if not username:
+        return {}
+    return {
+        "X-HackerOne-Researcher": username,
+        "X-HackerOne-Research": username,
+    }
 
 
 def _auth_header_args(session_cookies: str = "", auth_header: str = "") -> list[str]:
@@ -356,6 +372,24 @@ async def _run_command(
     return proc.returncode or 0, "\n".join(stdout_lines), "\n".join(stderr_lines)
 
 
+# ── Per-scan request-rate cap ─────────────────────────────────────────────────
+# Some programs allow 100 req/s, others only a few. The cap is stored in a ContextVar
+# so concurrent scans do not affect each other; 0 means "use each tool's own default".
+import contextvars as _contextvars
+
+_RATE_CAP: _contextvars.ContextVar[int] = _contextvars.ContextVar("scan_rate_cap", default=0)
+
+
+def set_rate_cap(requests_per_second: int) -> None:
+    _RATE_CAP.set(max(0, int(requests_per_second or 0)))
+
+
+def cap_rate(default: int) -> int:
+    """Return min(default, program cap) when a cap is set, else default (never below 1)."""
+    cap = _RATE_CAP.get()
+    return max(1, min(int(default), cap)) if cap > 0 else int(default)
+
+
 def _write_temp_list(items: list[str], suffix: str = ".txt") -> str:
     """Write a list of items to a temp file, one per line. Returns file path."""
     fd, path = tempfile.mkstemp(suffix=suffix)
@@ -373,6 +407,13 @@ async def run_subfinder(domains: list[str], output_file: str) -> list[str]:
     results rather than blocking the entire pipeline for 10 minutes.
     Uses -all flag when available for best coverage; falls back to defaults.
     """
+    # subfinder hangs (until our timeout, returning nothing) when the list contains
+    # wildcard entries like "*.example.com". Normalise to bare, de-duplicated domains.
+    domains = sorted({
+        d.strip().lower().lstrip("*.").rstrip(".")
+        for d in domains
+        if d and d.strip() and " " not in d.strip()
+    } - {""})
     domains_file = _write_temp_list(domains)
     try:
         cmd = [
@@ -850,12 +891,12 @@ async def run_httpx(
             [  # Set A — modern short flags (v1.3+)
                 _HTTPX_BIN, "-l", input_file, "-json", "-o", output_file,
                 "-sc", "-cl", "-fr",
-                "-threads", "20", "-timeout", "10", "-rl", "30", "-retries", "1",
+                "-threads", "20", "-timeout", "10", "-rl", str(cap_rate(30)), "-retries", "1",
             ] + _hdr,
             [  # Set B — legacy long flags (v1.2 and below)
                 _HTTPX_BIN, "-l", input_file, "-json", "-o", output_file,
                 "-status-code", "-content-length", "-follow-redirects", "-no-color",
-                "-threads", "20", "-timeout", "10", "-rate-limit", "30", "-retries", "1",
+                "-threads", "20", "-timeout", "10", "-rate-limit", str(cap_rate(30)), "-retries", "1",
             ] + _hdr,
         ]
 
@@ -917,30 +958,35 @@ async def run_httpx(
 async def run_gau(domain: str, output_file: str) -> list[str]:
     """
     Fetch known URLs from various sources (Wayback, Common Crawl, etc).
-    Command: gau {domain} --blacklist png,jpg,gif,css,woff --o {output_file}
-    Timeout: 120s per domain — some domains return 50k+ URLs and we cap them anyway.
+    Command: gau {domain} --blacklist png,jpg,gif,css,woff --threads 5
+    Timeout: 150s per domain. Output is read from stdout, NOT from gau's --o file:
+    gau only writes --o at the very end, so when the timeout kills a slow run
+    (e.g. coupang.com needs >150s) everything collected so far was lost (0 results).
+    With stdout, _run_command keeps the partial output after a kill.
     """
     cmd = [
         "gau",
         domain,
         "--blacklist", "png,jpg,gif,jpeg,svg,ico,css,woff,woff2,ttf,mp4,mp3",
-        "--o", output_file,
         "--threads", "5",
         "--timeout", "30",
     ]
     # No stream_key: gau returns 10k-50k URLs per domain; pushing every line to
-    # Redis causes multi-hundred-MB RDB snapshots with zero benefit (output is
-    # read from the file, not the Redis stream).
-    await _run_command(cmd, timeout_s=120)
+    # Redis causes multi-hundred-MB RDB snapshots with zero benefit.
+    _, stdout, _ = await _run_command(cmd, timeout_s=150)
 
-    if os.path.exists(output_file):
-        with open(output_file) as f:
-            urls = [line.strip() for line in f if line.strip()]
-        # Cap per-domain to avoid www.example.com → 50k URLs overwhelming the pool.
-        # The global all_target_urls cap (15k) is a backstop, but capping early
-        # reduces memory and Redis write pressure during the scan.
-        return urls[:10_000]
-    return []
+    urls = list(dict.fromkeys(
+        line.strip() for line in stdout.splitlines()
+        if line.strip().startswith(("http://", "https://"))
+    ))
+    if urls:
+        try:
+            with open(output_file, "w") as f:
+                f.write(chr(10).join(urls) + chr(10))
+        except OSError:
+            pass
+    # Cap per-domain to avoid www.example.com → 50k URLs overwhelming the pool.
+    return urls[:10_000]
 
 
 async def run_katana(
@@ -964,7 +1010,7 @@ async def run_katana(
             "-o", output_file,
             "-depth", "2",           # was 3 — depth 3 on SPAs = millions of URLs
             "-concurrency", "10",
-            "-rate-limit", "50",
+            "-rate-limit", str(cap_rate(50)),
             "-timeout", "10",
             "-crawl-duration", "8m", # hard stop at 8 min regardless of depth
         ] + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
@@ -1060,7 +1106,7 @@ async def run_nuclei(
         # Cloudflare targets block nuclei's default "Go-http-client" UA and throttle
         # high-rate scans. Use browser UA always; lower rate when CF is detected.
         behind_cloudflare = detected_techs and "cloudflare" in detected_techs
-        nuclei_rate = "20" if behind_cloudflare else "100"
+        nuclei_rate = str(cap_rate(20 if behind_cloudflare else 100))
         nuclei_bulk = "20" if behind_cloudflare else "50"
         nuclei_conc = "10" if behind_cloudflare else "25"
         nuclei_ua   = (
@@ -1139,7 +1185,7 @@ async def run_nuclei(
                         "-jsonl-export", cve_out,
                         "-j",
                         "-silent",
-                        "-rate-limit", "15" if behind_cloudflare else "80",
+                        "-rate-limit", str(cap_rate(15 if behind_cloudflare else 80)),
                         "-bulk-size", "20" if behind_cloudflare else "30",
                         "-concurrency", "8"  if behind_cloudflare else "15",
                         "-timeout", "10",
@@ -1284,7 +1330,7 @@ async def run_ffuf(
         "-o", output_file,
         "-of", "json",
         "-t", "30",
-        "-rate", "30",     # CDN-friendly
+        "-rate", str(cap_rate(30)),     # CDN-friendly
         "-timeout", "10",
         "-silent",
     ] + _h1_header_args() + _auth_header_args(session_cookies, auth_header)
@@ -1330,7 +1376,7 @@ async def run_dalfox(url: str, params: list[str], output_file: str, *, scope: Sc
     # dalfox uses --header instead of -H
     _dalfox_hdrs = []
     if settings.h1_username:
-        _dalfox_hdrs = ["--header", f"X-HackerOne-Researcher: {settings.h1_username}"]
+        _dalfox_hdrs = ["--header", f"X-HackerOne-Researcher: {settings.h1_username}", "--header", f"X-HackerOne-Research: {settings.h1_username}"]
 
     cmd = [
         "dalfox",
@@ -1621,7 +1667,11 @@ async def run_trufflehog(urls: list[str], output_file: str) -> list[dict]:
     return deduped
 
 
-async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
+async def run_js_scanner(
+    js_urls: list[str],
+    output_file: str,
+    endpoints_out: list[str] | None = None,
+) -> list[dict]:
     """
     Download JS files and scan for secrets using regex.
     Returns list of findings: {url, secret_type, match, context, severity}.
@@ -1658,6 +1708,9 @@ async def run_js_scanner(js_urls: list[str], output_file: str) -> list[dict]:
             content = await loop.run_in_executor(None, _download_url, url)
         if not content:
             return
+        if endpoints_out is not None:
+            from backend.services.js_endpoints import extract_js_endpoints
+            endpoints_out.extend(extract_js_endpoints(content, url))
         for regex, secret_type, severity in compiled:
             for m in regex.finditer(content):
                 matched = m.group(0)[:120]
@@ -3831,7 +3884,12 @@ async def read_interactsh_callbacks(output_file: str) -> list[dict]:
     return callbacks
 
 
-async def run_graphql_probe(base_urls: list[str], scan_dir: str) -> list[dict]:
+async def run_graphql_probe(
+    base_urls: list[str],
+    scan_dir: str,
+    session_cookies: str = "",
+    auth_header: str = "",
+) -> list[dict]:
     """
     Probe for exposed GraphQL endpoints and test for common misconfigurations.
 
@@ -3875,6 +3933,9 @@ async def run_graphql_probe(base_urls: list[str], scan_dir: str) -> list[dict]:
         headers={
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (security-research)",
+            **h1_research_headers(),
+            **({"Cookie": session_cookies} if session_cookies else {}),
+            **({"Authorization": auth_header} if auth_header else {}),
         }
     ) as client:
         for base_url in base_urls[:20]:  # cap at 20 base URLs

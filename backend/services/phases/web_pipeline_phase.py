@@ -16,6 +16,15 @@ from backend.services.phases.active_recon_phase import run_active_recon_core
 from backend.services.phases.appsec_probe_phase import run_appsec_probe_phase
 from backend.services.phases.content_and_js_phase import run_content_and_js_phase
 from backend.services.phases.delta_history_phase import emit_delta_new_surface
+from backend.services.auth_check import check_auth
+from backend.services.waf_detect import (
+    CF_NUCLEI_MAX_URLS,
+    cloudflare_confirmed_hosts,
+    detect_waf_profile,
+    resolve_hosts,
+    resolver_looks_unreliable,
+    select_origin_candidates,
+)
 from backend.services.phases.finding_aggregation_phase import append_phase_findings
 from backend.services.phases.filtering_reporting_phase import run_filtering_reporting_phase
 from backend.services.phases.github_dork_phase import run_github_dork_phase
@@ -170,6 +179,30 @@ def nuclei_to_finding(raw: dict, job: ScanJob) -> Finding:
 
 # ── Web pipeline orchestrator ─────────────────────────────────────────────────
 
+_SET_FIELDS = ("all_subdomains", "detected_techs", "gau_urls")
+
+
+def _save_recon_checkpoint(path: str, recon: dict) -> None:
+    """Persist recon results so an interrupted scan can resume after the slow part."""
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(recon, fh, default=lambda o: sorted(o) if isinstance(o, (set, frozenset)) else str(o))
+    except Exception:
+        pass  # checkpointing is best-effort; never break the scan
+
+
+def _load_recon_checkpoint(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        for key in _SET_FIELDS:
+            data[key] = set(data.get(key) or [])
+        required = ("live_hosts", "live_urls", "all_target_urls", "http_results", "prog_type")
+        return data if all(k in data for k in required) else None
+    except Exception:
+        return None
+
+
 async def run_web_pipeline(
     *,
     job: ScanJob,
@@ -191,6 +224,7 @@ async def run_web_pipeline(
     github_token: str,
     takeover_timeout_s: int,
     emit: EventEmitter,
+    resume: bool = False,
 ) -> dict:
     """
     Full web scan pipeline: Phase 1 (passive recon) through Phase 4 (filter & report).
@@ -207,81 +241,130 @@ async def run_web_pipeline(
         "automation_policy_markers": blocked_markers,
     })
 
-    # ── Phase 1: Passive recon ────────────────────────────────────────────────
-    await emit("phase_start", {"phase": "passive_recon"})
+    async def _recon_phases() -> dict:
+        """Phase 1 (passive) + Phase 2 (active recon). The expensive part of a scan."""
+        # ── Phase 1: Passive recon ────────────────────────────────────────────────
+        await emit("phase_start", {"phase": "passive_recon"})
 
-    all_subdomains: set[str] = set()
+        all_subdomains: set[str] = set()
 
-    phase1 = await run_passive_recon_phase(scope.in_scope_domains, max_domains=5)
+        phase1 = await run_passive_recon_phase(scope.in_scope_domains, max_domains=5)
 
-    await emit("pipeline_config", {
-        "passive_domains": phase1["passive_domains"],
-        "total_scope_domains": len(scope.in_scope_domains),
-    })
+        await emit("pipeline_config", {
+            "passive_domains": phase1["passive_domains"],
+            "total_scope_domains": len(scope.in_scope_domains),
+        })
 
-    all_subdomains.update(phase1["subdomains"])
+        all_subdomains.update(phase1["subdomains"])
 
-    recon_dir = os.path.join(workspace_dir, program_id, "recon")
-    os.makedirs(recon_dir, exist_ok=True)
-    async with aiofiles.open(os.path.join(recon_dir, "passive_subdomains.txt"), "w") as fh:
-        await fh.write("\n".join(sorted(all_subdomains)))
+        recon_dir = os.path.join(workspace_dir, program_id, "recon")
+        os.makedirs(recon_dir, exist_ok=True)
+        async with aiofiles.open(os.path.join(recon_dir, "passive_subdomains.txt"), "w") as fh:
+            await fh.write("\n".join(sorted(all_subdomains)))
 
-    await emit("phase_done", {
-        "phase": "passive_recon",
-        "subdomains": len(all_subdomains),
-        "urls": len(phase1["urls"]),
-    })
+        await emit("phase_done", {
+            "phase": "passive_recon",
+            "subdomains": len(all_subdomains),
+            "urls": len(phase1["urls"]),
+        })
 
-    # ── Phase 2: Active recon ─────────────────────────────────────────────────
-    await emit("phase_start", {"phase": "active_recon"})
+        # ── Phase 2: Active recon ─────────────────────────────────────────────────
+        await emit("phase_start", {"phase": "active_recon"})
 
-    prog_type = (scope.program_type or "web").lower()
+        prog_type = (scope.program_type or "web").lower()
 
-    phase2 = await run_active_recon_core(
-        scope=scope,
-        recon_dir=recon_dir,
-        seed_subdomains=all_subdomains,
-        emit=emit,
-        shodan_api_key=settings.shodan_api_key or "",
-    )
-    all_subdomains = phase2["all_subdomains"]
-    live_hosts = phase2["live_hosts"]
-    nmap_endpoints = phase2["nmap_endpoints"]
-    nmap_service_versions = phase2["nmap_service_versions"]
-    nmap_csv_cve_hits = phase2["nmap_csv_cve_hits"]
-    shodan_vuln_findings = phase2["shodan_vuln_findings"]
+        phase2 = await run_active_recon_core(
+            scope=scope,
+            recon_dir=recon_dir,
+            seed_subdomains=all_subdomains,
+            emit=emit,
+            shodan_api_key=settings.shodan_api_key or "",
+        )
+        all_subdomains = phase2["all_subdomains"]
+        live_hosts = phase2["live_hosts"]
+        nmap_endpoints = phase2["nmap_endpoints"]
+        nmap_service_versions = phase2["nmap_service_versions"]
+        nmap_csv_cve_hits = phase2["nmap_csv_cve_hits"]
+        shodan_vuln_findings = phase2["shodan_vuln_findings"]
 
-    phase2_urls = await run_url_recon_phase(
-        scope=scope,
-        recon_dir=recon_dir,
-        live_hosts=live_hosts,
-        nmap_endpoints=nmap_endpoints,
-        nmap_service_versions=nmap_service_versions,
-        nmap_csv_cve_hits=nmap_csv_cve_hits,
-        do_katana=do_katana,
-        program_type=prog_type,
-        session_cookies=job.session_cookies,
-        auth_header=job.auth_header,
-        emit=emit,
-    )
+        phase2_urls = await run_url_recon_phase(
+            scope=scope,
+            recon_dir=recon_dir,
+            live_hosts=live_hosts,
+            nmap_endpoints=nmap_endpoints,
+            nmap_service_versions=nmap_service_versions,
+            nmap_csv_cve_hits=nmap_csv_cve_hits,
+            do_katana=do_katana,
+            program_type=prog_type,
+            session_cookies=job.session_cookies,
+            auth_header=job.auth_header,
+            emit=emit,
+        )
 
-    live_urls: list[str] = phase2_urls["live_urls"]
-    detected_techs: set[str] = set(phase2_urls["detected_techs"])
-    _http_results_raw: list[dict] = phase2_urls.get("http_results", [])
-    nmap_service_versions = phase2_urls["nmap_service_versions"]
-    nmap_csv_cve_hits = phase2_urls["nmap_csv_cve_hits"]
-    gau_urls = phase2_urls["gau_urls"]
-    crawled_urls = phase2_urls["crawled_urls"]
-    all_target_urls: list[str] = phase2_urls["all_target_urls"]
-    cred_urls = phase2_urls["cred_urls"]
-    favicon_findings = phase2_urls.get("favicon_findings", [])
+        live_urls: list[str] = phase2_urls["live_urls"]
+        detected_techs: set[str] = set(phase2_urls["detected_techs"])
+        _http_results_raw: list[dict] = phase2_urls.get("http_results", [])
+        nmap_service_versions = phase2_urls["nmap_service_versions"]
+        nmap_csv_cve_hits = phase2_urls["nmap_csv_cve_hits"]
+        gau_urls = phase2_urls["gau_urls"]
+        crawled_urls = phase2_urls["crawled_urls"]
+        all_target_urls: list[str] = phase2_urls["all_target_urls"]
+        cred_urls = phase2_urls["cred_urls"]
+        favicon_findings = phase2_urls.get("favicon_findings", [])
 
-    await emit("phase_done", {
-        "phase": "active_recon",
-        "live_hosts": len(live_hosts),
-        "target_urls": len(all_target_urls),
-        **({"cred_urls": len(cred_urls)} if cred_urls else {}),
-    })
+        await emit("phase_done", {
+            "phase": "active_recon",
+            "live_hosts": len(live_hosts),
+            "target_urls": len(all_target_urls),
+            **({"cred_urls": len(cred_urls)} if cred_urls else {}),
+        })
+
+        return {
+            "all_subdomains": all_subdomains,
+            "live_hosts": live_hosts,
+            "nmap_endpoints": nmap_endpoints,
+            "nmap_service_versions": nmap_service_versions,
+            "nmap_csv_cve_hits": nmap_csv_cve_hits,
+            "shodan_vuln_findings": shodan_vuln_findings,
+            "live_urls": live_urls,
+            "detected_techs": detected_techs,
+            "http_results": _http_results_raw,
+            "gau_urls": gau_urls,
+            "crawled_urls": crawled_urls,
+            "all_target_urls": all_target_urls,
+            "cred_urls": cred_urls,
+            "favicon_findings": favicon_findings,
+            "prog_type": prog_type,
+        }
+
+    checkpoint_path = os.path.join(scan_dir, "recon_checkpoint.json")
+    recon = _load_recon_checkpoint(checkpoint_path) if resume else None
+    if recon is not None:
+        await emit("pipeline_config", {"resumed_from_checkpoint": True})
+        await emit("phase_done", {
+            "phase": "active_recon",
+            "resumed": True,
+            "live_hosts": len(recon["live_hosts"]),
+            "target_urls": len(recon["all_target_urls"]),
+        })
+    else:
+        recon = await _recon_phases()
+        _save_recon_checkpoint(checkpoint_path, recon)
+
+    all_subdomains = recon["all_subdomains"]
+    live_hosts = recon["live_hosts"]
+    nmap_service_versions = recon["nmap_service_versions"]
+    nmap_csv_cve_hits = recon["nmap_csv_cve_hits"]
+    shodan_vuln_findings = recon["shodan_vuln_findings"]
+    live_urls: list[str] = recon["live_urls"]
+    detected_techs: set[str] = recon["detected_techs"]
+    _http_results_raw: list[dict] = recon["http_results"]
+    gau_urls = recon["gau_urls"]
+    crawled_urls = recon["crawled_urls"]
+    all_target_urls: list[str] = recon["all_target_urls"]
+    cred_urls = recon["cred_urls"]
+    favicon_findings = recon["favicon_findings"]
+    prog_type = recon["prog_type"]
 
     # Delta: emit new surface relative to previous scan
     await emit_delta_new_surface(
@@ -291,6 +374,46 @@ async def run_web_pipeline(
         live_urls=live_urls,
         emit=emit,
     )
+
+    # Authenticated scan: verify the supplied credentials actually change responses.
+    if job.session_cookies or job.auth_header:
+        in_scope_live = [u for u in live_urls if is_in_scope(u, scope)]
+        auth_result = await check_auth(in_scope_live, job.session_cookies, job.auth_header)
+        await emit("auth_check", auth_result)
+
+    # Early WAF detection: behind Cloudflare, blind fuzzing and bulk nuclei mostly
+    # get blocked, so skip ffuf/arjun and shrink the nuclei target list.
+    waf = detect_waf_profile(_http_results_raw)
+    nuclei_max_urls = 500
+    if waf.cloudflare_heavy:
+        skipped = [name for name, on in (("ffuf", do_ffuf), ("arjun", do_arjun)) if on]
+        do_ffuf = False
+        do_arjun = False
+        nuclei_max_urls = CF_NUCLEI_MAX_URLS
+        await emit("waf_detected", {
+            "waf": "cloudflare",
+            "cloudflare_hosts": waf.cloudflare_hosts,
+            "total_hosts": waf.total_hosts,
+            "skipped": skipped,
+            "nuclei_max_urls": nuclei_max_urls,
+        })
+        # Passive origin discovery: subdomains resolving outside Cloudflare ranges.
+        host_ips = await resolve_hosts(sorted(all_subdomains))
+        if resolver_looks_unreliable(host_ips, cloudflare_confirmed_hosts(_http_results_raw)):
+            origin_candidates = {}
+            await emit("tool_skip", {
+                "tool": "origin_discovery",
+                "reason": "local DNS returns non-Cloudflare IPs for Cloudflare hosts (altered answers)",
+            })
+        else:
+            origin_candidates = select_origin_candidates(host_ips)
+        if origin_candidates:
+            async with aiofiles.open(os.path.join(scan_dir, "origin_candidates.json"), "w") as fh:
+                await fh.write(json.dumps(origin_candidates, indent=2))
+            await emit("origin_candidates", {
+                "count": len(origin_candidates),
+                "samples": [{"host": h, "ips": ips} for h, ips in list(origin_candidates.items())[:8]],
+            })
 
     # GitHub dorking
     github_findings = await run_github_dork_phase(
@@ -371,7 +494,7 @@ async def run_web_pipeline(
     await emit("phase_start", {"phase": "nuclei_scan"})
 
     if do_nuclei:
-        nuclei_urls = select_nuclei_targets(all_target_urls, live_urls, max_urls=500)
+        nuclei_urls = select_nuclei_targets(all_target_urls, live_urls, max_urls=nuclei_max_urls)
         await emit("tool_start", {
             "tool": "nuclei",
             "detail": f"{len(nuclei_urls)} targets (of {len(all_target_urls)} total)"

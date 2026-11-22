@@ -7,9 +7,15 @@ const EVENT_COLORS = {
   tool_start: '#8b949e',
   tool_done: '#58a6ff',
   tool_skip: '#6e7681',
+  raw_findings_collected: '#8b949e',
   nuclei_progress: '#8b949e',
   pipeline_config: '#8b949e',
   tech_detected: '#a371f7',
+  waf_detected: '#d29922',
+  scan_resumed: '#58a6ff',
+  rate_limit: '#8b949e',
+  auth_check: '#d29922',
+  origin_candidates: '#d29922',
   service_versions: '#79c0ff',
   llm_usage: '#79c0ff',
   finding_approved: '#f0883e',
@@ -61,8 +67,24 @@ export default function ScanProgress() {
   const [reportIds, setReportIds] = useState([]) // track generated report IDs for navigation
   const [rerunPhase, setRerunPhase] = useState('nuclei')
   const [rerunning, setRerunning] = useState(false)
+  const [resuming, setResuming] = useState(false)
+  const [resumeError, setResumeError] = useState('')
   const bottomRef = useRef(null)
   const esRef = useRef(null)
+
+  async function resumeScan() {
+    setResuming(true)
+    setResumeError('')
+    try {
+      const res = await fetch(`/api/scans/${scanId}/resume`, { method: 'POST' })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`)
+      window.location.reload() // reopen the event stream; the scan continues from its checkpoint
+    } catch (e) {
+      setResumeError(String(e.message || e))
+      setResuming(false)
+    }
+  }
 
   useEffect(() => {
     const url = `/api/scans/${programId}/${scanId}/stream`
@@ -151,9 +173,49 @@ export default function ScanProgress() {
         addLine(`    ⊘ ${data.tool} skipped${data.reason ? ` — ${data.reason}` : ''}`, color)
         break
 
+      case 'raw_findings_collected':
+        addLine(`  ${data.total_findings} raw finding(s) collected — running AI filter…`, color)
+        break
+
       case 'tech_detected': {
         const techList = (data.techs || []).join(', ')
         addLine(`  🔬 Tech detected: ${techList || 'none'}`, color)
+        break
+      }
+
+      case 'scan_resumed':
+        addLine(`  ↻ Scan resumed${data.from_checkpoint ? ' from recon checkpoint (passive + active recon skipped)' : ' (no checkpoint found, restarting from scratch)'}`, color)
+        break
+
+      case 'rate_limit':
+        addLine(`  ⏱ Request rate capped at ${data.requests_per_second}/s (${data.source})`, color)
+        break
+
+      case 'auth_check': {
+        const msg = {
+          accepted: '✓ credentials accepted — responses differ from anonymous requests',
+          rejected: '✗ credentials REJECTED (401/403) — session expired or wrong; scan continues unauthenticated in effect',
+          no_effect: '⚠ credentials had no visible effect on the checked URLs (cookie/token may be wrong or the pages are public)',
+          unreachable: '⚠ could not reach URLs to verify credentials',
+          skipped: 'auth check skipped',
+        }[data.verdict] || data.verdict
+        addLine(`  🔐 Auth check (${data.checked} URLs): ${msg}`, color)
+        break
+      }
+
+      case 'waf_detected': {
+        const skipped = (data.skipped || []).join(', ')
+        addLine(
+          `  🛡 ${data.waf} detected on ${data.cloudflare_hosts}/${data.total_hosts} hosts — ` +
+          `${skipped ? `skipping ${skipped}, ` : ''}nuclei capped at ${data.nuclei_max_urls} URLs`,
+          color,
+        )
+        break
+      }
+
+      case 'origin_candidates': {
+        const samples = (data.samples || []).map(x => `${x.host} -> ${x.ips.join(',')}`).join('; ')
+        addLine(`  🎯 ${data.count} hosts resolve outside Cloudflare (possible origin): ${samples}`, color)
         break
       }
 
@@ -299,6 +361,24 @@ export default function ScanProgress() {
       {/* Action buttons */}
       {(done || failed) && (
         <div style={{ marginTop: 16 }}>
+          {failed && (
+            <div style={{ marginBottom: 12 }}>
+              <button
+                onClick={resumeScan}
+                disabled={resuming}
+                style={{
+                  padding: '9px 20px', background: '#1f6feb', color: '#fff',
+                  border: 'none', borderRadius: 6, fontSize: 14, fontWeight: 700,
+                  cursor: resuming ? 'default' : 'pointer', opacity: resuming ? 0.6 : 1,
+                }}
+              >
+                {resuming ? 'Resuming…' : '↻ Resume scan from checkpoint'}
+              </button>
+              {resumeError && (
+                <span style={{ marginLeft: 12, color: '#f85149', fontSize: 13 }}>{resumeError}</span>
+              )}
+            </div>
+          )}
           {done && stats.approved > 0 && (
             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
               {/* Primary CTA: jump straight to reports if any were generated */}

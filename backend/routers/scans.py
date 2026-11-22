@@ -132,6 +132,7 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
     scan_dir = _scan_dir(program_id, scan_id)
     recon_dir = os.path.join(WORKSPACE, program_id, "recon")
     rerun_job = await _load_job(program_id, scan_id)
+    tool_runner.set_rate_cap(rerun_job.rate_limit)
 
     try:
         await _push_event(redis, scan_id, "phase_start", {"phase": phase})
@@ -292,7 +293,7 @@ async def _rerun_phase_pipeline(program_id: str, scan_id: str, phase: str) -> No
 
 # ── scan orchestration ────────────────────────────────────────────────────────
 
-async def _run_scan_pipeline(job: ScanJob) -> None:
+async def _run_scan_pipeline(job: ScanJob, resume: bool = False) -> None:
     """
     Full scan pipeline executed as a background task.
     Phase 1: Passive recon
@@ -353,6 +354,17 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
         program = await _load_scope_and_program(program_id)
         scope = program.scope
 
+        # Request-rate cap: explicit user value wins, otherwise a limit stated in the program policy.
+        from backend.services.rate_limit import parse_rate_limit
+        policy_rate = parse_rate_limit(program.raw_text or "")
+        effective_rate = job.rate_limit or policy_rate
+        tool_runner.set_rate_cap(effective_rate)
+        if effective_rate:
+            await _push_event(redis, scan_id, "rate_limit", {
+                "requests_per_second": effective_rate,
+                "source": "user" if job.rate_limit else "program policy",
+            })
+
         mode_config = await resolve_pipeline_mode_config(
             job=job,
             scope=scope,
@@ -411,6 +423,7 @@ async def _run_scan_pipeline(job: ScanJob) -> None:
             github_token=settings.github_token,
             takeover_timeout_s=TAKEOVER_PHASE_TIMEOUT_S,
             emit=_emit_web,
+            resume=resume,
         )
 
         await save_delta_history(
@@ -543,6 +556,7 @@ async def start_scan(body: ScanCreate):
         scan_mode=(body.scan_mode or "auto").strip(),
         api_spec_url=(body.api_spec_url or "").strip(),
         repo_url=(body.repo_url or "").strip(),
+        rate_limit=max(0, int(body.rate_limit or 0)),
     )
 
     await _save_job(job, body.program_id)
@@ -738,6 +752,38 @@ async def get_finding_screenshot(program_id: str, scan_id: str, finding_id: str)
         raise HTTPException(status_code=404, detail="No screenshot captured for this finding")
 
     return FileResponse(screenshot_path, media_type="image/png")
+
+
+@router.post("/{scan_id}/resume", response_model=ApiResponse)
+async def resume_scan(scan_id: str):
+    """Resume an interrupted/failed scan from its recon checkpoint (skips passive + active recon)."""
+    program_id = _discover_program_id_by_scan(scan_id)
+    if not program_id:
+        raise HTTPException(status_code=404, detail=f"Scan '{scan_id}' not found")
+    job = await _load_job(program_id, scan_id)
+    if job.status not in (ScanStatus.interrupted, ScanStatus.failed):
+        raise HTTPException(status_code=409, detail=f"Scan is '{job.status.value}', only interrupted/failed scans can be resumed")
+
+    has_checkpoint = os.path.exists(os.path.join(_scan_dir(program_id, scan_id), "recon_checkpoint.json"))
+
+    # Drop the terminal error event so the SSE stream does not close immediately.
+    redis = await _get_redis()
+    if redis:
+        try:
+            key = f"scan:{scan_id}:events"
+            last_raw = await redis.lindex(key, -1)
+            if last_raw and json.loads(last_raw).get("type") in ("scan_error", "scan_done"):
+                await redis.rpop(key)
+            await _push_event(redis, scan_id, "scan_resumed", {"from_checkpoint": has_checkpoint})
+        finally:
+            await redis.aclose()
+
+    job.status = ScanStatus.pending
+    job.finished_at = None
+    await _save_job(job, program_id)
+    await database.update_scan_status(job.id, status=ScanStatus.pending.value)
+    asyncio.create_task(_run_scan_pipeline(job, resume=True))
+    return ApiResponse(success=True, data={"scan_id": scan_id, "program_id": program_id, "from_checkpoint": has_checkpoint})
 
 
 @router.post("/{scan_id}/rerun-phase", response_model=ApiResponse)

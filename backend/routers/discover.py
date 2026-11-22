@@ -21,7 +21,7 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from backend import database
 from backend.config import settings
 from backend.models import Program, ScanCreate
-from backend.services import h1_discovery, scope_parser, claude_service
+from backend.services import h1_discovery, program_ranker, scope_parser, claude_service
 
 log = logging.getLogger("discover")
 router = APIRouter()
@@ -189,6 +189,37 @@ async def discover_programs(
     return {**result, "count": len(result["programs"])}
 
 
+@router.get("/ranked")
+async def ranked_programs(
+    limit: int = Query(30, ge=5, le=60),
+    refresh: bool = Query(False),
+    sort: str = Query("newest", pattern="^(newest|score)$"),
+):
+    """Rank the newest open programs by suitability for this scanner (cached 1h, no LLM cost).
+
+    sort=newest (default): most recently launched first, so freshly opened programs surface
+    before ones that have been picked over; sort=score: best score first.
+    """
+    if not h1_discovery.has_credentials():
+        raise HTTPException(status_code=400, detail=_NO_CREDS)
+    try:
+        ranked = await program_ranker.rank_programs(limit=limit, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except Exception as exc:
+        log.error("ranking error: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Ranking failed: {exc}")
+    ranked = [dict(r) for r in ranked]
+    for r in ranked:
+        slug = _slugify(r.get("name") or r.get("handle") or "")
+        r["already_imported"] = os.path.isdir(_program_dir(slug)) if slug else False
+    if sort == "newest":
+        ranked.sort(key=lambda r: r.get("started_accepting_at") or "", reverse=True)
+    else:
+        ranked.sort(key=lambda r: r["score"], reverse=True)
+    return {"programs": ranked, "count": len(ranked), "sort": sort}
+
+
 @router.get("/new-programs")
 async def discover_new_programs(refresh: bool = Query(False)):
     """
@@ -227,7 +258,11 @@ async def import_program(handle: str, name: str = Query("")):
 
 
 @router.post("/import-scan/{handle}")
-async def import_and_scan(handle: str, name: str = Query("")):
+async def import_and_scan(
+    handle: str,
+    name: str = Query(""),
+    rate_limit: int = Query(0, ge=0, le=500),
+):
     """
     Import program from H1, generate a testing plan via Claude,
     then start a scan immediately.
@@ -261,7 +296,7 @@ async def import_and_scan(handle: str, name: str = Query("")):
 
     try:
         scan_result = await start_scan(
-            ScanCreate(program_id=slug, approved_plan=plan_md)
+            ScanCreate(program_id=slug, approved_plan=plan_md, rate_limit=rate_limit)
         )
         scan_id: str = scan_result.data["id"]  # type: ignore[index]
     except HTTPException as exc:

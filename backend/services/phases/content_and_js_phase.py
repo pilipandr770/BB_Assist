@@ -124,8 +124,22 @@ async def run_content_and_js_phase(
 
     await emit("tool_start", {"tool": "js_scanner", "detail": f"{len(js_urls)} JS files"})
     js_out = os.path.join(scan_dir, "js_secrets.jsonl")
-    js_secrets = await tool_runner.run_js_scanner(js_urls, js_out)
+    js_endpoints: list[str] = []
+    js_secrets = await tool_runner.run_js_scanner(js_urls, js_out, endpoints_out=js_endpoints)
     await emit("tool_done", {"tool": "js_scanner", "count": len(js_secrets)})
+
+    # Endpoints referenced inside first-party JS (APIs the crawler never visits).
+    js_new_endpoints = [
+        u for u in dict.fromkeys(js_endpoints)
+        if is_in_scope(u, scope) and u not in set(all_target_urls)
+    ][:500]
+    if js_new_endpoints:
+        all_target_urls = list(all_target_urls) + js_new_endpoints
+        await emit("tool_done", {
+            "tool": "js_endpoints",
+            "count": len(js_new_endpoints),
+            "detail": "new in-scope API endpoints found inside JS",
+        })
 
     js_pre_filtered = 0
     js_kept = []

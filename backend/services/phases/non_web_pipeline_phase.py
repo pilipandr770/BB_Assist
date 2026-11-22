@@ -84,8 +84,12 @@ async def run_non_web_pipeline_phase(
                 }
             )
 
+        # Non-terminal: persist_raw_findings_phase below runs the AI filter and emits
+        # the real terminal "scan_done" when it's actually done. Do NOT use that name
+        # here — the SSE reader and frontend both treat "scan_done" as the stream's
+        # end-of-scan signal and would close the connection before filtering runs.
         await emit(
-            "scan_done",
+            "raw_findings_collected",
             {
                 "total_findings": len(all_findings_raw),
                 "pipeline": "ip",
@@ -174,8 +178,9 @@ async def run_non_web_pipeline_phase(
                 }
             )
 
+        # Non-terminal — see the "ip" branch above for why this must not be "scan_done".
         await emit(
-            "scan_done",
+            "raw_findings_collected",
             {
                 "total_findings": len(all_findings_raw),
                 "pipeline": "source_code",
@@ -245,8 +250,9 @@ async def run_non_web_pipeline_phase(
                 }
             )
 
+        # Non-terminal — see the "ip" branch above for why this must not be "scan_done".
         await emit(
-            "scan_done",
+            "raw_findings_collected",
             {
                 "total_findings": len(all_findings_raw),
                 "pipeline": "api",

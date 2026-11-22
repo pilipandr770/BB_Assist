@@ -96,4 +96,4 @@ async def test_persist_raw_findings_phase(monkeypatch, tmp_path):
 
     assert saved["program_id"] == "prog-1"
     assert job.findings_count == 1
-    assert any(evt[0] == "scan_complete" for evt in events)
+    assert any(evt[0] == "scan_done" for evt in events)

@@ -17,6 +17,7 @@ class ScanStatus(str, Enum):
     running = "running"
     done = "done"
     failed = "failed"
+    interrupted = "interrupted"
 
 
 # --- Scope ---
@@ -60,6 +61,7 @@ class ScanCreate(BaseModel):
     scan_mode: str = "auto"     # auto | ip | api | source_code
     api_spec_url: str = ""      # OpenAPI/Swagger spec URL or local path
     repo_url: str = ""          # git repo URL for source_code mode
+    rate_limit: int = 0         # max requests/sec for scan tools; 0 = auto (parse program text / tool defaults)
 
 
 class ScanJob(BaseModel):
@@ -76,6 +78,7 @@ class ScanJob(BaseModel):
     scan_mode: str = "auto"       # auto | ip | api | source_code
     api_spec_url: str = ""
     repo_url: str = ""
+    rate_limit: int = 0
 
 
 # --- Finding ---

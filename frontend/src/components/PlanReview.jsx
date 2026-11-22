@@ -12,6 +12,7 @@ export default function PlanReview() {
   const [error, setError] = useState(null)
   const [sessionCookies, setSessionCookies] = useState('')
   const [authHeader, setAuthHeader] = useState('')
+  const [rateLimit, setRateLimit] = useState('')
   const [showAuth, setShowAuth] = useState(false)
   const [scanMode, setScanMode] = useState('auto')
   const [apiSpecUrl, setApiSpecUrl] = useState('')
@@ -61,6 +62,7 @@ export default function PlanReview() {
         approved_plan: plan,
         session_cookies: sessionCookies,
         auth_header: authHeader,
+        rate_limit: Math.max(0, parseInt(rateLimit, 10) || 0),
         scan_mode: scanMode,
         api_spec_url: apiSpecUrl,
         repo_url: repoUrl,
@@ -145,6 +147,18 @@ export default function PlanReview() {
       />
 
       <div style={{ ...S.card, marginTop: 14 }}>
+        <div style={{ marginBottom: 16 }}>
+          <label style={S.label}>Max requests/sec (optional)</label>
+          <input
+            type="number"
+            min="0"
+            value={rateLimit}
+            onChange={e => setRateLimit(e.target.value)}
+            placeholder="empty = auto (read from program policy, else tool defaults)"
+            style={S.input}
+          />
+        </div>
+
         <button
           type="button"
           onClick={() => setShowAuth(v => !v)}

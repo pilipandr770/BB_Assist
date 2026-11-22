@@ -1,8 +1,11 @@
 """Phase helpers for 403 bypass, parameter discovery, and focused XSS probing."""
 
+import asyncio
 from collections.abc import Awaitable, Callable
 import os
 import re
+
+import httpx
 from urllib.parse import urlparse
 
 from urllib.parse import ParseResult
@@ -43,6 +46,29 @@ _STATIC_PATH_SEGS = frozenset(
 )
 
 
+_ARJUN_CONCURRENCY = 3
+_SAFE_ARJUN_PATH_RE = re.compile(r"^[A-Za-z0-9/_\-.~]+$")
+
+
+def is_clean_arjun_url(url: str) -> bool:
+    """Reject malformed URLs (trailing %5C, backslashes, control chars, odd encodings)."""
+    if not url.isascii() or "\\" in url or "%00" in url or "%5c" in url.lower():
+        return False
+    parsed = _try_parse(url)
+    if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    return bool(_SAFE_ARJUN_PATH_RE.match(parsed.path or "/"))
+
+
+async def arjun_preflight(url: str, client: httpx.AsyncClient) -> bool:
+    """Cheap liveness check: skip dead/404/5xx endpoints before spending ~2 min on arjun."""
+    try:
+        resp = await client.get(url)
+    except Exception:
+        return False
+    return resp.status_code < 400 or resp.status_code in (401, 403, 405)
+
+
 async def run_appsec_probe_phase(
     *,
     scan_dir: str,
@@ -75,6 +101,8 @@ async def run_appsec_probe_phase(
         for target_url in all_target_urls:
             if "?" in target_url or not is_in_scope(target_url, scope):
                 continue
+            if not is_clean_arjun_url(target_url):
+                continue
             try:
                 parsed = urlparse(target_url)
                 path = parsed.path.lower()
@@ -99,16 +127,34 @@ async def run_appsec_probe_phase(
             if len(param_targets) >= arjun_max:
                 break
 
-        for pt_url in param_targets:
-            await emit("tool_start", {"tool": "arjun", "detail": pt_url})
-            arjun_out = os.path.join(scan_dir, f"arjun_{len(arjun_params)}.json")
-            params = await tool_runner.run_arjun(pt_url, arjun_out)
+        sem = asyncio.Semaphore(_ARJUN_CONCURRENCY)
+
+        async with httpx.AsyncClient(
+            timeout=8, follow_redirects=True, verify=False,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                     **tool_runner.h1_research_headers()},
+        ) as client:
+
+            async def _probe(idx: int, pt_url: str) -> tuple[str, list[str]]:
+                async with sem:
+                    if not await arjun_preflight(pt_url, client):
+                        await emit("tool_skip", {"tool": "arjun", "reason": f"{pt_url} not reachable / 4xx-5xx"})
+                        return pt_url, []
+                    await emit("tool_start", {"tool": "arjun", "detail": pt_url})
+                    arjun_out = os.path.join(scan_dir, f"arjun_{idx}.json")
+                    found = await tool_runner.run_arjun(pt_url, arjun_out)
+                    await emit("tool_done", {"tool": "arjun", "count": len(found)})
+                    return pt_url, found
+
+            results = await asyncio.gather(*(_probe(i, u) for i, u in enumerate(param_targets)))
+
+        for pt_url, params in results:
             if params:
                 arjun_params[pt_url] = params
                 param_url = pt_url + "?" + "&".join(f"{p}=FUZZ" for p in params[:5])
                 if is_in_scope(param_url, scope):
                     all_target_urls.append(param_url)
-            await emit("tool_done", {"tool": "arjun", "count": len(params)})
 
         await emit(
             "phase_done",
@@ -150,7 +196,9 @@ async def run_appsec_probe_phase(
         await emit("phase_start", {"phase": "graphql_probe"})
         await emit("tool_start", {"tool": "graphql", "detail": f"{len(base_hosts)} hosts"})
         gql_out = os.path.join(scan_dir, "graphql_findings.jsonl")
-        graphql_findings = await tool_runner.run_graphql_probe(base_hosts, scan_dir)
+        graphql_findings = await tool_runner.run_graphql_probe(
+            base_hosts, scan_dir, session_cookies=session_cookies, auth_header=auth_header
+        )
         await emit("tool_done", {"tool": "graphql", "count": len(graphql_findings)})
         await emit("phase_done", {"phase": "graphql_probe", "findings": len(graphql_findings)})
 

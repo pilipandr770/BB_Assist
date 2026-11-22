@@ -273,7 +273,7 @@ async def get_program_scopes(handle: str) -> tuple[list[dict], list[dict]]:
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
             resp = await client.get(
-                f"{H1_BASE}/programs/{handle}/structured_scopes",
+                f"{H1_BASE}/hackers/programs/{handle}/structured_scopes",
                 auth=_auth(),
                 params={"page[number]": page, "page[size]": 100},
                 headers={"Accept": "application/json"},

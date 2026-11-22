@@ -231,12 +231,23 @@ def _extract_usage(message) -> tuple[int, int]:
     return int(in_tokens or 0), int(out_tokens or 0)
 
 
+def _msg_text(message) -> str:
+    """Concatenate text blocks, skipping thinking/tool blocks (newer models emit ThinkingBlock first)."""
+    return "".join(
+        getattr(b, "text", "") or ""
+        for b in (getattr(message, "content", None) or [])
+        if getattr(b, "type", None) == "text"
+    )
+
+
 def _is_claude4(model: str) -> bool:
     m = (model or "").lower()
     return (
         "claude-opus-4" in m
         or "claude-sonnet-4" in m
         or "claude-haiku-4" in m
+        or "claude-sonnet-5" in m
+        or "claude-haiku-5" in m
         or "claude-fable" in m
     )
 
@@ -436,7 +447,7 @@ Program text:
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw_text = message.content[0].text if message.content else ""
+    raw_text = _msg_text(message) or ""
     data = _parse_scope_json_or_none(raw_text)
     if data is not None:
         return Scope(**data)
@@ -453,7 +464,7 @@ Program text:
         temperature=0,
         messages=[{"role": "user", "content": repair_prompt}],
     )
-    repair_raw = repair_message.content[0].text if repair_message.content else ""
+    repair_raw = _msg_text(repair_message) or ""
     repaired = _parse_scope_json_or_none(repair_raw)
     if repaired is not None:
         return Scope(**repaired)
@@ -534,7 +545,7 @@ Return a well-structured, actionable markdown document."""
         messages=[{"role": "user", "content": prompt}],
     )
 
-    return message.content[0].text
+    return _msg_text(message)
 
 
 async def check_duplicate_finding(finding: Finding, scope: Scope) -> tuple[bool, str]:
@@ -583,7 +594,7 @@ Is this likely a known/overreported duplicate on HackerOne?"""
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        data = json.loads(_strip_json(message.content[0].text))
+        data = json.loads(_strip_json(_msg_text(message)))
         return data.get("is_duplicate", False), data.get("reason", "")
     except Exception:
         return False, "dedup check failed — assuming unique"
@@ -671,7 +682,7 @@ Decision:"""
 
     raw_text = ""
     try:
-        raw_text = message.content[0].text if message.content else ""
+        raw_text = _msg_text(message) or ""
         data = json.loads(_strip_json(raw_text))
     except (json.JSONDecodeError, IndexError, Exception):
         # Claude returned empty/invalid JSON — conservatively reject the finding
@@ -751,7 +762,7 @@ Is this confirmed?"""
 
     raw_text = ""
     try:
-        raw_text = message.content[0].text if message.content else ""
+        raw_text = _msg_text(message) or ""
         data = json.loads(_strip_json(raw_text))
     except (json.JSONDecodeError, IndexError, Exception):
         return PocResult(
@@ -934,7 +945,7 @@ import requests
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    report_md = message.content[0].text
+    report_md = _msg_text(message)
 
     # Safety pass: remove common template leftovers / mixed-language artifacts.
     has_placeholders = bool(re.search(r"\[[^\]]*(add|step|endpoint|x\.x|severity|cwe|cvss)[^\]]*\]", report_md, re.IGNORECASE))
@@ -959,7 +970,7 @@ Report to rewrite:
             system="You are a strict technical editor for bug bounty reports.",
             messages=[{"role": "user", "content": rewrite_prompt}],
         )
-        report_md = rewrite.content[0].text
+        report_md = _msg_text(rewrite)
 
     return report_md
 
@@ -992,4 +1003,4 @@ Report to revise:
         system="You are a strict technical editor for bug bounty reports.",
         messages=[{"role": "user", "content": rewrite_prompt}],
     )
-    return rewrite.content[0].text if rewrite.content else report_md
+    return _msg_text(rewrite) or report_md

@@ -4,14 +4,14 @@ from typing import Optional
 
 class Settings(BaseSettings):
     anthropic_api_key: str
-    anthropic_model_scope: str = "claude-haiku-4-5"
-    anthropic_model_plan: str = "claude-sonnet-4-6"
-    anthropic_model_filter: str = "claude-sonnet-4-6"
-    anthropic_model_poc: str = "claude-sonnet-4-6"
-    anthropic_model_report: str = "claude-opus-4-7"
-    anthropic_model_rewrite: str = "claude-sonnet-4-6"
+    anthropic_model_scope: str = "claude-haiku-5-5"
+    anthropic_model_plan: str = "claude-sonnet-5-5"
+    anthropic_model_filter: str = "claude-sonnet-5-5"
+    anthropic_model_poc: str = "claude-sonnet-5-5"
+    anthropic_model_report: str = "claude-sonnet-5-5"
+    anthropic_model_rewrite: str = "claude-sonnet-5-5"
     # Comma-separated model list tried after the task-specific primary model.
-    anthropic_model_fallbacks: str = "claude-sonnet-4-6,claude-haiku-4-5"
+    anthropic_model_fallbacks: str = "claude-sonnet-5-5,claude-haiku-5-5"
 
     # Estimated per-1M token pricing used for UI scan-cost telemetry.
     anthropic_cost_opus_input_per_mtok: float = 15.0

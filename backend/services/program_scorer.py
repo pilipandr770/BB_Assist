@@ -5,8 +5,9 @@ import re
 import anthropic
 
 from backend.config import settings
+from backend.services.waf_detect import probe_cloudflare
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-5-5"
 _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 _NO_AUTOMATED_RE = re.compile(
@@ -110,7 +111,7 @@ Program text:
         temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = msg.content[0].text if msg.content else "{}"
+    raw = ("".join(getattr(b,"text","") or "" for b in (msg.content or []) if getattr(b,"type",None)=="text") or "{}")
 
     try:
         data = json.loads(_strip_json(raw))
@@ -130,6 +131,17 @@ Program text:
 
     normalized = _normalize_result(data)
     normalized["score"] = _apply_score_formula(program_text, normalized)
+
+    # Cloudflare-fronted targets block most scanners (see waf_detect): penalise.
+    target_domains = [t for t in normalized.get("top_targets", []) if isinstance(t, str) and "." in t and "/" not in t]
+    try:
+        behind_cf = await probe_cloudflare(target_domains)
+    except Exception:
+        behind_cf = False
+    normalized["behind_cloudflare"] = behind_cf
+    if behind_cf:
+        normalized["score"] = max(0, normalized["score"] - 15)
+        normalized["red_flags"] = list(normalized["red_flags"]) + ["behind_cloudflare"]
     normalized["program_text"] = program_text
     return normalized
 

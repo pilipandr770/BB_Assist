@@ -224,8 +224,12 @@ async def persist_raw_findings_phase(
     if llm_usage is not None:
         await emit("llm_usage", llm_usage)
 
+    # Must be literally "scan_done" (not e.g. "scan_complete"): the SSE reader in
+    # scans.py and the frontend both key off this exact string to recognise the
+    # terminal event and close the stream — see scan_finalize_phase.py for the
+    # equivalent event in the web pipeline.
     await emit(
-        "scan_complete",
+        "scan_done",
         {
             "approved": approved_count,
             "rejected": rejected_count,

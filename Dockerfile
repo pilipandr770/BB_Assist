@@ -55,7 +55,7 @@ RUN go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 
     go install -v github.com/tomnomnom/qsreplace@latest && \
     go install -v github.com/d3mondev/puredns/v2@latest && \
     go install -v github.com/haccer/subjack@latest && \
-    go install -v github.com/zricethezav/gitleaks/v8/cmd/gitleaks@latest && \
+    go install -v github.com/zricethezav/gitleaks/v8@latest && \
     go install -v github.com/infosec-au/altdns@latest 2>/dev/null || true
 
 # Install trufflehog (standalone binary, pinned version)

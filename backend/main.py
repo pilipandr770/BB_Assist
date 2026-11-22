@@ -85,12 +85,45 @@ async def _mark_zombie_scans():
         pass  # Redis unavailable — skip zombie cleanup
 
 
+async def _mark_interrupted_jobs():
+    """Any job still 'running'/'pending' at startup was killed by the restart: mark it resumable."""
+    try:
+        from backend.config import settings as _s
+        from backend.models import ScanStatus
+
+        root = _s.workspace_dir
+        if not os.path.isdir(root):
+            return
+        for prog in os.scandir(root):
+            scans_dir = os.path.join(prog.path, "scans")
+            if not prog.is_dir() or not os.path.isdir(scans_dir):
+                continue
+            for scan in os.scandir(scans_dir):
+                job_path = os.path.join(scan.path, "job.json")
+                if not os.path.exists(job_path):
+                    continue
+                try:
+                    with open(job_path, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    if data.get("status") not in ("running", "pending"):
+                        continue
+                    data["status"] = ScanStatus.interrupted.value
+                    with open(job_path, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, indent=2)
+                    await database.update_scan_status(data["id"], status=ScanStatus.interrupted.value)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: kill orphan tool processes and mark zombie scans as error
     await database.init_db()
     _kill_child_processes()
     await _mark_zombie_scans()
+    await _mark_interrupted_jobs()
 
     # Wire Redis into the pre-submission duplicate gate
     try:

@@ -40,6 +40,26 @@ export default function ProgramDiscovery() {
   const [expanded, setExpanded] = useState({})
   const [actionState, setActionState] = useState({})
 
+  const [ranked, setRanked] = useState([])
+  const [rankLoading, setRankLoading] = useState(false)
+  const [rankError, setRankError] = useState('')
+  const [rankSort, setRankSort] = useState('newest')
+
+  const fetchRanked = useCallback(async (refresh = false, sortKey = 'newest') => {
+    setRankLoading(true)
+    setRankError('')
+    try {
+      const r = await fetch(`/api/discover/ranked?limit=30&sort=${sortKey}&refresh=${refresh ? 'true' : 'false'}`)
+      const j = await r.json()
+      if (!r.ok) throw new Error(j.detail || r.statusText)
+      setRanked(j.programs || [])
+    } catch (e) {
+      setRankError(e.message)
+    } finally {
+      setRankLoading(false)
+    }
+  }, [])
+
   const fetchAll = useCallback(async (p, sortKey) => {
     setAllLoading(true)
     setAllError('')
@@ -102,6 +122,7 @@ export default function ProgramDiscovery() {
 
   useEffect(() => {
     if (activeTab === 'all' && allPrograms.length === 0) fetchAll(1, sort)
+    if (activeTab === 'best' && ranked.length === 0 && !rankLoading) fetchRanked(false, rankSort)
   }, [activeTab]) // eslint-disable-line
 
   async function doImport(p) {
@@ -167,7 +188,84 @@ export default function ProgramDiscovery() {
           label={`🔔 New Programs${newPrograms.length ? ` (${newPrograms.length})` : ''}`}
         />
         <TabBtn id="all" label="All Programs" />
+        <TabBtn id="best" label="🎯 Best Targets" />
       </div>
+
+      {/* ── Best Targets Tab ── */}
+      {activeTab === 'best' && (
+        <div>
+          <p style={{ color: G.muted, fontSize: 12, marginBottom: 12 }}>
+            Newest 30 open programs, freshest first by default. Score = wildcard/bounty web scope, severity ceiling, payment speed and a bonus for new programs (fewer duplicates).
+            Penalised: Cloudflare-fronted targets, “no automated scanning” policies, very low rate limits. No LLM cost.
+            {['newest', 'score'].map(k => (
+              <button
+                key={k}
+                onClick={() => { setRankSort(k); fetchRanked(false, k) }}
+                style={{ marginLeft: 8, background: rankSort === k ? G.surface : 'none',
+                  border: `1px solid ${rankSort === k ? G.accent : G.border}`,
+                  color: rankSort === k ? G.accent : G.muted, fontSize: 12,
+                  padding: '3px 10px', borderRadius: 4, cursor: 'pointer' }}
+              >
+                {k === 'newest' ? 'Newest first' : 'Best score first'}
+              </button>
+            ))}
+            <button
+              onClick={() => fetchRanked(true, rankSort)}
+              style={{ marginLeft: 12, background: 'none', border: `1px solid ${G.border}`,
+                color: G.muted, fontSize: 12, padding: '3px 10px', borderRadius: 4, cursor: 'pointer' }}
+            >
+              ↻ Re-rank
+            </button>
+          </p>
+          {rankLoading && <p style={{ color: G.muted, fontSize: 13 }}>⟳ Fetching scopes and probing targets (about 30–60 s)…</p>}
+          {rankError && <CredError error={rankError} />}
+          {!rankLoading && ranked.length > 0 && (
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ color: G.muted, textAlign: 'left', borderBottom: `1px solid ${G.border}` }}>
+                    <th style={cellStyle}>Score</th>
+                    <th style={{ ...cellStyle, whiteSpace: 'nowrap' }}>Accepting since</th>
+                    <th style={cellStyle}>Program</th>
+                    <th style={cellStyle}>Scope</th>
+                    <th style={cellStyle}>Flags</th>
+                    <th style={{ ...cellStyle, minWidth: 210 }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ranked.map(r => (
+                    <tr key={r.handle}>
+                      <td style={{ ...cellStyle, fontWeight: 700,
+                        color: r.score >= 70 ? G.green : r.score >= 45 ? G.yellow : G.red }}>{r.score}</td>
+                      <td style={{ ...cellStyle, whiteSpace: 'nowrap', color: G.muted, fontSize: 12 }}>
+                        {fmtDate(r.started_accepting_at) || '—'}
+                        {r.age_days != null && <div>{r.age_days}d ago</div>}
+                      </td>
+                      <td style={cellStyle}>
+                        <a href={`https://hackerone.com/${r.handle}`} target="_blank" rel="noreferrer"
+                          style={{ color: G.blue }}>{r.name}</a>
+                        <div style={{ color: G.muted, fontSize: 11 }}>
+                          @{r.handle}
+                          {r.already_imported && <span style={{ color: G.yellow, marginLeft: 8 }}>● already in My Programs</span>}
+                        </div>
+                      </td>
+                      <td style={cellStyle}>
+                        {r.wildcards} wildcard · {r.web_assets} web · {r.bounty_web_assets} bounty
+                      </td>
+                      <td style={{ ...cellStyle, color: G.yellow, fontSize: 12 }}>
+                        {(r.flags || []).join(', ') || '—'}
+                      </td>
+                      <td style={cellStyle}>
+                        <ActionCell p={r} s={actionState[r.handle]} onImport={doImport} onImportScan={doImportScan} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── New Programs Tab ── */}
       {activeTab === 'new' && (
