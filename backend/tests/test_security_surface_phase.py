@@ -18,7 +18,7 @@ async def _fake_swagger(_live_urls, _out_path):
     return [{"spec_url": "https://app.example.com/swagger.json", "base_url": "https://app.example.com", "sample_paths": ["/api/v1/users"], "endpoints_count": 1, "severity": "medium", "impact": "exposure"}]
 
 
-async def _fake_s3(_domains, _out_path):
+async def _fake_s3(_domains, _out_path, live_urls=None):
     return [{"bucket": "example-public", "severity": "high"}]
 
 

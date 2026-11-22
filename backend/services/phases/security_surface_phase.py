@@ -81,7 +81,10 @@ async def run_security_surface_phase(
     await emit("phase_start", {"phase": "s3_enum"})
     await emit("tool_start", {"tool": "s3_enum", "detail": f"{len(scope.in_scope_domains)} domains → bucket variants"})
     s3_out = os.path.join(scan_dir, "s3_buckets.jsonl")
-    s3_findings = await tool_runner.run_s3_enum(scope.in_scope_domains, s3_out)
+    s3_findings = await tool_runner.run_s3_enum(
+        scope.in_scope_domains, s3_out,
+        live_urls=[u for u in live_urls if is_in_scope(u, scope)],
+    )
     await emit("tool_done", {"tool": "s3_enum", "count": len(s3_findings)})
     await emit("phase_done", {"phase": "s3_enum", "public_buckets": len(s3_findings)})
 

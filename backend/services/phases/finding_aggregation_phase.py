@@ -174,13 +174,16 @@ def append_phase_findings(
                     "name": f"Public S3 Bucket — {s3_hit['bucket']}",
                     "severity": s3_hit["severity"],
                     "tags": ["exposure", "s3", "misconfig", "cloud"],
-                    "description": s3_hit["impact"],
+                    "description": s3_hit["impact"] + (
+                        " Sample objects: " + ", ".join(s3_hit["sample_keys"]) if s3_hit.get("sample_keys") else ""
+                    ),
                 },
                 "matched-at": s3_hit.get("scope_url") or s3_hit["url"],
                 "type": "exposure",
                 "_bucket": s3_hit["bucket"],
                 "_publicly_listed": s3_hit["publicly_listed"],
                 "_bucket_url": s3_hit["url"],
+                "_sample_keys": s3_hit.get("sample_keys", []),
             }
         )
 

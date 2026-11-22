@@ -2251,10 +2251,12 @@ def _check_s3_bucket_sync(bucket: str) -> Optional[dict]:
                 if resp.status == 200:
                     raw = resp.read(4096).decode("utf-8", errors="replace")
                     is_listing = "<ListBucketResult" in raw
+                    sample_keys = re.findall(r"<Key>([^<]{1,200})</Key>", raw)[:5] if is_listing else []
                     return {
                         "bucket": bucket,
                         "url": url,
                         "publicly_listed": is_listing,
+                        "sample_keys": sample_keys,
                         "severity": "critical" if is_listing else "high",
                         "impact": (
                             f"S3 bucket '{bucket}' is publicly accessible. "
@@ -2270,10 +2272,45 @@ def _check_s3_bucket_sync(bucket: str) -> Optional[dict]:
     return None
 
 
-async def run_s3_enum(domains: list[str], output_file: str) -> list[dict]:
+def _s3_refs_in_text(text: str) -> set[str]:
+    """Bucket names referenced in text (virtual-hosted or path-style S3 URLs)."""
+    found: set[str] = set()
+    for m in re.finditer(r"([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])\.s3[.\-][a-z0-9.\-]*amazonaws\.com", text, re.I):
+        found.add(m.group(1).lower())
+    for m in re.finditer(r"(?<![a-z0-9.\-])s3[.\-][a-z0-9.\-]*amazonaws\.com/([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])", text, re.I):
+        found.add(m.group(1).lower())
+    return found
+
+
+def _collect_s3_refs_sync(urls: list[str], domains: list[str]) -> set[str]:
+    """Buckets the target itself points to: page bodies, headers, CNAME targets."""
+    import socket
+    refs: set[str] = set()
+    for d in domains:
+        host = d.lstrip("*.")
+        try:
+            canon, aliases, _ = socket.gethostbyname_ex(host)
+            for name in [canon, *aliases]:
+                refs |= _s3_refs_in_text(name)
+        except Exception:
+            pass
+    for url in urls[:40]:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                refs |= _s3_refs_in_text(str(resp.headers))
+                refs |= _s3_refs_in_text(resp.read(400_000).decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+    return refs
+
+
+async def run_s3_enum(domains: list[str], output_file: str, live_urls: Optional[list[str]] = None) -> list[dict]:
     """
     Enumerate S3 buckets by generating company name variants from target domains.
-    Only reports actually public buckets (HTTP 200). Private (403) buckets are skipped.
+    Only reports buckets that are public (HTTP 200) AND that the target itself references
+    (page body/headers of live URLs or a CNAME to the bucket). Guessed names that nothing
+    links to are dropped: anyone can own a bucket called "<company>-prod".
     """
     import logging
     log = logging.getLogger("tool_runner")
@@ -2319,6 +2356,18 @@ async def run_s3_enum(domains: list[str], output_file: str) -> list[dict]:
             findings.append(result)
 
     await asyncio.gather(*[_check_one(b) for b in bucket_names])
+
+    if findings:
+        refs = await loop.run_in_executor(None, _collect_s3_refs_sync, list(live_urls or []), domains)
+        linked = []
+        for item in findings:
+            if item["bucket"].lower() in refs:
+                item["linked_to_target"] = True
+                item["impact"] += " The target references this bucket directly (page content, headers or CNAME)."
+                linked.append(item)
+        log.info("s3_enum: %d listable/public, %d linked to target (dropped %d unlinked)",
+                 len(findings), len(linked), len(findings) - len(linked))
+        findings = linked
 
     if findings:
         with open(output_file, "w") as f:
