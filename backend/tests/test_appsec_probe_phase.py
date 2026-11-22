@@ -10,6 +10,10 @@ async def _fake_arjun(_url, _out_path):
     return ["id", "token"]
 
 
+async def _fake_preflight(_url, _client):
+    return True
+
+
 async def _fake_dalfox(_url, _params, _out_path, scope=None):
     return [{"url": _url, "param": _params[0], "evidence": "reflected payload"}]
 
@@ -18,6 +22,7 @@ async def test_run_appsec_probe_phase(monkeypatch):
     monkeypatch.setattr(appsec_probe_phase.tool_runner, "run_403_bypass", _fake_403_bypass)
     monkeypatch.setattr(appsec_probe_phase.tool_runner, "run_arjun", _fake_arjun)
     monkeypatch.setattr(appsec_probe_phase.tool_runner, "run_dalfox", _fake_dalfox)
+    monkeypatch.setattr(appsec_probe_phase, "arjun_preflight", _fake_preflight)
 
     events = []
 

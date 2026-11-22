@@ -1,5 +1,6 @@
 """Phase 2 helpers for active recon core discovery."""
 
+import re
 from collections.abc import Awaitable, Callable
 import os
 
@@ -10,6 +11,19 @@ from backend.services.scope_parser import is_in_scope
 
 EventEmitter = Callable[[str, dict], Awaitable[None]]
 
+
+
+_HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+
+
+def explicit_scope_hosts(scope) -> set[str]:
+    """Concrete (non-wildcard) hostnames the program lists as in scope."""
+    hosts: set[str] = set()
+    for d in getattr(scope, "in_scope_domains", None) or []:
+        d = (d or "").strip().lower().rstrip(".")
+        if d and "*" not in d and _HOST_RE.match(d):
+            hosts.add(d)
+    return hosts
 
 async def run_active_recon_core(
     *,
@@ -23,6 +37,9 @@ async def run_active_recon_core(
     Run subfinder -> dnsx -> nmap and return structured outputs.
     """
     all_subdomains = set(seed_subdomains)
+    # Programs often list exact hosts (api.example.com, console.example.com) rather than
+    # wildcards. Discovery tools never "find" those, so probe them directly.
+    all_subdomains.update(explicit_scope_hosts(scope))
 
     await emit("tool_start", {"tool": "subfinder", "detail": f"{len(scope.in_scope_domains)} domains"})
     subfinder_out = os.path.join(recon_dir, "subfinder.txt")

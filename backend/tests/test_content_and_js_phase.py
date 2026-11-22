@@ -17,7 +17,7 @@ async def _fake_run_ffuf(_host_url, _wordlist, _out_path, scope=None, session_co
     ]
 
 
-async def _fake_run_js_scanner(_js_urls, _out_path):
+async def _fake_run_js_scanner(_js_urls, _out_path, endpoints_out=None):
     return [
         {"context": "NEXT_PUBLIC_KEY=something", "match": "public", "secret_type": "public", "severity": "low", "url": "https://app.example.com/app.js"},
         {"context": "upliftApiKey=secret", "match": "secret", "secret_type": "api_key", "severity": "high", "url": "https://app.example.com/app.js"},

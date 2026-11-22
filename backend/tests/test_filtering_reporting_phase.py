@@ -48,6 +48,14 @@ def _to_finding(raw, job):
 
 async def test_run_filtering_reporting_phase(monkeypatch, tmp_path):
     monkeypatch.setattr(filtering_reporting_phase.finding_filter, "run_all_layers", _fake_run_all_layers)
+
+    class _OpenGate:
+        async def evaluate(self, _finding):
+            from backend.services.presubmit_gate import CheckStatus, GateDecision
+            return GateDecision(blocked=False, status=CheckStatus.UNIQUE, reason="", h1_count=0, nvd_count=0)
+
+    # The real gate queries live HackerOne data, which made this test flaky.
+    monkeypatch.setattr(filtering_reporting_phase, "get_gate", lambda: _OpenGate())
     monkeypatch.setattr(filtering_reporting_phase.report_generator, "generate", _fake_report_generate)
     monkeypatch.setattr(filtering_reporting_phase.tool_runner, "capture_finding_evidence", _fake_capture_evidence)
     monkeypatch.setattr(filtering_reporting_phase.database, "save_finding", _fake_save_finding)

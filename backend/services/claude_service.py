@@ -614,6 +614,17 @@ async def filter_finding(
     finding_dict = finding.model_dump()
     scope_dict = scope.model_dump()
 
+    # Deterministic scope verdict: with 50+ listed hosts the model sometimes misreads
+    # the list and rejects in-scope assets as "not listed". State the exact result.
+    from backend.services.scope_parser import is_in_scope
+    _scope_check_line = ""
+    if finding.url:
+        _in = is_in_scope(finding.url, scope)
+        _scope_check_line = (
+            "\nAutomated scope check (exact match against the lists above, authoritative): "
+            f"{finding.url} is {'IN SCOPE' if _in else 'OUT OF SCOPE'}.\n"
+        )
+
     # Build EPSS/KEV context block if enrichment is available
     _epss_kev_block = ""
     if enrichment and enrichment.get("summary"):
@@ -666,7 +677,7 @@ Finding:
 
 Program scope:
 {json.dumps(scope_dict, indent=2)}
-
+{_scope_check_line}
 Program rules (first 3000 chars):
 {raw_program_text[:3000]}
 {_epss_kev_block}
