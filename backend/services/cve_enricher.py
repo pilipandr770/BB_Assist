@@ -131,6 +131,35 @@ async def get_epss(cve_ids: list[str]) -> dict[str, dict]:
     return result
 
 
+# ── Pre-filter for banner-based CVE candidates ────────────────────────────────
+
+_CVE_ID_RE = re.compile(r"^CVE-(19|20)\d{2}-\d{4,7}$", re.IGNORECASE)
+_MIN_EPSS = 0.01  # 1% — below this a banner-only match is not worth a report
+
+
+async def filter_actionable_cves(hits: list[dict], key: str = "cve", min_epss: float = _MIN_EPSS) -> tuple[list[dict], int]:
+    """
+    Drop banner-based CVE candidates that cannot become a report: malformed IDs,
+    unknown to EPSS, or EPSS below ``min_epss`` and not in CISA KEV. Returns
+    (kept, dropped_count). Fails open (keeps everything) if EPSS is unreachable,
+    so a network blip never hides a real finding.
+    """
+    if not hits:
+        return [], 0
+    valid = [h for h in hits if _CVE_ID_RE.match(str(h.get(key, "")))]
+    ids = sorted({str(h[key]).upper() for h in valid})
+    epss = await get_epss(ids)
+    if ids and not epss:
+        return list(hits), 0  # EPSS unavailable — fail open
+    kept: list[dict] = []
+    for h in valid:
+        cve = str(h[key]).upper()
+        score = (epss.get(cve) or {}).get("score")
+        if (score is not None and score >= min_epss) or await is_in_kev(cve):
+            kept.append(h)
+    return kept, len(hits) - len(kept)
+
+
 # ── Main enrichment entry point ─────────────────────────────────────────────────
 
 async def enrich_finding(raw_output: str, title: str = "", tool: str = "") -> dict:

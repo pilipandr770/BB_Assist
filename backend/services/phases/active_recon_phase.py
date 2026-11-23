@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 import os
 
 from backend.models import Scope
-from backend.services import tool_runner
+from backend.services import cve_enricher, tool_runner
 from backend.services.scope_parser import is_in_scope
 
 
@@ -70,17 +70,19 @@ async def run_active_recon_core(
         shodan_out = os.path.join(recon_dir, "shodan.json")
         shodan_result = await tool_runner.run_shodan_lookup(live_hosts, shodan_api_key, shodan_out)
         nmap_service_versions += shodan_result["service_versions"]
-        shodan_vuln_findings = shodan_result["vuln_findings"]
+        shodan_vuln_findings, shodan_dropped = await cve_enricher.filter_actionable_cves(shodan_result["vuln_findings"])
         await emit(
             "tool_done",
             {
                 "tool": "shodan",
                 "count": len(shodan_result["service_versions"]),
                 "shodan_vulns": len(shodan_vuln_findings),
+                "shodan_vulns_dropped": shodan_dropped,
             },
         )
 
     nmap_csv_cve_hits = tool_runner.match_service_versions_to_cves(nmap_service_versions)
+    nmap_csv_cve_hits, _csv_dropped = await cve_enricher.filter_actionable_cves(nmap_csv_cve_hits, key="cve")
 
     version_samples = []
     for svc in nmap_service_versions:
